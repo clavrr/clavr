@@ -179,8 +179,7 @@ See [docs/IMPORT_GUIDELINES.md](docs/IMPORT_GUIDELINES.md) for detailed guidelin
 
 ### User Guides
 - [User Query Guide](docs/USER_QUERY_GUIDE.md) - Complete guide with query examples
-- [Quick Reference](docs/QUICK_REFERENCE.md) - Quick reference for common queries
-- [Autonomous Features](docs/AUTONOMOUS_FEATURES.md) - Multi-step queries and autonomous capabilities
+
 
 ### Technical Documentation
 - [API Reference](docs/API.md) - Complete API documentation
@@ -191,4 +190,4 @@ See [docs/IMPORT_GUIDELINES.md](docs/IMPORT_GUIDELINES.md) for detailed guidelin
 
 ## License
 
-MIT
+Apache 2.0
