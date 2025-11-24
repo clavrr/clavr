@@ -93,8 +93,28 @@ class GmailWatchService:
         if topic_name is None:
             topic_name = os.getenv('GMAIL_PUBSUB_TOPIC', 'gmail-notifications')
         
+        # Ensure topic name is in the correct format: projects/PROJECT_ID/topics/TOPIC_NAME
+        # Google requires the full Pub/Sub topic path, not just the topic name
+        if not topic_name.startswith('projects/'):
+            project_id = os.getenv('GOOGLE_CLOUD_PROJECT_ID') or os.getenv('GOOGLE_CLOUD_PROJECT')
+            if project_id:
+                # Construct full topic path
+                topic_name = f"projects/{project_id}/topics/{topic_name}"
+                logger.debug(f"Constructed full topic path: {topic_name}")
+            else:
+                logger.warning(
+                    "GOOGLE_CLOUD_PROJECT_ID not set. Topic name must be in format: "
+                    "projects/PROJECT_ID/topics/TOPIC_NAME. "
+                    "Set GOOGLE_CLOUD_PROJECT_ID environment variable or provide full topic path."
+                )
+                raise ValueError(
+                    "Pub/Sub topic name must be in format 'projects/PROJECT_ID/topics/TOPIC_NAME'. "
+                    "Set GOOGLE_CLOUD_PROJECT_ID environment variable or provide full topic path in GMAIL_PUBSUB_TOPIC."
+                )
+        
         try:
             logger.info(f"Setting up Gmail watch for user {user_id} with labels: {label_ids}")
+            logger.debug(f"Using Pub/Sub topic: {topic_name}")
             
             # Build watch request
             watch_request = {
@@ -113,7 +133,7 @@ class GmailWatchService:
             expiration_dt = datetime.fromtimestamp(expiration_ms / 1000) if expiration_ms else None
             
             logger.info(
-                f"✅ Gmail watch setup successful! "
+                f"Gmail watch setup successful! "
                 f"History ID: {history_id}, "
                 f"Expires: {expiration_dt}"
             )
@@ -133,16 +153,20 @@ class GmailWatchService:
             
             if error_reason == 'insufficientPermissions':
                 logger.error(
-                    "❌ Gmail watch failed: Insufficient permissions. "
+                    "Gmail watch failed: Insufficient permissions. "
                     "Ensure the Gmail API scope 'https://www.googleapis.com/auth/gmail.modify' is granted."
                 )
             elif error_reason == 'invalidArgument':
                 logger.error(
-                    "❌ Gmail watch failed: Invalid argument. "
-                    "Check that the Pub/Sub topic exists and is accessible."
+                    "Gmail watch failed: Invalid argument. "
+                    "Check that:\n"
+                    "  1. Pub/Sub topic exists and is accessible\n"
+                    "  2. Topic name is in correct format: projects/PROJECT_ID/topics/TOPIC_NAME\n"
+                    "  3. GOOGLE_CLOUD_PROJECT_ID environment variable is set\n"
+                    "  4. Gmail service account has publish permission on the topic"
                 )
             else:
-                logger.error(f"❌ Gmail watch failed: {error_reason} - {e}")
+                logger.error(f"Gmail watch failed: {error_reason} - {e}")
             
             raise
     
@@ -163,7 +187,7 @@ class GmailWatchService:
                 userId=user_id
             ).execute()
             
-            logger.info("✅ Gmail watch stopped successfully")
+            logger.info("Gmail watch stopped successfully")
             
             return {
                 'success': True,
@@ -171,7 +195,7 @@ class GmailWatchService:
             }
             
         except HttpError as e:
-            logger.error(f"❌ Failed to stop Gmail watch: {e}")
+            logger.error(f"Failed to stop Gmail watch: {e}")
             raise
     
     def get_history(
