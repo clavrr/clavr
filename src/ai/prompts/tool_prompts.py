@@ -231,6 +231,8 @@ User's search query: "{query}"
 Search results:
 {formatted_result}
 
+PERSONALIZATION: {personalization_note}
+
 Generate a natural, conversational response that:
 - Directly answers their search query
 - Presents matching tasks clearly and organized
@@ -269,6 +271,8 @@ User's request: "{query}"
 
 Task completion result:
 {formatted_result}
+
+PERSONALIZATION: {personalization_note}
 
 Generate a natural, celebratory confirmation that:
 - Confirms the task was marked as complete
@@ -313,6 +317,8 @@ User's request: "{query}"
 Task deletion result:
 {formatted_result}
 
+PERSONALIZATION: {personalization_note}
+
 Generate a natural, understanding confirmation that:
 - Confirms the task was deleted
 - Mentions which task was removed
@@ -355,6 +361,8 @@ User's request: "{query}"
 
 Tasks:
 {formatted_result}
+
+PERSONALIZATION: {personalization_note}
 
 Generate a natural, conversational response that:
 - Introduces the task list in a friendly way

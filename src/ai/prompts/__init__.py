@@ -41,6 +41,11 @@ from .orchestrator_prompts import (
     get_orchestrator_master_prompt
 )
 
+from .conversational_prompts import (
+    get_orchestrator_conversational_prompt,
+    get_conversational_enhancement_prompt
+)
+
 from .tool_prompts import (
     TASK_CREATE_SYSTEM,
     TASK_CREATE_PROMPT,
@@ -131,6 +136,14 @@ from .notion_prompts import (
     NOTION_ENTITY_EXTRACTION_PROMPT
 )
 
+from .context_prompts import (
+    CONTEXT_EXTRACTION_PROMPT
+)
+
+from .decomposition_prompts import (
+    QUERY_DECOMPOSITION_PROMPT
+)
+
 # Utilities are internal - import directly: from .utils import format_prompt
 
 __all__ = [
@@ -166,6 +179,8 @@ __all__ = [
     
     # Orchestrator prompts
     "get_orchestrator_master_prompt",
+    "get_orchestrator_conversational_prompt",
+    "get_conversational_enhancement_prompt",
     
     # Tool prompts
     "TASK_CREATE_SYSTEM",
@@ -255,5 +270,11 @@ __all__ = [
     # Task conversational prompts
     "TASK_CONVERSATIONAL_LIST",
     "TASK_CONVERSATIONAL_EMPTY",
+    
+    # Context extraction prompts
+    "CONTEXT_EXTRACTION_PROMPT",
+    
+    # Query decomposition prompts
+    "QUERY_DECOMPOSITION_PROMPT",
 ]
 

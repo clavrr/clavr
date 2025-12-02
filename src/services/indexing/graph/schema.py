@@ -336,6 +336,31 @@ class GraphSchema:
         "message_id": PropertyType.STRING,
         "ttl_expiry": PropertyType.DATETIME,
         "source": PropertyType.STRING,  # 'slack', 'web', 'api', etc.
+        
+        # Session and ConversationMessage properties
+        "id": PropertyType.STRING,  # Session ID
+        "user_id": PropertyType.INTEGER,  # User ID for sessions and messages
+        "text": PropertyType.STRING,  # Message text content
+        "intent": PropertyType.STRING,  # Detected intent (e.g., 'general', 'search', 'create')
+        
+        # Slack properties
+        "slack_channel_id": PropertyType.STRING,
+        "slack_message_ts": PropertyType.STRING,
+        "slack_thread_ts": PropertyType.STRING,
+        "slack_user_id": PropertyType.STRING,
+        "is_thread_reply": PropertyType.BOOLEAN,
+        "reactions": PropertyType.ARRAY,
+        "files": PropertyType.ARRAY,
+        "is_private": PropertyType.BOOLEAN,
+        "topic": PropertyType.STRING,
+        "purpose": PropertyType.STRING,
+        "workspace_id": PropertyType.STRING,
+        "member_count": PropertyType.INTEGER,
+        "created": PropertyType.DATETIME,
+        
+        # Goal and Project properties
+        "completed_at": PropertyType.DATETIME,
+        "updated_at": PropertyType.DATETIME,
     }
     
     # Valid relationship constraints (from_type -> rel_type -> to_type)

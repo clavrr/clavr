@@ -221,24 +221,36 @@ class GraphRAGIntegrationService:
                 error_str = str(e)
                 error_type = type(e).__name__
                 
-                # Handle various connection errors
+                # Handle various connection errors (including DNS resolution failures)
                 is_connection_error = (
                     "Connection refused" in error_str or 
                     "ServiceUnavailable" in error_str or 
                     "Couldn't connect" in error_str or
+                    "Cannot resolve address" in error_str or
+                    "nodename nor servname provided" in error_str.lower() or
+                    "gaierror" in error_type.lower() or
                     "Broken pipe" in error_str.lower() or
                     "BrokenPipeError" in error_type or
                     "defunct connection" in error_str.lower() or
                     "Failed to write" in error_str or
-                    "Failed to read" in error_str
+                    "Failed to read" in error_str or
+                    "DNS" in error_str
                 )
                 
                 if is_connection_error:
                     # Neo4j connection issue - gracefully fall back to vector-only
-                    logger.warning(
-                        f"Neo4j connection error for {node.node_id}: {error_type}: {error_str}. "
-                        f"This is likely a transient network issue. Continuing with vector-only indexing."
-                    )
+                    # Use a shorter, less alarming message for DNS/connection errors
+                    if "Cannot resolve address" in error_str or "nodename nor servname" in error_str.lower():
+                        logger.warning(
+                            f"Neo4j database unavailable (DNS resolution failed). "
+                            f"Falling back to vector-only indexing for {node.node_id}. "
+                            f"Check NEO4J_URI environment variable or disable graph indexing if Neo4j is not needed."
+                        )
+                    else:
+                        logger.warning(
+                            f"Neo4j connection error for {node.node_id}: {error_type}. "
+                            f"Falling back to vector-only indexing."
+                        )
                 else:
                     # Other graph errors - log but continue to vector indexing
                     logger.error(f"Failed to index node {node.node_id} in graph: {e}")

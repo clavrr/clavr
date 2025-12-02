@@ -422,7 +422,23 @@ class IntelligentEmailIndexer(SmartIndexingMixin if HAS_SMART_INDEXING else obje
             return success_count > 0
             
         except Exception as e:
-            logger.error(f"Failed to index email with graph: {e}", exc_info=True)
+            # Check if it's a connection error (Neo4j unavailable)
+            error_str = str(e)
+            is_connection_error = (
+                "Cannot resolve address" in error_str or
+                "nodename nor servname" in error_str.lower() or
+                "Connection refused" in error_str or
+                "ServiceUnavailable" in error_str or
+                "Couldn't connect" in error_str
+            )
+            
+            if is_connection_error:
+                # Neo4j is unavailable - log briefly and fallback gracefully
+                logger.debug(f"Neo4j unavailable, using vector-only indexing for email {email_data.get('id', 'unknown')[:20]}")
+            else:
+                # Other errors - log with full details
+                logger.error(f"Failed to index email with graph: {e}", exc_info=True)
+            
             # Fallback to vector-only indexing
             logger.info("Falling back to vector-only indexing...")
             return await self._index_vector_only(email_data)

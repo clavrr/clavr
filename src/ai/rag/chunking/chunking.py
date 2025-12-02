@@ -426,7 +426,10 @@ class RecursiveTextChunker:
                         separator_used=separator or "char",
                         depth=depth
                     )
-                    chunks.append(Chunk(text=chunk_text.strip(), metadata=metadata))
+                    chunk_text_stripped = chunk_text.strip()
+                    # Only add non-empty chunks
+                    if chunk_text_stripped:
+                        chunks.append(Chunk(text=chunk_text_stripped, metadata=metadata))
                 
                 # Start new chunk with overlap
                 if self.overlap_tokens > 0 and chunks:
@@ -472,10 +475,16 @@ class RecursiveTextChunker:
                     separator_used=separator or "char",
                     depth=depth
                 )
-                chunks.append(Chunk(text=chunk_text.strip(), metadata=metadata))
+                chunk_text_stripped = chunk_text.strip()
+                # Only add non-empty chunks
+                if chunk_text_stripped:
+                    chunks.append(Chunk(text=chunk_text_stripped, metadata=metadata))
         
         # Merge small chunks
         chunks = self._merge_small_chunks(chunks, target_size)
+        
+        # Final filter: remove any empty chunks that might have been created during merging
+        chunks = [chunk for chunk in chunks if chunk.text and chunk.text.strip()]
         
         return chunks
     
@@ -578,38 +587,44 @@ class RecursiveTextChunker:
                     if current_tokens + chunk_tokens <= target_size:
                         # Merge with current chunk
                         current_merge.append(chunk)
-                        merged_text = " ".join(c.text for c in current_merge)
-                        merged_chunk = Chunk(
-                            text=merged_text,
-                            metadata=ChunkMetadata(
-                                chunk_id=self._generate_chunk_id(merged_text, len(merged), 0),
-                                parent_id=current_merge[0].metadata.parent_id,
-                                child_ids=[],
-                                token_count=self.token_counter(merged_text),
-                                char_start=current_merge[0].metadata.char_start,
-                                char_end=current_merge[-1].metadata.char_end,
-                                separator_used="merged",
-                                depth=current_merge[0].metadata.depth
+                        merged_text = " ".join(c.text for c in current_merge).strip()
+                        # Only create merged chunk if it has content
+                        if merged_text:
+                            merged_chunk = Chunk(
+                                text=merged_text,
+                                metadata=ChunkMetadata(
+                                    chunk_id=self._generate_chunk_id(merged_text, len(merged), 0),
+                                    parent_id=current_merge[0].metadata.parent_id,
+                                    child_ids=[],
+                                    token_count=self.token_counter(merged_text),
+                                    char_start=current_merge[0].metadata.char_start,
+                                    char_end=current_merge[-1].metadata.char_end,
+                                    separator_used="merged",
+                                    depth=current_merge[0].metadata.depth
+                                )
                             )
-                        )
-                        merged.append(merged_chunk)
+                            merged.append(merged_chunk)
+                        # If merged text is empty, skip this merge
                     else:
                         # Create separate merged chunk
-                        merged_text = " ".join(c.text for c in current_merge)
-                        merged_chunk = Chunk(
-                            text=merged_text,
-                            metadata=ChunkMetadata(
-                                chunk_id=self._generate_chunk_id(merged_text, len(merged), 0),
-                                parent_id=current_merge[0].metadata.parent_id,
-                                child_ids=[],
-                                token_count=self.token_counter(merged_text),
-                                char_start=current_merge[0].metadata.char_start,
-                                char_end=current_merge[-1].metadata.char_end,
-                                separator_used="merged",
-                                depth=current_merge[0].metadata.depth
+                        merged_text = " ".join(c.text for c in current_merge).strip()
+                        # Only create merged chunk if it has content
+                        if merged_text:
+                            merged_chunk = Chunk(
+                                text=merged_text,
+                                metadata=ChunkMetadata(
+                                    chunk_id=self._generate_chunk_id(merged_text, len(merged), 0),
+                                    parent_id=current_merge[0].metadata.parent_id,
+                                    child_ids=[],
+                                    token_count=self.token_counter(merged_text),
+                                    char_start=current_merge[0].metadata.char_start,
+                                    char_end=current_merge[-1].metadata.char_end,
+                                    separator_used="merged",
+                                    depth=current_merge[0].metadata.depth
+                                )
                             )
-                        )
-                        merged.append(merged_chunk)
+                            merged.append(merged_chunk)
+                        # If merged text is empty, skip this merge
                         merged.append(chunk)
                     
                     current_merge = []
@@ -620,21 +635,23 @@ class RecursiveTextChunker:
         
         # Add final merge
         if current_merge:
-            merged_text = " ".join(c.text for c in current_merge)
-            merged_chunk = Chunk(
-                text=merged_text,
-                metadata=ChunkMetadata(
-                    chunk_id=self._generate_chunk_id(merged_text, len(merged), 0),
-                    parent_id=current_merge[0].metadata.parent_id,
-                    child_ids=[],
-                    token_count=self.token_counter(merged_text),
-                    char_start=current_merge[0].metadata.char_start,
-                    char_end=current_merge[-1].metadata.char_end,
-                    separator_used="merged",
-                    depth=current_merge[0].metadata.depth
+            merged_text = " ".join(c.text for c in current_merge).strip()
+            # Only create merged chunk if it has content
+            if merged_text:
+                merged_chunk = Chunk(
+                    text=merged_text,
+                    metadata=ChunkMetadata(
+                        chunk_id=self._generate_chunk_id(merged_text, len(merged), 0),
+                        parent_id=current_merge[0].metadata.parent_id,
+                        child_ids=[],
+                        token_count=self.token_counter(merged_text),
+                        char_start=current_merge[0].metadata.char_start,
+                        char_end=current_merge[-1].metadata.char_end,
+                        separator_used="merged",
+                        depth=current_merge[0].metadata.depth
+                    )
                 )
-            )
-            merged.append(merged_chunk)
+                merged.append(merged_chunk)
         
         return merged if merged else chunks
     

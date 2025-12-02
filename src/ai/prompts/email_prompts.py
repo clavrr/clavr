@@ -123,6 +123,8 @@ Current Time: {current_time}, {current_date}
 Number of Emails: {email_count}
 Unread: {unread_count}
 
+{count_instruction}
+
 Emails:
 {emails_json}
 
@@ -147,6 +149,11 @@ CRITICAL FOR "LAST EMAIL" QUERIES:
 - Do NOT mention other emails - the user specifically asked for "the last email"
 - If {email_count} > 1 but the query asks for "the last email", only discuss the FIRST email (most recent)
 
+CRITICAL COUNT RULE:
+- ONLY mention the number of emails if the user explicitly asked for a count (e.g., "how many", "count", "number of")
+- If the user did NOT ask for a count, DO NOT mention the number of emails in your response
+- When the user DOES ask for a count, be accurate and specific (e.g., "You have 100 new emails" or "You have 2 unread emails" or "You have 0 new emails")
+
 Generate a natural, conversational response that:
 1. Answers the user's question directly
 2. UNDERSTANDS THE CONTEXT AND INTENT of each email - don't just repeat subjects verbatim
@@ -155,13 +162,12 @@ Generate a natural, conversational response that:
 5. If the query asks for "the last email" or "last email" (singular), focus ONLY on the first/most recent email - ignore others
 6. Otherwise, presents ALL {email_count} emails in a friendly, easy-to-read way (don't skip any!)
 7. Adds helpful context based on:
-   - Number of emails (manageable? inbox overload?)
-   - Unread count (caught up? needs attention?)
    - Senders and subjects (anything urgent or important?)
    - Email context and intent (what the sender is actually trying to communicate)
+   - ONLY mention number of emails if user explicitly asked for a count
 8. Is warm and supportive without being overly enthusiastic
 9. Uses natural language, not bullet points or structured formats
-10. CRITICAL: If the user asked about "new emails today" or "emails today", make sure to mention ALL {email_count} emails. Group them by sender or topic if helpful, but don't skip any.
+10. CRITICAL: If the user asked about "new emails today" or "emails today", make sure to mention ALL {email_count} emails. Group them by sender or topic if helpful, but don't skip any. DO NOT mention the count unless explicitly asked.
 11. CRITICAL: When the user asks "What email have I received from [Person]?" or "What email from [Person]?", provide a COMPREHENSIVE SUMMARY of the email content, not just the subject line.
 
 CRITICAL RULES - NATURAL LANGUAGE & CONTEXT:
@@ -175,6 +181,7 @@ CRITICAL RULES - NATURAL LANGUAGE & CONTEXT:
 - DO add personalized encouragement or advice based on the context
 - DO format paraphrased email references in BOLD using markdown: **paraphrased subject** (NOT quotes or commas)
 - DO NOT truncate or cut off mid-sentence - generate a COMPLETE response covering all emails
+- DO NOT mention the number of emails unless the user explicitly asked for a count
 - CRITICAL: Always use the "from" field for sender. If subject is "Sam Curtis' readings" but "from" is "Alvaro Santana-Acuna", the email is FROM Alvaro, NOT from Sam Curtis.
 
 ABSOLUTELY FORBIDDEN - DO NOT MENTION:
@@ -209,10 +216,15 @@ EXAMPLE: If email data shows:
 CORRECT response: "You've got an email from Alvaro Santana-Acuna about **Sam Curtis' readings and recording of talk**"
 WRONG response: "You've got an email from Sam Curtis..." (NEVER say this - Sam Curtis is in the subject, not the sender!)
 
-Example good responses:
-- "You've got 3 emails in your inbox. The most recent is from John about **project update**, followed by a newsletter from TechCrunch, and a notification from GitHub. Nothing too urgent, so you can tackle them when you're ready!"
-- "Looking at your inbox, you have 5 unread emails. There's one from Sarah about **tomorrow's meeting** that might need your attention soon. The others look like newsletters and updates that can wait. You're doing great staying on top of things!"
-- "You've got a couple of emails waiting for you. There's **project update** from John and **meeting reminder** from Sarah. Both look important, so you might want to check them out soon!"
+Example good responses (when user did NOT ask for count):
+- "The most recent is from John about **project update**, followed by a newsletter from TechCrunch, and a notification from GitHub. Nothing too urgent, so you can tackle them when you're ready!"
+- "There's one from Sarah about **tomorrow's meeting** that might need your attention soon. The others look like newsletters and updates that can wait. You're doing great staying on top of things!"
+- "You've got **project update** from John and **meeting reminder** from Sarah. Both look important, so you might want to check them out soon!"
+
+Example good responses (when user DID ask for count):
+- "You have 3 emails in your inbox. The most recent is from John about **project update**, followed by a newsletter from TechCrunch, and a notification from GitHub."
+- "You have 5 unread emails. There's one from Sarah about **tomorrow's meeting** that might need your attention soon."
+- "You have 0 new emails right now - your inbox is all caught up!"
 
 Generate the response:"""
 

@@ -717,28 +717,40 @@ class KnowledgeGraphManager:
         try:
             return await asyncio.to_thread(_execute)
         except Exception as e:
-            # Check if it's a connection error (including BrokenPipeError)
+            # Check if it's a connection error (including BrokenPipeError and DNS failures)
             error_str = str(e)
             error_type = type(e).__name__
             
-            # Handle various connection errors
+            # Handle various connection errors (including DNS resolution failures)
             is_connection_error = (
                 "Connection refused" in error_str or 
                 "ServiceUnavailable" in error_str or 
                 "Couldn't connect" in error_str or
+                "Cannot resolve address" in error_str or
+                "nodename nor servname provided" in error_str.lower() or
+                "gaierror" in error_type.lower() or
                 "Broken pipe" in error_str.lower() or
                 "BrokenPipeError" in error_type or
                 "defunct connection" in error_str.lower() or
                 "Failed to write" in error_str or
-                "Failed to read" in error_str
+                "Failed to read" in error_str or
+                "DNS" in error_str
             )
             
             if is_connection_error:
                 # Log the error but don't raise - allow graceful fallback
-                logger.warning(
-                    f"Neo4j connection error for node {node_id}: {error_type}: {error_str}. "
-                    f"This is likely a transient network issue. Will retry on next operation."
-                )
+                # Use a shorter, less alarming message for DNS/connection errors
+                if "Cannot resolve address" in error_str or "nodename nor servname" in error_str.lower():
+                    logger.warning(
+                        f"Neo4j database unavailable (DNS resolution failed). "
+                        f"Falling back to vector-only indexing. "
+                        f"Check NEO4J_URI environment variable or disable graph indexing if Neo4j is not needed."
+                    )
+                else:
+                    logger.warning(
+                        f"Neo4j connection error for node {node_id}: {error_type}. "
+                        f"Falling back to vector-only indexing."
+                    )
                 # Return False to indicate failure, but don't raise exception
                 # This allows the caller to handle gracefully (e.g., fallback to vector-only)
                 return False
@@ -795,24 +807,35 @@ class KnowledgeGraphManager:
             error_str = str(e)
             error_type = type(e).__name__
             
-            # Handle various connection errors
+            # Handle various connection errors (including DNS resolution failures)
             is_connection_error = (
                 "Connection refused" in error_str or 
                 "ServiceUnavailable" in error_str or 
                 "Couldn't connect" in error_str or
+                "Cannot resolve address" in error_str or
+                "nodename nor servname provided" in error_str.lower() or
+                "gaierror" in error_type.lower() or
                 "Broken pipe" in error_str.lower() or
                 "BrokenPipeError" in error_type or
                 "defunct connection" in error_str.lower() or
                 "Failed to write" in error_str or
-                "Failed to read" in error_str
+                "Failed to read" in error_str or
+                "DNS" in error_str
             )
             
             if is_connection_error:
                 # Log the error but don't raise - allow graceful fallback
-                logger.warning(
-                    f"Neo4j connection error for relationship {from_node}->{to_node}: {error_type}: {error_str}. "
-                    f"This is likely a transient network issue. Will retry on next operation."
-                )
+                # Use a shorter, less alarming message
+                if "Cannot resolve address" in error_str or "nodename nor servname" in error_str.lower():
+                    logger.debug(
+                        f"Neo4j unavailable (DNS resolution failed) for relationship {from_node}->{to_node}. "
+                        f"Skipping graph indexing."
+                    )
+                else:
+                    logger.warning(
+                        f"Neo4j connection error for relationship {from_node}->{to_node}: {error_type}. "
+                        f"Falling back to vector-only indexing."
+                    )
                 # Return False to indicate failure, but don't raise exception
                 return False
             raise
@@ -851,9 +874,19 @@ class KnowledgeGraphManager:
         except Exception as e:
             # Check if it's a connection error - return None gracefully
             error_str = str(e)
-            if "Connection refused" in error_str or "ServiceUnavailable" in error_str or "Couldn't connect" in error_str:
+            error_type = type(e).__name__
+            is_connection_error = (
+                "Connection refused" in error_str or 
+                "ServiceUnavailable" in error_str or 
+                "Couldn't connect" in error_str or
+                "Cannot resolve address" in error_str or
+                "nodename nor servname provided" in error_str.lower() or
+                "gaierror" in error_type.lower() or
+                "DNS" in error_str
+            )
+            if is_connection_error:
                 # Neo4j is not running - return None (node doesn't exist)
-                logger.debug(f"Neo4j connection failed for node {node_id}: {e}")
+                logger.debug(f"Neo4j unavailable for node {node_id}: {error_type}")
                 return None
             raise
     

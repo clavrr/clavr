@@ -600,31 +600,46 @@ class PineconeVectorStore(VectorStore):
         if not documents:
             return
         
-        # Extract contents
+        # Extract contents and filter out empty content
         # Extract text content - handle both Chunk objects and strings
         contents = []
-        for doc in documents:
+        valid_doc_indices = []  # Track which documents have non-empty content
+        
+        for i, doc in enumerate(documents):
             content = doc['content']
             # If it's a Chunk object, extract the text property
             if hasattr(content, 'text'):
-                contents.append(content.text)
+                content_str = content.text
             elif isinstance(content, str):
-                contents.append(content)
+                content_str = content
             else:
                 # Fallback: convert to string
-                contents.append(str(content))
+                content_str = str(content)
+            
+            # Filter out empty or whitespace-only content
+            if content_str and content_str.strip():
+                contents.append(content_str)
+                valid_doc_indices.append(i)
+            else:
+                doc_id = doc.get('id', f"doc_{i}")
+                logger.warning(f"Skipping document {doc_id} with empty content (chunk_index={doc.get('metadata', {}).get('chunk_index', 'unknown')})")
         
-        # Batch encode embeddings
+        if not contents:
+            logger.warning("All documents had empty content, nothing to index")
+            return
+        
+        # Batch encode embeddings only for non-empty content
         embeddings = self.embedding_provider.encode_batch(contents)
         embeddings = [
             emb.tolist() if hasattr(emb, 'tolist') else list(emb)
             for emb in embeddings
         ]
         
-        # Prepare vectors for upsert
+        # Prepare vectors for upsert (only for documents with valid content)
         vectors = []
-        for i, doc in enumerate(documents):
-            doc_id = doc.get('id', f"doc_{i}_{int(time.time())}")
+        for emb_idx, doc_idx in enumerate(valid_doc_indices):
+            doc = documents[doc_idx]
+            doc_id = doc.get('id', f"doc_{doc_idx}_{int(time.time())}")
             meta = doc.get('metadata', {}).copy()  # Make a copy to avoid modifying original
             
             # Store content in metadata (needed for retrieval), but truncate if too large
@@ -673,7 +688,7 @@ class PineconeVectorStore(VectorStore):
             except Exception as e:
                 logger.warning(f"Error validating metadata size for {doc_id}: {e}")
             
-            vectors.append((doc_id, embeddings[i], meta))
+            vectors.append((doc_id, embeddings[emb_idx], meta))
         
         # Batch upsert (Pinecone recommends batches of 100-200)
         batch_size = 100
@@ -703,7 +718,11 @@ class PineconeVectorStore(VectorStore):
                 else:
                     raise
         
-        logger.info(f"Added {len(documents)} documents to Pinecone (namespace={self.namespace})")
+        indexed_count = len(vectors)
+        if indexed_count < len(documents):
+            logger.info(f"Added {indexed_count}/{len(documents)} documents to Pinecone (namespace={self.namespace}) - {len(documents) - indexed_count} empty chunks filtered out")
+        else:
+            logger.info(f"Added {indexed_count} documents to Pinecone (namespace={self.namespace})")
     
     def search(
         self,

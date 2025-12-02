@@ -103,6 +103,8 @@ High Priority: {high_priority_count}
 Tasks:
 {tasks_json}
 
+PERSONALIZATION: {personalization_note}
+
 Generate a natural, conversational response that:
 1. Answers the user's question directly
 2. UNDERSTANDS THE CONTEXT AND INTENT of each task - don't just repeat titles verbatim
@@ -170,6 +172,8 @@ Generate the response:"""
 TASK_CONVERSATIONAL_EMPTY = """You are Clavr, a friendly personal assistant. The user asked about their tasks but they have no tasks.
 
 User Query: "{query}"
+
+PERSONALIZATION: {personalization_note}
 
 Generate a brief, friendly response that:
 1. Tells them they have no tasks

@@ -57,13 +57,19 @@ async def refresh_token_with_retry(
         access_token = decrypt_token(session.gmail_access_token)
         refresh_token = decrypt_token(session.gmail_refresh_token)
     except Exception as e:
-        logger.error(f"Failed to decrypt tokens for session {session.id}: {e}")
+        # Provide detailed error message with exception type and message
+        error_type = type(e).__name__
+        error_msg = str(e) if str(e) else "Unknown decryption error"
+        logger.warning(
+            f"Failed to decrypt tokens for session {session.id} (possibly stale): "
+            f"{error_type} - {error_msg}"
+        )
         await log_auth_event(
             db=db,
             event_type=AuditEventType.TOKEN_REFRESH_FAILURE,
             user_id=session.user_id,
             success=False,
-            error_message=f"Token decryption failed: {e}",
+            error_message=f"Token decryption failed: {error_type} - {error_msg}",
             session_id=session.id
         )
         return False, None
@@ -253,7 +259,13 @@ def get_valid_credentials(
         access_token = decrypt_token(session.gmail_access_token)
         refresh_token = decrypt_token(session.gmail_refresh_token) if session.gmail_refresh_token else None
     except Exception as e:
-        logger.error(f"Failed to decrypt tokens for session {session.id}: {e}")
+        # Provide detailed error message with exception type and message
+        error_type = type(e).__name__
+        error_msg = str(e) if str(e) else "Unknown decryption error"
+        logger.warning(
+            f"Failed to decrypt tokens for session {session.id} (possibly stale): "
+            f"{error_type} - {error_msg}"
+        )
         return None
     
     if not auto_refresh:
@@ -347,7 +359,13 @@ async def get_valid_credentials_async(
         access_token = decrypt_token(session.gmail_access_token)
         refresh_token = decrypt_token(session.gmail_refresh_token) if session.gmail_refresh_token else None
     except Exception as e:
-        logger.error(f"Failed to decrypt tokens for session {session.id}: {e}")
+        # Provide detailed error message with exception type and message
+        error_type = type(e).__name__
+        error_msg = str(e) if str(e) else "Unknown decryption error"
+        logger.warning(
+            f"Failed to decrypt tokens for session {session.id} (possibly stale): "
+            f"{error_type} - {error_msg}"
+        )
         return None
     
     if not auto_refresh:
