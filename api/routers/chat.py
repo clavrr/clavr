@@ -17,6 +17,8 @@ from src.utils.config import load_config
 from src.ai.llm_factory import LLMFactory
 from src.ai.prompts import get_agent_system_prompt
 from src.utils.logger import setup_logger
+from src.ai.conversation_memory import ConversationMemory
+from src.ai.memory_constants import DEFAULT_CONVERSATION_LIST_LIMIT
 from ..dependencies import get_config, get_rag_engine
 from ..auth import get_current_user_required, get_current_user_optional
 from ..exceptions import create_error_response, create_success_response
@@ -24,6 +26,83 @@ from src.database.models import User
 
 logger = setup_logger(__name__)
 router = APIRouter(prefix="/api", tags=["chat"])
+
+
+# Response models for conversation endpoints
+class ConversationPreview(BaseModel):
+    """Preview of a conversation for sidebar listing"""
+    session_id: str
+    preview: str
+    last_activity: Optional[str]
+    message_count: int
+
+
+class ConversationListResponse(BaseModel):
+    """Response model for listing conversations"""
+    conversations: List[ConversationPreview]
+    total: int
+
+
+class MessageResponse(BaseModel):
+    """Response model for a single message"""
+    role: str
+    content: str
+    timestamp: Optional[str]
+    intent: Optional[str] = None
+    entities: Optional[Dict[str, Any]] = None
+
+
+class ConversationMessagesResponse(BaseModel):
+    """Response model for conversation messages"""
+    session_id: str
+    messages: List[MessageResponse]
+    total: int
+
+
+class MessageRequest(BaseModel):
+    """Request model for a single message"""
+    role: str = Field(..., description="Message role: 'user' or 'assistant'")
+    content: str = Field(..., min_length=1, description="Message content")
+    intent: Optional[str] = Field(None, description="Detected intent")
+    entities: Optional[Dict[str, Any]] = Field(None, description="Extracted entities")
+    confidence: Optional[float] = Field(None, ge=0.0, le=1.0, description="Confidence score (0.0-1.0)")
+    
+    @validator('role')
+    def validate_role(cls, v):
+        if v not in ['user', 'assistant']:
+            raise ValueError("role must be 'user' or 'assistant'")
+        return v
+
+
+class ConversationCreateRequest(BaseModel):
+    """Request model for creating a new conversation"""
+    session_id: Optional[str] = Field(None, description="Session ID (auto-generated if not provided)")
+    messages: List[MessageRequest] = Field(..., description="List of messages to save (minimum 1 message)")
+    
+    @validator('messages')
+    def validate_messages(cls, v):
+        if not v or len(v) == 0:
+            raise ValueError("messages list must contain at least one message")
+        return v
+
+
+class ConversationUpdateRequest(BaseModel):
+    """Request model for updating an existing conversation"""
+    messages: List[MessageRequest] = Field(..., description="List of messages to add/update (minimum 1 message)")
+    
+    @validator('messages')
+    def validate_messages(cls, v):
+        if not v or len(v) == 0:
+            raise ValueError("messages list must contain at least one message")
+        return v
+
+
+class ConversationResponse(BaseModel):
+    """Response model for conversation save/update operations"""
+    session_id: str
+    message_ids: List[Optional[int]]
+    total_messages: int
+    success: bool
 
 
 
@@ -804,4 +883,230 @@ async def unified_query_stream(
             "Transfer-Encoding": "chunked"  # Ensure chunked transfer encoding
         }
     )
+
+
+@router.get("/conversations", response_model=ConversationListResponse)
+async def list_conversations(
+    db_session: AsyncSession = Depends(get_async_db),
+    current_user: User = Depends(get_current_user_required),
+    limit: int = DEFAULT_CONVERSATION_LIST_LIMIT
+) -> ConversationListResponse:
+    """
+    List all conversations (sessions) for the current user.
+    
+    Used for the sidebar "Your Actions" list. Returns conversations sorted by
+    most recent activity, with a preview of the first message.
+    
+    Args:
+        limit: Maximum number of conversations to return (default: DEFAULT_CONVERSATION_LIST_LIMIT)
+        
+    Returns:
+        ConversationListResponse with list of conversation previews
+    """
+    try:
+        memory = ConversationMemory(db_session)
+        conversations = await memory.list_conversations(
+            user_id=current_user.id,
+            limit=limit
+        )
+        
+        return ConversationListResponse(
+            conversations=[ConversationPreview(**conv) for conv in conversations],
+            total=len(conversations)
+        )
+    except Exception as e:
+        logger.error(f"Failed to list conversations: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Failed to list conversations: {str(e)}")
+
+
+@router.get("/conversations/{session_id}", response_model=ConversationMessagesResponse)
+async def get_conversation_messages(
+    session_id: str,
+    db_session: AsyncSession = Depends(get_async_db),
+    current_user: User = Depends(get_current_user_required)
+) -> ConversationMessagesResponse:
+    """
+    Get all messages for a specific conversation (session).
+    
+    Used when user clicks on a conversation in the sidebar to view full history.
+    Returns both user queries and agent responses in chronological order.
+    
+    Args:
+        session_id: Session ID of the conversation
+        
+    Returns:
+        ConversationMessagesResponse with all messages for the conversation
+    """
+    try:
+        memory = ConversationMemory(db_session)
+        messages = await memory.get_conversation_messages(
+            user_id=current_user.id,
+            session_id=session_id
+        )
+        
+        return ConversationMessagesResponse(
+            session_id=session_id,
+            messages=[MessageResponse(**msg) for msg in messages],
+            total=len(messages)
+        )
+    except Exception as e:
+        logger.error(f"Failed to get conversation messages: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Failed to get conversation messages: {str(e)}")
+
+
+@router.post("/conversations", response_model=ConversationResponse, status_code=201)
+async def create_conversation(
+    request: ConversationCreateRequest,
+    db_session: AsyncSession = Depends(get_async_db),
+    current_user: User = Depends(get_current_user_required)
+) -> ConversationResponse:
+    """
+    Create a new conversation and save messages.
+    
+    Creates a new conversation session and saves all provided messages.
+    If session_id is not provided, one will be auto-generated.
+    
+    Args:
+        request: ConversationCreateRequest with session_id (optional) and messages
+        current_user: Authenticated user
+        
+    Returns:
+        ConversationResponse with session_id, message_ids, and success status
+    """
+    import uuid
+    from datetime import datetime
+    
+    try:
+        # Generate session_id if not provided
+        session_id = request.session_id or f"session_{uuid.uuid4().hex[:16]}_{int(datetime.utcnow().timestamp())}"
+        
+        memory = ConversationMemory(db_session)
+        message_ids = []
+        
+        # Add all messages
+        for msg in request.messages:
+            try:
+                msg_id = await memory.add_message(
+                    user_id=current_user.id,
+                    session_id=session_id,
+                    role=msg.role,
+                    content=msg.content,
+                    intent=msg.intent,
+                    entities=msg.entities,
+                    confidence=msg.confidence
+                )
+                message_ids.append(msg_id)
+            except Exception as e:
+                logger.error(f"Failed to add message to conversation: {e}", exc_info=True)
+                message_ids.append(None)
+        
+        success = all(msg_id is not None for msg_id in message_ids)
+        
+        if not success:
+            logger.warning(f"Some messages failed to save for session {session_id}")
+        
+        return ConversationResponse(
+            session_id=session_id,
+            message_ids=message_ids,
+            total_messages=len(message_ids),
+            success=success
+        )
+        
+    except Exception as e:
+        logger.error(f"Failed to create conversation: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Failed to create conversation: {str(e)}")
+
+
+@router.put("/conversations/{session_id}", response_model=ConversationResponse)
+async def update_conversation(
+    session_id: str,
+    request: ConversationUpdateRequest,
+    db_session: AsyncSession = Depends(get_async_db),
+    current_user: User = Depends(get_current_user_required)
+) -> ConversationResponse:
+    """
+    Update an existing conversation by adding new messages.
+    
+    Adds the provided messages to the existing conversation session.
+    The conversation must belong to the current user.
+    
+    Args:
+        session_id: Session ID of the conversation to update
+        request: ConversationUpdateRequest with messages to add
+        current_user: Authenticated user
+        
+    Returns:
+        ConversationResponse with session_id, message_ids, and success status
+        
+    Raises:
+        HTTPException 404: If conversation doesn't exist or doesn't belong to user
+        HTTPException 500: If update fails
+    """
+    try:
+        # Verify the conversation exists and belongs to the user
+        memory = ConversationMemory(db_session)
+        existing_messages = await memory.get_conversation_messages(
+            user_id=current_user.id,
+            session_id=session_id,
+            limit=1
+        )
+        
+        if not existing_messages:
+            # Check if session_id exists for any user (for better error message)
+            from sqlalchemy import select
+            from src.database.models import ConversationMessage
+            
+            check_stmt = select(ConversationMessage).where(
+                ConversationMessage.session_id == session_id
+            ).limit(1)
+            result = await db_session.execute(check_stmt)
+            exists = result.scalar_one_or_none() is not None
+            
+            if exists:
+                raise HTTPException(
+                    status_code=403,
+                    detail="Conversation exists but does not belong to the current user"
+                )
+            else:
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"Conversation with session_id '{session_id}' not found"
+                )
+        
+        message_ids = []
+        
+        # Add all new messages
+        for msg in request.messages:
+            try:
+                msg_id = await memory.add_message(
+                    user_id=current_user.id,
+                    session_id=session_id,
+                    role=msg.role,
+                    content=msg.content,
+                    intent=msg.intent,
+                    entities=msg.entities,
+                    confidence=msg.confidence
+                )
+                message_ids.append(msg_id)
+            except Exception as e:
+                logger.error(f"Failed to add message to conversation: {e}", exc_info=True)
+                message_ids.append(None)
+        
+        success = all(msg_id is not None for msg_id in message_ids)
+        
+        if not success:
+            logger.warning(f"Some messages failed to save for session {session_id}")
+        
+        return ConversationResponse(
+            session_id=session_id,
+            message_ids=message_ids,
+            total_messages=len(message_ids),
+            success=success
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to update conversation: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Failed to update conversation: {str(e)}")
 

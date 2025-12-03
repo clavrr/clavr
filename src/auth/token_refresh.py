@@ -7,7 +7,7 @@ and persists them back to the database with encryption.
 import os
 import time
 from datetime import datetime, timedelta
-from typing import Optional, Tuple, cast, cast
+from typing import Optional, Tuple, cast
 from sqlalchemy.orm import Session
 
 from google.oauth2.credentials import Credentials
@@ -49,7 +49,13 @@ async def refresh_token_with_retry(
         - credentials: Credentials object (refreshed or original)
     """
     if not session.gmail_refresh_token:
-        logger.warning(f"Session {session.id} has no refresh token - cannot refresh")
+        logger.debug(f"Session {session.id} has no refresh token - cannot refresh")
+        return False, None
+    
+    # Check if we've already determined this token is invalid (to avoid repeated attempts)
+    # This prevents spam warnings for known invalid tokens
+    if hasattr(session, '_token_invalid') and session._token_invalid:
+        logger.debug(f"Session {session.id} token already known to be invalid - skipping refresh attempt")
         return False, None
     
     # Decrypt tokens from database
@@ -57,12 +63,13 @@ async def refresh_token_with_retry(
         access_token = decrypt_token(session.gmail_access_token)
         refresh_token = decrypt_token(session.gmail_refresh_token)
     except Exception as e:
-        # Provide detailed error message with exception type and message
+        # Decryption failed - token may be encrypted with different key or corrupted
+        # This is expected for stale sessions or after encryption key changes
         error_type = type(e).__name__
         error_msg = str(e) if str(e) else "Unknown decryption error"
-        logger.warning(
-            f"Failed to decrypt tokens for session {session.id} (possibly stale): "
-            f"{error_type} - {error_msg}"
+        logger.debug(
+            f"Failed to decrypt tokens for session {session.id} (stale/corrupted token): "
+            f"{error_type} - {error_msg}. Session will need re-authentication."
         )
         await log_auth_event(
             db=db,
@@ -103,7 +110,17 @@ async def refresh_token_with_retry(
         needs_refresh = True
     elif session.token_expiry:
         # Check if token expires within threshold
-        time_until_expiry = session.token_expiry - datetime.utcnow()
+        # Handle both timezone-aware and naive datetimes
+        expiry = session.token_expiry
+        if expiry.tzinfo:
+            # Timezone-aware: use UTC now
+            from datetime import timezone
+            now = datetime.now(timezone.utc)
+            time_until_expiry = expiry - now
+        else:
+            # Naive datetime: treat as UTC and compare with utcnow()
+            now = datetime.utcnow()
+            time_until_expiry = expiry - now
         if time_until_expiry < timedelta(minutes=refresh_threshold_minutes):
             logger.info(f"Token expires in {time_until_expiry.total_seconds()/60:.1f} minutes - refreshing proactively")
             needs_refresh = True
@@ -150,15 +167,86 @@ async def refresh_token_with_retry(
             error_str = str(e)
             error_type = type(e).__name__
             
+            # Log the error details for debugging (before determining error type)
+            logger.debug(
+                f"Token refresh attempt {attempt + 1} failed for session {session.id}: "
+                f"{error_type}: {error_str}"
+            )
+            
+            # Check if it's an invalid_grant error (permanent - token revoked/expired)
+            # Google OAuth can raise various exceptions, check for invalid_grant in multiple ways
+            # Common exception types: RefreshError, OAuth2Error, or generic Exception with invalid_grant message
+            is_invalid_grant = False
+            
+            # Check error message first (most reliable)
+            if "invalid_grant" in error_str.lower():
+                is_invalid_grant = True
+                logger.debug(f"Detected invalid_grant from error message: {error_str[:100]}")
+            # Check exception type (RefreshError from google.auth.exceptions is almost always invalid_grant)
+            elif "RefreshError" in error_type:
+                is_invalid_grant = True
+                logger.debug(f"Detected invalid_grant from exception type: {error_type}")
+            # Check for OAuth2Error with invalid_grant
+            elif "OAuth2Error" in error_type and "invalid_grant" in error_str.lower():
+                is_invalid_grant = True
+                logger.debug(f"Detected invalid_grant from OAuth2Error: {error_str[:100]}")
+            # Check exception attributes
+            elif hasattr(e, 'error_code') and str(e.error_code) == 'invalid_grant':
+                is_invalid_grant = True
+                logger.debug(f"Detected invalid_grant from error_code attribute: {e.error_code}")
+            elif hasattr(e, 'status_code') and e.status_code == 400:
+                # 400 with invalid_grant in message is likely invalid_grant
+                if "invalid_grant" in error_str.lower():
+                    is_invalid_grant = True
+                    logger.debug(f"Detected invalid_grant from 400 status with message: {error_str[:100]}")
+            
             # Check if it's a network/connection error
             is_network_error = (
-                "TransportError" in error_type or
-                "Unable to find the server" in error_str or
-                "Connection" in error_type or
-                "network" in error_str.lower() or
-                "timeout" in error_str.lower() or
-                "DNS" in error_str
+                not is_invalid_grant and (
+                    "TransportError" in error_type or
+                    "Unable to find the server" in error_str or
+                    "Connection" in error_type or
+                    "network" in error_str.lower() or
+                    "timeout" in error_str.lower() or
+                    "DNS" in error_str
+                )
             )
+            
+            # Don't retry on invalid_grant - it's a permanent error
+            if is_invalid_grant:
+                # Mark session as having invalid token to prevent future refresh attempts
+                session._token_invalid = True
+                
+                # Use DEBUG level for expected scenarios (token revoked/expired)
+                # Only log once per session to avoid spam - this is expected behavior
+                if not hasattr(session, '_invalid_token_logged'):
+                    logger.info(
+                    f"Refresh token invalid for session {session.id} (user_id={session.user_id}): "
+                    f"Token has been revoked or expired. User needs to re-authenticate. "
+                    f"This is expected when: user changes password, revokes access, or token expires after 6 months of inactivity."
+                )
+                    session._invalid_token_logged = True
+                else:
+                    logger.debug(
+                        f"Refresh token invalid for session {session.id} (user_id={session.user_id}) - "
+                        f"already logged, skipping duplicate warning"
+                    )
+                
+                # Log token refresh failure (audit log should still record it, but only once)
+                if not hasattr(session, '_audit_logged'):
+                    await log_auth_event(
+                        db=db,
+                        event_type=AuditEventType.TOKEN_REFRESH_FAILURE,
+                        user_id=session.user_id,
+                        success=False,
+                        error_message=f"invalid_grant: Refresh token revoked or expired. Re-authentication required.",
+                        session_id=session.id,
+                        attempts=attempt + 1
+                    )
+                    session._audit_logged = True
+                
+                db.rollback()
+                return False, None
             
             wait_time = backoff_factor ** attempt
             
@@ -172,7 +260,7 @@ async def refresh_token_with_retry(
                 else:
                     logger.warning(
                         f"Token refresh failed for session {session.id} "
-                        f"(attempt {attempt + 1}/{max_retries}): {e}. "
+                        f"(attempt {attempt + 1}/{max_retries}): {error_type}: {error_str}. "
                         f"Retrying in {wait_time}s..."
                     )
                 time.sleep(wait_time)
@@ -184,10 +272,10 @@ async def refresh_token_with_retry(
                         f"Please check your internet connection."
                     )
                 else:
+                    # Only log full traceback for unexpected errors (not invalid_grant)
                     logger.error(
                         f"Token refresh failed for session {session.id} "
-                        f"after {max_retries} attempts: {e}",
-                        exc_info=True
+                        f"after {max_retries} attempts: {error_type}: {error_str}"
                     )
                 
                 # Log token refresh failure
@@ -259,12 +347,13 @@ def get_valid_credentials(
         access_token = decrypt_token(session.gmail_access_token)
         refresh_token = decrypt_token(session.gmail_refresh_token) if session.gmail_refresh_token else None
     except Exception as e:
-        # Provide detailed error message with exception type and message
+        # Decryption failed - token may be encrypted with different key or corrupted
+        # This is expected for stale sessions or after encryption key changes
         error_type = type(e).__name__
         error_msg = str(e) if str(e) else "Unknown decryption error"
-        logger.warning(
-            f"Failed to decrypt tokens for session {session.id} (possibly stale): "
-            f"{error_type} - {error_msg}"
+        logger.debug(
+            f"Failed to decrypt tokens for session {session.id} (stale/corrupted token): "
+            f"{error_type} - {error_msg}. Session will need re-authentication."
         )
         return None
     
@@ -359,12 +448,13 @@ async def get_valid_credentials_async(
         access_token = decrypt_token(session.gmail_access_token)
         refresh_token = decrypt_token(session.gmail_refresh_token) if session.gmail_refresh_token else None
     except Exception as e:
-        # Provide detailed error message with exception type and message
+        # Decryption failed - token may be encrypted with different key or corrupted
+        # This is expected for stale sessions or after encryption key changes
         error_type = type(e).__name__
         error_msg = str(e) if str(e) else "Unknown decryption error"
-        logger.warning(
-            f"Failed to decrypt tokens for session {session.id} (possibly stale): "
-            f"{error_type} - {error_msg}"
+        logger.debug(
+            f"Failed to decrypt tokens for session {session.id} (stale/corrupted token): "
+            f"{error_type} - {error_msg}. Session will need re-authentication."
         )
         return None
     

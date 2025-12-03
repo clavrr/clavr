@@ -199,7 +199,7 @@ def kill_process_on_port(port: int) -> bool:
 
 @click.command()
 @click.option('--port', default=8000, help='Port to run server on')
-@click.option('--host', default='127.0.0.1', help='Host to bind to (use 0.0.0.0 for network access)')
+@click.option('--host', default='0.0.0.0', help='Host to bind to (use 0.0.0.0 for network access)')
 @click.option('--reload', is_flag=True, help='Enable auto-reload')
 @click.option('--no-celery', is_flag=True, help='Skip starting Celery worker')
 @click.option('--kill-existing', is_flag=True, help='Kill existing process on port if in use')
