@@ -33,8 +33,8 @@ Multi-step queries execute independently using LangGraph orchestration:
 
 ### AI-Powered Intelligence
 
-- **Semantic Search**: RAG-powered search across emails and attachments using Pinecone vector store
-- **Knowledge Graph**: Neo4j-powered entity relationships for spending analysis, vendor insights, receipt trends
+- **Semantic Search**: RAG-powered search across emails and attachments using Qdrant vector store
+- **Knowledge Graph**: ArangoDB-powered entity relationships for spending analysis, vendor insights, receipt trends
 - **Auto-Reply Generation**: Personalized responses matching your writing style
 - **Document Summarization**: Executive summaries and key data extraction
 - **Meeting Preparation**: Pre-meeting briefs, agendas, and preparation tasks
@@ -53,7 +53,7 @@ User Query → ClavrAgent → Intent Analysis → Tool Orchestration
                     │               │               │
                     └───────────────┼───────────────┘
                                     │
-                    RAG Engine (Pinecone + Neo4j)
+                    RAG Engine (Qdrant + ArangoDB)
                                     │
                             Knowledge Graph
 ```
@@ -75,8 +75,8 @@ User Query → ClavrAgent → Intent Analysis → Tool Orchestration
 - Sentence Transformers for local embeddings
 
 **Data & Storage:**
-- Pinecone (primary) for vector storage and semantic search
-- Neo4j for knowledge graph and entity relationships
+- Qdrant (primary) for vector storage and semantic search
+- ArangoDB for knowledge graph and entity relationships
 - PostgreSQL (fallback) for relational data and vector storage
 - Redis for caching and session management
 
@@ -103,14 +103,14 @@ GOOGLE_CLIENT_SECRET=your-client-secret
 GOOGLE_API_KEY=your-gemini-api-key
 
 # Vector Store (Primary)
-PINECONE_API_KEY=your-pinecone-api-key
-PINECONE_INDEX_NAME=clavr-emails
-PINECONE_NAMESPACE=default
+QDRANT_URL=http://localhost:6333
+QDRANT_API_KEY=your-qdrant-api-key
 
-# Knowledge Graph
-NEO4J_URI=bolt://localhost:7687
-NEO4J_USER=neo4j
-NEO4J_PASSWORD=your-password
+# Knowledge Graph (ArangoDB)
+ARANGODB_URL=http://localhost:8529
+ARANGODB_USERNAME=root
+ARANGODB_PASSWORD=your-password
+ARANGODB_DATABASE=clavr
 
 # Database (Fallback)
 DATABASE_URL=postgresql://user:password@localhost:5432/clavr

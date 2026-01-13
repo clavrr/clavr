@@ -1,0 +1,118 @@
+# Core dependencies
+python-dotenv>=1.0.0
+pyyaml>=6.0.1
+pydantic>=2.5.0
+pydantic-settings>=2.1.0
+itsdangerous>=2.1.0  # CSRF token generation and validation
+tenacity>=8.2.0  # Retry logic for external APIs
+pybreaker>=1.0.0  # Circuit breaker pattern for fault tolerance
+cryptography>=41.0.0  # Token encryption (Fernet)
+slowapi>=0.1.9  # Rate limiting for FastAPI
+
+# Job Queue / Background Tasks
+celery>=5.3.0
+kombu>=5.3.0  # Celery messaging
+flower>=2.0.0  # Celery monitoring web UI
+
+# Email handling
+imap-tools>=1.5.0
+email-validator>=2.1.0
+
+# Slack Integration
+slack-sdk>=3.27.0
+
+# AI/LLM
+openai>=1.12.0
+anthropic>=0.18.0
+google-generativeai>=0.3.0
+google-genai>=1.0.0  # Interactions API client for stateful conversations
+langchain>=0.3.0,<1.0.0
+langchain-openai>=0.3.0,<1.0.0
+langchain-anthropic>=0.3.0,<1.0.0
+langchain-google-genai>=2.0.0,<3.0.0
+langchain-community>=0.3.0,<0.4.0
+langgraph>=0.0.20
+
+# Vector Store / RAG
+# Primary: Qdrant (required)
+qdrant-client>=1.7.0  # REQUIRED: Primary vector store
+psycopg2-binary>=2.9.0  # REQUIRED: PostgreSQL fallback for vector store
+# Fallback: PostgreSQL with pgvector
+sentence-transformers>=2.2.2  # Local embeddings
+tiktoken>=0.5.2  # Token counting
+pgvector>=0.2.4  # PostgreSQL vector extension
+langchain-postgres>=0.0.6  # LangChain PostgreSQL integration
+langchain-core>=0.3.72,<1.0.0
+langchain-text-splitters>=0.3.0,<1.0.0
+scikit-learn>=1.3.0  # For semantic similarity matching
+
+# Knowledge Graph 
+python-arango>=8.0.0  # ArangoDB driver
+
+# Database
+sqlalchemy>=2.0.25
+alembic>=1.13.1
+psycopg>=3.1.0
+psycopg-pool>=3.1.0
+psycopg-binary>=3.1.0
+asyncpg>=0.29.0  # PostgreSQL async driver for AsyncSession support
+
+# LangGraph Checkpointing
+langgraph-checkpoint-postgres>=1.0.0
+
+# Attachment content extraction (IBM Docling - Advanced document parsing)
+docling>=1.0.0
+
+# Google Calendar API & OAuth
+google-auth>=2.23.0
+google-auth-oauthlib>=1.1.0
+google-auth-httplib2>=0.1.1
+google-api-python-client>=2.100.0
+
+# Authentication & Security
+passlib>=1.7.4
+python-jose[cryptography]>=3.3.0
+python-multipart>=0.0.6
+httpx>=0.25.0
+bcrypt>=4.1.0
+
+# Web Framework
+fastapi>=0.109.0
+uvicorn[standard]>=0.27.0
+websockets>=12.0
+
+# Voice/Audio
+aiohttp>=3.9.0
+
+# Utilities
+rich>=13.7.0
+click>=8.1.7
+python-dateutil>=2.8.2
+pytz>=2024.1
+dateparser>=1.2.0
+numpy>=2.1.0,<2.3.0
+urllib3>=2.0.0,<2.4.0
+psutil>=5.9.0  # System resource monitoring for health checks
+requests>=2.32.5  # Required by both locust and langchain-community
+
+# Caching
+redis>=5.0.0
+hiredis>=2.2.0  # C parser for better Redis performance
+
+# Testing
+pytest>=7.4.4
+pytest-asyncio>=0.23.3
+pytest-cov>=4.1.0
+pytest-mock>=3.12.0
+locust>=2.20.0  # Performance/load testing
+
+# Code quality
+black>=24.1.1
+flake8>=7.0.0
+mypy>=1.8.0
+isort>=5.13.2
+
+# Logging
+structlog>=24.1.0
+
+rank-bm25>=0.2.2

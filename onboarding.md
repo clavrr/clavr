@@ -6,7 +6,7 @@ Welcome to the Clavr team! This guide will help you understand our system, set u
 
 ## 1. Prerequisites
 - **Python**: 3.13.7 (Verified current env version).
-- **Service Tokens**: You will need API keys for Google Gemini, Pinecone, and Neo4j (shared via internal secure vault).
+- **Service Tokens**: You will need API keys for Google Gemini, Qdrant, and ArangoDB (shared via internal secure vault).
 - **Local Infrastructure**:
     - **PostgreSQL**: For relational data and relational RAG fallback.
     - **Redis**: For Celery task queue and caching.
@@ -67,8 +67,8 @@ graph TD
     - `supervisor.py`: Higher-order planning.
     - `base.py`: The abstract interface for all agent capabilities.
 3. **Memory Layer (`src/ai/memory/`)**:
-    - **Vector Search**: Pinecone/PostgreSQL for semantic history.
-    - **Knowledge Graph**: Neo4j/ArangoDB for entity relationship tracking.
+    - **Vector Search**: Qdrant/PostgreSQL for semantic history.
+    - **Knowledge Graph**: ArangoDB for entity relationship tracking.
 4. **Tool/Integration Layer (`src/tools/`, `src/integrations/`)**: The "Muscle". Actions like `send_email` or `create_task`.
 
 ---
