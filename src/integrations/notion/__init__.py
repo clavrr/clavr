@@ -4,7 +4,7 @@ Notion Integration Module
 Provides complete Notion integration for Clavr agent implementing three key capabilities:
 
 1. 🔍 Enhanced Knowledge and RAG (Retrieval)
-   - Graph-Grounded Search: Uses Notion API + Neo4j for contextual retrieval
+   - Graph-Grounded Search: Uses Notion API + ArangoDB for contextual retrieval
    - Cross-Platform Synthesis: Combines Slack + Notion + other systems
    - Instant Knowledge Capture: Monitors Notion databases in real-time
 

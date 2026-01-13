@@ -7,7 +7,7 @@ from datetime import datetime
 
 from ..celery_app import celery_app
 from ..base_task import BaseTask, PriorityTask
-from ...utils.logger import setup_logger
+from src.utils.logger import setup_logger
 
 logger = setup_logger(__name__)
 
@@ -35,7 +35,7 @@ def send_email_notification(
     logger.info(f"Sending email notification to {user_email}")
     
     try:
-        from ...utils.config import load_config
+        from src.utils.config import load_config
         
         config = load_config()
         
@@ -177,8 +177,8 @@ def send_task_reminder(
     logger.info(f"Sending task reminder for task {task_id} to user {user_id}")
     
     try:
-        from ...database import get_db_context
-        from ...database import User
+        from src.database import get_db_context
+        from src.database import User
         
         # Get user email
         with get_db_context() as db:
@@ -228,9 +228,9 @@ def send_digest_email(
     logger.info(f"Sending {period} digest to user {user_id}")
     
     try:
-        from ...database import get_db_context
-        from ...database import User
-        from ...database.models import Session as DBSession
+        from src.database import get_db_context
+        from src.database import User
+        from src.database.models import Session as DBSession
         from datetime import timedelta
         
         # Get user
@@ -342,8 +342,8 @@ def send_alert(
     logger.info(f"Sending {severity} alert to user {user_id}: {alert_type}")
     
     try:
-        from ...database import get_db_context
-        from ...database import User
+        from src.database import get_db_context
+        from src.database import User
         
         # Get user
         with get_db_context() as db:

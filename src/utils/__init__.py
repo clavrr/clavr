@@ -57,7 +57,25 @@ from .api import (
 from .performance import (
     PerformanceContext,
     track_time,
-    timed
+    timed,
+    LatencyMonitor
+)
+from .attachment_processor import AttachmentProcessor
+from .sanitization import (
+    sanitize_html,
+    sanitize_string,
+    sanitize_email,
+    sanitize_url,
+    sanitize_filename,
+    sanitize_dict,
+    create_html_sanitizer,
+    create_string_sanitizer
+)
+from .secrets import (
+    SecretsManager,
+    get_secrets_manager,
+    get_secret,
+    get_required_secret
 )
 from .user.user_utils import extract_first_name
 from .datetime import FlexibleDateParser
@@ -112,9 +130,25 @@ __all__ = [
     'PerformanceContext',
     'track_time',
     'timed',
+    'LatencyMonitor',
+    # Attachment processor
+    'AttachmentProcessor',
+    # Sanitization utilities
+    'sanitize_html',
+    'sanitize_string',
+    'sanitize_email',
+    'sanitize_url',
+    'sanitize_filename',
+    'sanitize_dict',
+    'create_html_sanitizer',
+    'create_string_sanitizer',
+    # Secrets utilities
+    'SecretsManager',
+    'get_secrets_manager',
+    'get_secret',
+    'get_required_secret',
     # User utilities
     'extract_first_name',
     # DateTime utilities
     'FlexibleDateParser',
 ]
-

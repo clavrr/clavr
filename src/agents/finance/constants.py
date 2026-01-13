@@ -1,0 +1,5 @@
+
+"""
+Constants for Finance Agent
+"""
+

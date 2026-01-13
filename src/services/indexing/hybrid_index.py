@@ -4,8 +4,8 @@ Hybrid Index Coordinator
 Coordinates between Knowledge Graph (structured reasoning) and Vector Store (semantic search).
 Provides a unified indexing and querying interface.
 
-Vector Store: RAGEngine ONLY (Pinecone primary, PostgreSQL fallback)
-Graph Store: Neo4j or NetworkX
+Vector Store: RAGEngine ONLY (Qdrant primary, PostgreSQL fallback)
+Graph Store: ArangoDB or NetworkX
 
 """
 import asyncio
@@ -25,7 +25,7 @@ from .graph_rag_constants import (
     GRAPH_SCORE_NORMALIZATION_FACTOR,
     MAX_NEIGHBORS_FOR_CONTEXT,
 )
-from ...utils.logger import setup_logger
+from src.utils.logger import setup_logger
 
 logger = setup_logger(__name__)
 
@@ -68,16 +68,16 @@ class HybridIndexCoordinator:
         
         Args:
             graph_manager: Knowledge graph manager instance
-            rag_engine: RAGEngine instance (Pinecone/PostgreSQL)
+            rag_engine: RAGEngine instance (Qdrant/PostgreSQL)
             enable_graph: Whether to use graph indexing
             enable_vector: Whether to use vector indexing
         """
-        from ...ai.rag import RAGEngine
+        from src.ai.rag import RAGEngine
         
         if not isinstance(rag_engine, RAGEngine):
             raise TypeError(
                 f"HybridIndexCoordinator requires RAGEngine, got {type(rag_engine).__name__}. "
-                "Only Pinecone and PostgreSQL vector stores are supported."
+                "Only Qdrant and PostgreSQL vector stores are supported."
             )
         
         self.graph = graph_manager

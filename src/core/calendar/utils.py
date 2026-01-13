@@ -12,40 +12,26 @@ from datetime import datetime, timedelta
 import pytz
 import re
 
-from ...utils.config import get_timezone
+from ...utils import get_timezone, FlexibleDateParser
 from ...utils.logger import setup_logger
+from ...utils.config import ConfigDefaults
 
 logger = setup_logger(__name__)
 
 
-# ============================================================================
 # CONSTANTS
-# ============================================================================
 
-DEFAULT_TIMEZONE = "America/Los_Angeles"
-DEFAULT_DURATION_MINUTES = 60
-DEFAULT_DAYS_AHEAD = 7
+DEFAULT_DURATION_MINUTES = ConfigDefaults.CALENDAR_DEFAULT_DURATION
+DEFAULT_DAYS_AHEAD = ConfigDefaults.CALENDAR_SEARCH_DAYS_AHEAD
 
 
-# ============================================================================
 # TIMEZONE HELPERS
-# ============================================================================
 
 def get_user_timezone(config: Optional[Any] = None) -> str:
     """
     Get the user's configured timezone, with a sensible default.
-    
-    Args:
-        config: Optional configuration object
-        
-    Returns:
-        Timezone string (e.g., "America/Los_Angeles")
     """
-    if config:
-        tz = get_timezone(config)
-        if tz:
-            return tz
-    return DEFAULT_TIMEZONE
+    return get_timezone(config)
 
 
 def get_utc_now() -> datetime:
@@ -88,187 +74,43 @@ def parse_datetime_with_timezone(
     """
     Parse a datetime string, handling various formats and timezones.
     
-    Handles:
-    - ISO format with timezone (2025-01-15T14:00:00-08:00)
-    - ISO format UTC (2025-01-15T14:00:00Z)
-    - ISO format naive (2025-01-15T14:00:00) - assumes configured timezone
-    - Date only (2025-01-15) - assumes 9:00 AM in configured timezone
-    - Natural language with timezone: "3 pm PST", "10am PST", "2:30 PM EST"
-    
-    Args:
-        time_str: Datetime string to parse
-        config: Optional configuration object for timezone
-        prefer_future: If True, prefer future dates when ambiguous
-        
-    Returns:
-        Parsed datetime with timezone info, or None if parsing fails
+    Uses FlexibleDateParser for robust natural language and ISO parsing.
     """
     if not time_str:
         return None
     
-    tz_name = get_user_timezone(config)
-    local_tz = pytz.timezone(tz_name)
+    try:
+        parser = FlexibleDateParser(config)
+        result = parser.parse_date_expression(time_str, prefer_future=prefer_future)
+        
+        if result:
+            dt = result['start']
+            logger.info(f"Parsed datetime '{time_str}' using FlexibleDateParser -> {dt.isoformat()}")
+            return dt
+            
+    except Exception as e:
+        logger.warning(f"FlexibleDateParser failed for '{time_str}': {e}")
     
+    # Fallback to basic ISO parsing if FlexibleDateParser fails
     try:
         # Handle UTC timezone (Z suffix)
         if time_str.endswith('Z'):
             dt = datetime.fromisoformat(time_str.replace('Z', '+00:00'))
+            tz_name = get_user_timezone(config)
+            local_tz = pytz.timezone(tz_name)
             return dt.astimezone(local_tz)
         
-        # Handle explicit timezone offset (+08:00, -05:00)
-        # IMPORTANT: Preserve the original timezone - don't convert!
-        # This is critical for PST/PDT and other explicit timezones
-        if re.search(r'[+-]\d{2}:\d{2}$', time_str):
-            dt = datetime.fromisoformat(time_str)
-            # Preserve the original timezone - don't convert to configured timezone
-            # The caller can convert if needed, but we preserve the user's intent
-            return dt
-        
-        # Handle ISO format without timezone (assume configured timezone)
-        if 'T' in time_str:
+        # Handle ISO format
+        if 'T' in time_str or re.match(r'^\d{4}-\d{2}-\d{2}$', time_str):
             dt = datetime.fromisoformat(time_str)
             if dt.tzinfo is None:
+                tz_name = get_user_timezone(config)
+                local_tz = pytz.timezone(tz_name)
+                # If date only, set to 9 AM
+                if 'T' not in time_str:
+                    dt = dt.replace(hour=9, minute=0, second=0, microsecond=0)
                 dt = local_tz.localize(dt)
             return dt
-        
-        # Handle date-only format (assume 9:00 AM in configured timezone)
-        if re.match(r'^\d{4}-\d{2}-\d{2}$', time_str):
-            dt = datetime.fromisoformat(time_str)
-            dt = dt.replace(hour=9, minute=0, second=0, microsecond=0)
-            dt = local_tz.localize(dt)
-            return dt
-        
-        # NEW: Handle natural language time formats with timezone abbreviations
-        # Examples: "3 pm PST", "10am PST", "2:30 PM EST", "tomorrow at 3 pm PST"
-        time_str_lower = time_str.lower().strip()
-        
-        # Map timezone abbreviations to pytz timezones
-        tz_abbrev_map = {
-            'pst': 'America/Los_Angeles',  # Pacific Standard Time
-            'pdt': 'America/Los_Angeles',   # Pacific Daylight Time
-            'est': 'America/New_York',      # Eastern Standard Time
-            'edt': 'America/New_York',     # Eastern Daylight Time
-            'cst': 'America/Chicago',       # Central Standard Time
-            'cdt': 'America/Chicago',       # Central Daylight Time
-            'mst': 'America/Denver',        # Mountain Standard Time
-            'mdt': 'America/Denver',        # Mountain Daylight Time
-            'utc': 'UTC',
-            'gmt': 'GMT',
-        }
-        
-        # Extract timezone abbreviation if present
-        specified_tz = None
-        tz_abbrev = None
-        for abbrev, tz_name in tz_abbrev_map.items():
-            if abbrev in time_str_lower:
-                specified_tz = pytz.timezone(tz_name)
-                tz_abbrev = abbrev
-                logger.info(f"Found timezone abbreviation '{abbrev}' -> {tz_name}")
-                break
-        
-        # Extract time patterns - handle formats like "3 pm", "10am", "2:30 PM"
-        # Order matters: more specific patterns first
-        time_patterns = [
-            r'(\d{1,2}):(\d{2})\s*(am|pm)',  # "2:30 pm" or "2:30pm"
-            r'(\d{1,2})(am|pm)',              # "10am" or "3pm" (no space)
-            r'(\d{1,2})\s+(am|pm)',           # "3 pm" or "10 am" (with space)
-            r'(\d{1,2}):(\d{2})',             # "14:30" (24-hour format)
-        ]
-        
-        hour = None
-        minute = 0
-        for pattern in time_patterns:
-            match = re.search(pattern, time_str_lower)
-            if match:
-                try:
-                    hour = int(match.group(1))
-                    minute = 0
-                    am_pm = None
-                    
-                    # Determine which groups contain what based on pattern
-                    num_groups = len(match.groups())
-                    
-                    if num_groups >= 3:
-                        # Pattern has hour:minute:am/pm format (e.g., "2:30 pm")
-                        try:
-                            minute = int(match.group(2))
-                        except (ValueError, IndexError):
-                            minute = 0
-                        am_pm = match.group(3).lower() if match.group(3) else None
-                    elif num_groups >= 2:
-                        # Could be hour:minute OR hour:am/pm
-                        group2 = match.group(2)
-                        # Check if group 2 is a number (minutes) or am/pm
-                        if group2.isdigit():
-                            minute = int(group2)
-                            # Check for am/pm in group 3 if it exists
-                            if num_groups >= 3 and match.group(3):
-                                am_pm = match.group(3).lower()
-                        else:
-                            # Group 2 is am/pm (e.g., "10am" pattern)
-                            am_pm = group2.lower()
-                    
-                    # Convert to 24-hour format
-                    if am_pm == 'pm' and hour < 12:
-                        hour += 12
-                    elif am_pm == 'am' and hour == 12:
-                        hour = 0
-                    
-                    logger.debug(f"Parsed time: hour={hour}, minute={minute}, am_pm={am_pm} from pattern '{pattern}'")
-                    break
-                except (ValueError, IndexError, AttributeError) as e:
-                    logger.debug(f"Error parsing time pattern '{pattern}': {e}")
-                    continue
-        
-        # Extract date - try to parse relative dates first
-        now = datetime.now(local_tz)
-        target_date = now
-        
-        # Handle relative dates
-        if 'tomorrow' in time_str_lower:
-            target_date = now + timedelta(days=1)
-        elif 'today' in time_str_lower:
-            target_date = now
-        elif 'next week' in time_str_lower:
-            target_date = now + timedelta(days=7)
-        else:
-            # Try to extract specific date
-            # For now, default to today if no date specified
-            target_date = now
-        
-        if hour is not None:
-            # Create datetime with extracted time
-            dt = target_date.replace(hour=hour, minute=minute, second=0, microsecond=0)
-        else:
-            # No time specified - use business hours default (10 AM) instead of midnight
-            dt = target_date.replace(hour=10, minute=0, second=0, microsecond=0)
-        
-        # Apply timezone if specified
-        if specified_tz:
-            # If the datetime is naive, localize it to the specified timezone
-            if dt.tzinfo is None:
-                dt = specified_tz.localize(dt)
-            else:
-                # Convert to specified timezone
-                dt = dt.astimezone(specified_tz)
-        else:
-            # No timezone specified, use configured timezone
-            if dt.tzinfo is None:
-                dt = local_tz.localize(dt)
-        
-        logger.info(f"Parsed natural language time '{time_str}' -> {dt.isoformat()}")
-        return dt
-        
-    except (ValueError, TypeError) as e:
-        logger.warning(f"Failed to parse datetime '{time_str}': {e}")
-        return None
-    
-    # If we get here, try to parse as ISO date (fallback)
-    try:
-        dt = datetime.fromisoformat(time_str)
-        dt = dt.replace(hour=9, minute=0, second=0, microsecond=0)
-        dt = local_tz.localize(dt)
-        return dt
     except (ValueError, TypeError):
         pass
     
@@ -386,7 +228,7 @@ def calculate_time_range(
     start_date: Optional[datetime] = None,
     end_date: Optional[datetime] = None,
     days_back: int = 0,
-    days_ahead: int = 7,
+    days_ahead: int = ConfigDefaults.CALENDAR_SEARCH_DAYS_AHEAD,
     config: Optional[Any] = None
 ) -> Tuple[datetime, datetime]:
     """
@@ -455,6 +297,12 @@ def calculate_time_range(
             end_date = end_date.astimezone(user_tz)
         
         end_user = end_date
+        
+        # SMART EXPANSION: If start and end are identical and at midnight (common for date-only queries),
+        # expand end_user to the end of the day so we don't return an empty 0-second range.
+        if end_user == start_user and end_user.hour == 0 and end_user.minute == 0:
+            end_user = end_user.replace(hour=23, minute=59, second=59, microsecond=999999)
+            logger.debug(f"[CAL] Expanded identical start/end range to end of day: {end_user}")
     else:
         # CRITICAL: Handle special cases for date range calculation
         if days_ahead == 0 and days_back > 0:
@@ -491,6 +339,11 @@ def parse_event_time(event_time_obj: Dict[str, Any]) -> Optional[datetime]:
     """
     if not event_time_obj:
         return None
+        
+    # If already a datetime object, return it directly
+    if isinstance(event_time_obj, datetime):
+        return event_time_obj
+
     
     date_time = event_time_obj.get('dateTime')
     if date_time:
@@ -503,7 +356,8 @@ def parse_event_time(event_time_obj: Dict[str, Any]) -> Optional[datetime]:
     if date:
         try:
             dt = datetime.fromisoformat(date)
-            return dt.replace(hour=0, minute=0, second=0, microsecond=0)
+            # All-day events are UTC-based by convention in our system to avoid naive comparisons
+            return dt.replace(hour=0, minute=0, second=0, microsecond=0, tzinfo=pytz.UTC)
         except (ValueError, AttributeError):
             return None
     
@@ -547,6 +401,8 @@ def extract_event_details(event: Dict[str, Any]) -> Dict[str, Any]:
         - attendees: List of attendee emails
         - description: Event description
         - html_link: Link to event in Google Calendar
+        - transparency: Event transparency (opaque/transparent)
+        - event_type: Event type (default, outOfOffice, workingLocation)
     """
     start_dt = parse_event_time(event.get('start', {}))
     end_dt = parse_event_time(event.get('end', {}))
@@ -568,7 +424,9 @@ def extract_event_details(event: Dict[str, Any]) -> Dict[str, Any]:
         'location': event.get('location', ''),
         'attendees': attendees,
         'description': event.get('description', ''),
-        'html_link': event.get('htmlLink', '')
+        'html_link': event.get('htmlLink', ''),
+        'transparency': event.get('transparency', 'opaque'),
+        'event_type': event.get('eventType', 'default')
     }
 
 
@@ -863,15 +721,14 @@ def resolve_name_to_email_via_graph(
     user_id: Optional[int] = None
 ) -> Optional[str]:
     """
-    Resolve a person's name to their email address using Neo4j graph (Contact Resolver role).
+    Resolve a person's name to their email address using ArangoDB graph (Contact Resolver role).
     
     This implements the architecture pattern:
-    MATCH (a:Alias {value: 'Maniko'})-[:HAS_ALIAS]-(p:Person)-[:HAS_EMAIL]->(e:EmailAddress)
-    RETURN e.address
+    (p:Person {name: 'Maniko'})-[:HAS_EMAIL]->(e:Email)
     
     Args:
         name: Person's name (e.g., "Maniko", "John Smith")
-        graph_manager: KnowledgeGraphManager instance for Neo4j queries
+        graph_manager: KnowledgeGraphManager instance for ArangoDB queries
         user_id: Optional user ID for multi-user support
         
     Returns:
@@ -890,12 +747,12 @@ def resolve_name_to_email_via_graph(
         return None
     
     try:
-        # Build Cypher query according to architecture:
-        # MATCH (a:Alias {value: 'Maniko'})-[:HAS_ALIAS]-(p:Person)-[:HAS_EMAIL]->(e:EmailAddress)
-        # RETURN e.address
+        # Build graph query according to architecture:
+        # Find person by alias and return their email address
         
         # Use case-insensitive matching for better results
-        cypher_query = """
+        # First try exact match, then try partial/fuzzy match
+        graph_query = """
         MATCH (a:Alias)
         WHERE toLower(a.value) = toLower($name)
         MATCH (a)<-[:HAS_ALIAS]-(p:Person)
@@ -906,7 +763,7 @@ def resolve_name_to_email_via_graph(
         
         # Add user_id filter if provided (for multi-user support)
         if user_id:
-            cypher_query = """
+            graph_query = """
             MATCH (a:Alias)
             WHERE toLower(a.value) = toLower($name)
             MATCH (a)<-[:HAS_ALIAS]-(p:Person)
@@ -920,40 +777,43 @@ def resolve_name_to_email_via_graph(
         if user_id:
             params["user_id"] = user_id
         
-        # Execute query (graph_manager.query is async, so we need to handle it)
-        import asyncio
-        try:
-            # Try to get the current event loop
+        # Helper function to execute graph query
+        def execute_graph_query(query: str, params: dict) -> Optional[List[Dict[str, Any]]]:
+            """Execute a graph query and return results"""
             try:
-                loop = asyncio.get_event_loop()
-                if loop.is_running():
-                    # We're in an async context - create new event loop in thread
-                    import concurrent.futures
-                    def run_in_new_loop():
-                        new_loop = asyncio.new_event_loop()
-                        asyncio.set_event_loop(new_loop)
-                        try:
-                            return new_loop.run_until_complete(
-                                graph_manager.query(cypher_query, params=params)
-                            )
-                        finally:
-                            new_loop.close()
-                    
-                    with concurrent.futures.ThreadPoolExecutor() as executor:
-                        future = executor.submit(run_in_new_loop)
-                        results = future.result(timeout=5.0)
-                else:
-                    # Event loop exists but not running - use it
-                    results = loop.run_until_complete(graph_manager.query(cypher_query, params=params))
-            except RuntimeError:
-                # No event loop - create one
-                results = asyncio.run(graph_manager.query(cypher_query, params=params))
-        except Exception as e:
-            logger.warning(f"[CAL] Graph query execution failed: {e}")
-            return None
+                import asyncio
+                try:
+                    try:
+                        loop = asyncio.get_event_loop()
+                        if loop.is_running():
+                            import concurrent.futures
+                            def run_in_new_loop():
+                                new_loop = asyncio.new_event_loop()
+                                asyncio.set_event_loop(new_loop)
+                                try:
+                                    return new_loop.run_until_complete(
+                                        graph_manager.query(query, params=params)
+                                    )
+                                finally:
+                                    new_loop.close()
+                            
+                            with concurrent.futures.ThreadPoolExecutor() as executor:
+                                future = executor.submit(run_in_new_loop)
+                                return future.result(timeout=5.0)
+                        else:
+                            return loop.run_until_complete(graph_manager.query(query, params=params))
+                    except RuntimeError:
+                        return asyncio.run(graph_manager.query(query, params=params))
+                except Exception as e:
+                    logger.warning(f"[CAL] Graph query execution failed: {e}")
+                    return None
+            except Exception as e:
+                logger.debug(f"[CAL] Graph query failed: {e}")
+                return None
         
+        # Try exact match first
+        results = execute_graph_query(graph_query, params)
         if results and len(results) > 0:
-            # Extract email from result
             result = results[0]
             if isinstance(result, dict):
                 email = result.get('email') or result.get('e.address')
@@ -962,36 +822,80 @@ def resolve_name_to_email_via_graph(
             
             if email:
                 email_address = email.lower().strip()
-                logger.info(f"[CAL] Resolved name '{name}' to email '{email_address}' via Neo4j graph")
+                logger.info(f"[CAL] Resolved name '{name}' to email '{email_address}' via ArangoDB graph (exact match)")
+                return email_address
+        
+        # If exact match failed, try partial/fuzzy match (contains)
+        # This helps find "Nick" when stored as "Nicholas" or "Nicky"
+        fuzzy_query = """
+        MATCH (a:Alias)
+        WHERE toLower(a.value) CONTAINS toLower($name) OR toLower($name) CONTAINS toLower(a.value)
+        MATCH (a)<-[:HAS_ALIAS]-(p:Person)
+        MATCH (p)-[:HAS_EMAIL]->(e:EmailAddress)
+        RETURN e.address AS email, a.value AS alias
+        ORDER BY 
+            CASE 
+                WHEN toLower(a.value) = toLower($name) THEN 1
+                WHEN toLower(a.value) STARTS WITH toLower($name) THEN 2
+                WHEN toLower($name) STARTS WITH toLower(a.value) THEN 3
+                ELSE 4
+            END
+        LIMIT 1
+        """
+        
+        if user_id:
+            fuzzy_query = """
+            MATCH (a:Alias)
+            WHERE toLower(a.value) CONTAINS toLower($name) OR toLower($name) CONTAINS toLower(a.value)
+            MATCH (a)<-[:HAS_ALIAS]-(p:Person)
+            WHERE p.user_id = $user_id OR p.user_id IS NULL
+            MATCH (p)-[:HAS_EMAIL]->(e:EmailAddress)
+            RETURN e.address AS email, a.value AS alias
+            ORDER BY 
+                CASE 
+                    WHEN toLower(a.value) = toLower($name) THEN 1
+                    WHEN toLower(a.value) STARTS WITH toLower($name) THEN 2
+                    WHEN toLower($name) STARTS WITH toLower(a.value) THEN 3
+                    ELSE 4
+                END
+            LIMIT 1
+            """
+        
+        results = execute_graph_query(fuzzy_query, params)
+        if results and len(results) > 0:
+            result = results[0]
+            if isinstance(result, dict):
+                email = result.get('email') or result.get('e.address')
+            else:
+                email = str(result)
+            
+            if email:
+                email_address = email.lower().strip()
+                logger.info(f"[CAL] Resolved name '{name}' to email '{email_address}' via ArangoDB graph (fuzzy match)")
                 return email_address
         
         logger.debug(f"[CAL] Could not resolve name '{name}' to email via graph")
         return None
         
     except Exception as e:
-        logger.warning(f"[CAL] Failed to resolve name '{name}' via graph: {e}")
+        logger.debug(f"[CAL] Graph lookup failed for '{name}': {e}. Will try RAG and email search fallbacks.")
         return None
 
 
-def resolve_name_to_email(
+def resolve_name_to_email_via_rag(
     name: str,
-    email_service: Optional[Any] = None,
-    config: Optional[Any] = None,
-    graph_manager: Optional[Any] = None,
+    rag_engine: Optional[Any] = None,
     user_id: Optional[int] = None
 ) -> Optional[str]:
     """
-    Resolve a person's name to their email address.
+    Resolve a person's name to their email address using Qdrant/RAG semantic search.
     
-    This function implements the Contact Resolver role with a two-tier approach:
-    1. First, try Neo4j graph lookup (fast, accurate, uses Person/Alias/EmailAddress nodes)
-    2. Fallback to email search if graph doesn't have the contact
+    This uses semantic similarity to find person names even with variations
+    (e.g., "Nick" will match "Nicholas", "Nicky", etc. in the email index).
     
     Args:
-        name: Person's name (e.g., "Maniko", "John Smith")
-        email_service: Optional EmailService instance for fallback email search
-        config: Optional config for creating EmailService if needed
-        graph_manager: Optional KnowledgeGraphManager instance for Neo4j graph lookup
+        name: Person's name (e.g., "Nick", "John Smith")
+        rag_engine: RAGEngine instance for Qdrant semantic search
         user_id: Optional user ID for multi-user support
         
     Returns:
@@ -1000,67 +904,473 @@ def resolve_name_to_email(
     if not name or not name.strip():
         return None
     
+    if not rag_engine:
+        logger.debug(f"[CAL] Cannot resolve name '{name}' via RAG - no rag_engine provided")
+        return None
+    
+    try:
+        # Search for emails FROM this person specifically (not just mentioning them)
+        # Use multiple query variations to find emails where the person is the sender
+        # Priority: emails FROM the person, then emails where person's email appears in content
+        queries = [
+            f"email from {name} sent by {name}",
+            f"{name} email address contact",
+            f"email sender {name}"
+        ]
+        
+        all_results = []
+        seen_ids = set()
+        
+        # Try multiple queries and combine results
+        for query in queries:
+            results = rag_engine.search(
+                query=query,
+                k=10,  # Get fewer results per query to avoid duplicates
+                filters={'user_id': str(user_id)} if user_id else None,
+                rerank=True,
+                min_confidence=0.3
+            )
+            
+            # Deduplicate results by content hash or metadata
+            for result in results:
+                result_id = result.get('id') or hash(str(result.get('content', ''))[:100])
+                if result_id not in seen_ids:
+                    seen_ids.add(result_id)
+                    all_results.append(result)
+        
+        # Limit to top 20 unique results
+        results = all_results[:20]
+        
+        if results and len(results) > 0:
+            # Extract email addresses from search results
+            email_pattern = re.compile(r'([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})')
+            found_emails = []
+            name_lower = name.lower().strip()
+            name_parts = name_lower.split()  # Split name into parts for better matching
+            
+            # Helper function to check if email matches the person's name
+            def email_matches_name(email: str, name: str, name_parts: list) -> float:
+                """Check if email address matches the person's name. Returns confidence score (0-1)."""
+                email_lower = email.lower()
+                email_username = email_lower.split('@')[0] if '@' in email_lower else email_lower
+                name_lower = name.lower()
+                
+                # Exact name match in username (highest confidence)
+                # e.g., "anthony" in "manikoanthony" or "anthony" in "anthony.smith"
+                if name_lower in email_username:
+                    return 1.0
+                
+                # All name parts appear in username
+                if all(part in email_username for part in name_parts if len(part) > 2):
+                    return 0.9
+                
+                # First name or last name in username
+                if len(name_parts) > 0:
+                    first_name = name_parts[0]
+                    if first_name in email_username and len(first_name) > 2:
+                        return 0.8  # Increased from 0.7
+                    if len(name_parts) > 1:
+                        last_name = name_parts[-1]
+                        if last_name in email_username and len(last_name) > 2:
+                            return 0.8  # Increased from 0.7
+                
+                # Partial match (e.g., "anthony" -> "anthony" or "maniko" -> "maniko")
+                for part in name_parts:
+                    if len(part) > 3 and part in email_username:
+                        return 0.6  # Increased from 0.5
+                
+                # More lenient: check if any significant part of name appears
+                for part in name_parts:
+                    if len(part) > 2 and part in email_username:
+                        return 0.4  # Lower confidence but still acceptable
+                
+                return 0.0  # No match
+            
+            # Filter out obviously wrong emails (generic, no-reply, etc.)
+            def is_valid_person_email(email: str) -> bool:
+                """Check if email looks like a real person's email (not generic)."""
+                email_lower = email.lower()
+                invalid_patterns = [
+                    'noreply', 'no-reply', 'donotreply', 'do-not-reply',
+                    'email@', 'mail@', 'info@', 'contact@', 'support@',
+                    'booking@', 'reservation@', 'automated@', 'system@',
+                    'notification@', 'alerts@', 'newsletter@', 'marketing@'
+                ]
+                return not any(pattern in email_lower for pattern in invalid_patterns)
+            
+            logger.info(f"[CAL] Processing {len(results)} RAG results for name '{name}'")
+            for idx, result in enumerate(results):
+                # Check metadata for sender/recipient email
+                metadata = result.get('metadata', {})
+                content = result.get('content', '') or ''
+                score = result.get('score', 0) or result.get('distance', 1.0)
+                
+                # Log first few results for debugging
+                if idx < 3:
+                    logger.debug(
+                        f"[CAL] RAG result {idx+1}/{len(results)}: score={score:.3f}, "
+                        f"metadata_keys={list(metadata.keys())}, "
+                        f"sender={metadata.get('sender', 'N/A')[:50]}, "
+                        f"content_preview={str(content)[:150]}"
+                    )
+                
+                # Try to extract from metadata first (most reliable)
+                sender = metadata.get('sender', '') or metadata.get('from', '') or metadata.get('sender_email', '') or ''
+                recipient = metadata.get('recipient', '') or metadata.get('to', '') or metadata.get('recipient_email', '') or ''
+                
+                # Also extract emails from content (lower priority but still useful)
+                content_str = str(content)
+                
+                # Prioritize sender emails over recipient emails, then content
+                # When searching for "Anthony", we want emails FROM Anthony, not TO Anthony
+                priority_order = [
+                    ('sender', sender, 3.0),  # Sender emails get 3x priority boost
+                    ('recipient', recipient, 1.0),  # Recipient emails get normal priority
+                    ('content', content_str, 0.5)  # Content emails get lower priority
+                ]
+                
+                for source_type, field, priority_multiplier in priority_order:
+                    if field:
+                        matches = email_pattern.findall(str(field))
+                        for match in matches:
+                            email_lower = match.lower().strip()
+                            
+                            # Skip obviously invalid emails
+                            if not is_valid_person_email(email_lower):
+                                if idx < 3:  # Only log first few for debugging
+                                    logger.debug(f"[CAL] Skipping invalid email pattern: {email_lower}")
+                                continue
+                            
+                            # Only add if it's not already in the list
+                            if email_lower not in [e['email'] for e in found_emails]:
+                                # Check if email matches the person's name
+                                name_match_score = email_matches_name(email_lower, name_lower, name_parts)
+                                
+                                # More lenient validation:
+                                # 1. Name matches email (high confidence)
+                                # 2. Name appears in sender field (medium confidence)
+                                # 3. Name appears in content near email (lower confidence)
+                                name_in_field = name_lower in str(field).lower()
+                                name_in_content = name_lower in content_str.lower() if source_type == 'content' else False
+                                
+                                # Accept if: name matches email OR name in sender field OR (name in content AND email looks valid)
+                                should_include = (
+                                    name_match_score > 0 or
+                                    (source_type == 'sender' and name_in_field) or
+                                    (source_type == 'content' and name_in_content and name_match_score >= 0.4)
+                                )
+                                
+                                if should_include:
+                                    # If no name match but from sender field, give it some confidence
+                                    if name_match_score == 0:
+                                        if source_type == 'sender' and name_in_field:
+                                            name_match_score = 0.5  # Medium confidence for sender field
+                                        elif source_type == 'content' and name_in_content:
+                                            name_match_score = 0.4  # Lower confidence for content
+                                        else:
+                                            name_match_score = 0.3  # Minimal confidence
+                                    
+                                    # Calculate priority: sender emails get higher priority
+                                    adjusted_score = score * priority_multiplier * (1.0 + name_match_score)
+                                    
+                                    # Extra bonus if name appears in field text
+                                    if name_in_field or name_in_content:
+                                        adjusted_score *= 1.3
+                                    
+                                    found_emails.append({
+                                        'email': email_lower,
+                                        'score': adjusted_score,
+                                        'source': source_type,
+                                        'original_score': score,
+                                        'name_match': name_match_score
+                                    })
+                                    logger.debug(
+                                        f"[CAL] Found candidate email: {email_lower} "
+                                        f"(source: {source_type}, name_match: {name_match_score:.2f}, "
+                                        f"score: {adjusted_score:.2f})"
+                                    )
+                                elif idx < 3:  # Only log first few rejections
+                                    logger.debug(
+                                        f"[CAL] Rejected email (no match): {email_lower} "
+                                        f"(name_match: {name_match_score:.2f}, source: {source_type})"
+                                    )
+            
+            if found_emails:
+                # Sort by adjusted score (higher is better), prioritizing sender emails and name matches
+                found_emails.sort(
+                    key=lambda x: (x['score'], x['name_match'], x['source'] == 'sender'),
+                    reverse=True
+                )
+                best_email = found_emails[0]['email']
+                best_source = found_emails[0]['source']
+                name_match = found_emails[0].get('name_match', 0)
+                logger.info(
+                    f"[CAL] Resolved name '{name}' to email '{best_email}' via RAG semantic search "
+                    f"(source: {best_source}, name_match: {name_match:.2f}, score: {found_emails[0]['score']:.2f})"
+                )
+                return best_email
+            else:
+                # Only log detailed info at debug level to reduce noise
+                # The system will fall back to email search which works reliably
+                logger.debug(
+                    f"[CAL] RAG search found {len(results)} results for '{name}' but none contained valid person emails. "
+                    f"Falling back to email search (Tier 3)."
+                )
+        
+        logger.debug(f"[CAL] RAG search did not find valid email for '{name}', will try email search fallback")
+        return None
+        
+    except Exception as e:
+        logger.debug(f"[CAL] RAG search failed for '{name}': {e}. Will try email search fallback.")
+        return None
+
+
+def resolve_name_to_email(
+    name: str,
+    email_service: Optional[Any] = None,
+    config: Optional[Any] = None,
+    graph_manager: Optional[Any] = None,
+    user_id: Optional[int] = None,
+    rag_engine: Optional[Any] = None
+) -> Optional[str]:
+    """
+    Resolve a person's name to their email address.
+    
+    This function implements the Contact Resolver role with a three-tier approach:
+    1. First, try ArangoDB graph lookup (fast, accurate, uses Person/Alias/EmailAddress nodes)
+    2. Then, try Qdrant/RAG semantic search (finds names even with variations like "Nick" vs "Nicholas")
+    3. Finally, fallback to email search if graph and RAG don't have the contact
+    
+    Args:
+        name: Person's name (e.g., "Maniko", "John Smith", "Nick")
+        email_service: Optional EmailService instance for fallback email search
+        config: Optional config (currently unused)
+        graph_manager: Optional KnowledgeGraphManager instance for ArangoDB graph lookup
+        user_id: Optional user ID for multi-user support
+        rag_engine: Optional RAGEngine instance for Qdrant semantic search
+        
+    Returns:
+        Email address if found, None otherwise
+    """
+    # Suppress unused parameter warning
+    _ = config
+    if not name or not name.strip():
+        return None
+    
     # Check if it's already an email address
     email_pattern = re.compile(r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$')
     if email_pattern.match(name.strip()):
         return name.strip().lower()
     
-    # TIER 1: Try Neo4j graph lookup first (Contact Resolver role)
+    # Log what services are available
+    logger.info(
+        f"[CAL] Resolving name '{name}' to email - "
+        f"graph_manager: {graph_manager is not None}, "
+        f"rag_engine: {rag_engine is not None}, "
+        f"email_service: {email_service is not None}, "
+        f"user_id: {user_id}"
+    )
+    
+    # TIER 1: Try ArangoDB graph lookup first (Contact Resolver role)
     if graph_manager:
+        logger.debug(f"[CAL] Attempting ArangoDB graph lookup for '{name}'")
         email = resolve_name_to_email_via_graph(name, graph_manager, user_id)
         if email:
+            logger.info(f"[CAL] Resolved name '{name}' to email '{email}' via ArangoDB graph")
             return email
+        else:
+            logger.debug(f"[CAL] ArangoDB graph lookup failed for '{name}'")
+    else:
+        logger.debug(f"[CAL] No graph_manager available, skipping ArangoDB lookup")
     
-    # TIER 2: Fallback to email search if graph doesn't have the contact
+    # TIER 2: Try Qdrant/RAG semantic search for name variations
+    if rag_engine:
+        logger.debug(f"[CAL] Attempting RAG semantic search for '{name}'")
+        email = resolve_name_to_email_via_rag(name, rag_engine, user_id)
+        if email:
+            logger.info(f"[CAL] Resolved name '{name}' to email '{email}' via RAG semantic search")
+            return email
+        else:
+            logger.debug(f"[CAL] RAG search did not find email for '{name}', trying email search fallback")
+    else:
+        logger.debug(f"[CAL] No rag_engine available, skipping RAG search (will use email search)")
+    
+    # TIER 3: Fallback to email search if graph and RAG don't have the contact
     if not email_service:
-        logger.debug(f"[CAL] Cannot resolve name '{name}' to email - no email_service or graph_manager provided")
+        logger.debug(f"[CAL] Cannot resolve name '{name}' to email - no email_service provided (graph and RAG also failed). This is expected if email service is not available.")
         return None
     
+    logger.debug(f"[CAL] Attempting email search fallback for '{name}'")
+    
     try:
-        # Search for emails from this person (most recent first)
-        # Use intelligent sender matching
-        emails = email_service.search_emails(
+        # Search for emails FROM this person first (most reliable)
+        # When searching for "Anthony", we want emails FROM Anthony, not TO Anthony
+        emails_from = email_service.search_emails(
             from_email=name,
-            limit=5  # Get a few results to find the email address
+            limit=20  # Get more results to find the best match
         )
         
-        if emails and len(emails) > 0:
-            # Extract email address from the first result (most recent)
-            first_email = emails[0]
-            sender = first_email.get('from') or first_email.get('sender', '')
-            
-            if sender:
-                # Extract email from formats like "Name <email@domain.com>" or just "email@domain.com"
-                email_match = re.search(r'([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})', sender)
-                if email_match:
-                    email_address = email_match.group(1).lower().strip()
-                    logger.info(f"[CAL] Resolved name '{name}' to email '{email_address}' from email search")
-                    return email_address
+        found_emails = []
+        name_lower = name.lower().strip()
+        name_parts = name_lower.split()
+        email_pattern = re.compile(r'([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})')
         
-        # Also try searching emails TO this person (in case they're a recipient)
-        emails_to = email_service.search_emails(
-            to_email=name,
-            limit=5
-        )
-        
-        if emails_to and len(emails_to) > 0:
-            # Extract email from 'to' field
-            first_email = emails_to[0]
-            to_field = first_email.get('to', '')
+        # Helper function to check if email matches the person's name (same as RAG function)
+        def email_matches_name(email: str, name: str, name_parts: list) -> float:
+            """Check if email address matches the person's name. Returns confidence score (0-1)."""
+            email_lower = email.lower()
+            email_username = email_lower.split('@')[0] if '@' in email_lower else email_lower
+            name_lower = name.lower()
             
-            if to_field:
-                # Extract email from formats like "Name <email@domain.com>" or just "email@domain.com"
-                email_match = re.search(r'([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})', to_field)
-                if email_match:
-                    email_address = email_match.group(1).lower().strip()
-                    logger.info(f"[CAL] Resolved name '{name}' to email '{email_address}' from recipient search")
-                    return email_address
+            # Exact name match in username (highest confidence)
+            # e.g., "anthony" in "manikoanthony" or "anthony" in "anthony.smith"
+            if name_lower in email_username:
+                return 1.0
+            
+            # All name parts appear in username
+            if all(part in email_username for part in name_parts if len(part) > 2):
+                return 0.9
+            
+            # First name or last name in username
+            if len(name_parts) > 0:
+                first_name = name_parts[0]
+                if first_name in email_username and len(first_name) > 2:
+                    return 0.8  # Increased from 0.7
+                if len(name_parts) > 1:
+                    last_name = name_parts[-1]
+                    if last_name in email_username and len(last_name) > 2:
+                        return 0.8  # Increased from 0.7
+            
+            # Partial match (e.g., "anthony" -> "anthony" or "maniko" -> "maniko")
+            for part in name_parts:
+                if len(part) > 3 and part in email_username:
+                    return 0.6  # Increased from 0.5
+            
+            # More lenient: check if any significant part of name appears
+            for part in name_parts:
+                if len(part) > 2 and part in email_username:
+                    return 0.4  # Lower confidence but still acceptable
+            
+            return 0.0  # No match
+        
+        # Filter out obviously wrong emails
+        def is_valid_person_email(email: str) -> bool:
+            """Check if email looks like a real person's email (not generic)."""
+            email_lower = email.lower()
+            invalid_patterns = [
+                'noreply', 'no-reply', 'donotreply', 'do-not-reply',
+                'email@', 'mail@', 'info@', 'contact@', 'support@',
+                'booking@', 'reservation@', 'automated@', 'system@',
+                'notification@', 'alerts@', 'newsletter@', 'marketing@'
+            ]
+            return not any(pattern in email_lower for pattern in invalid_patterns)
+        
+        # Process emails FROM this person (highest priority)
+        if emails_from and len(emails_from) > 0:
+            for email in emails_from:
+                sender = email.get('from') or email.get('sender', '')
+                if sender:
+                    matches = email_pattern.findall(str(sender))
+                    for match in matches:
+                        email_lower = match.lower().strip()
+                        
+                        # Skip invalid emails
+                        if not is_valid_person_email(email_lower):
+                            logger.debug(f"[CAL] Skipping invalid email pattern: {email_lower}")
+                            continue
+                        
+                        if email_lower not in [e['email'] for e in found_emails]:
+                            # Check if name appears in sender field and email matches name
+                            sender_lower = str(sender).lower()
+                            name_match_score = email_matches_name(email_lower, name_lower, name_parts)
+                            
+                            # Include emails with name match OR if name appears in sender field (more lenient)
+                            if name_match_score > 0 or (name_lower in sender_lower):
+                                # If no name match but name in sender field, give it some confidence
+                                if name_match_score == 0:
+                                    name_match_score = 0.3  # Give it some confidence if from sender field
+                                priority = 3.0 if name_lower in sender_lower else 2.0
+                                priority *= (1.0 + name_match_score)  # Boost based on name match
+                                
+                                found_emails.append({
+                                    'email': email_lower,
+                                    'priority': priority,
+                                    'source': 'from',
+                                    'sender_field': sender,
+                                    'name_match': name_match_score
+                                })
+                                logger.debug(
+                                    f"[CAL] Found candidate email: {email_lower} "
+                                    f"(name_match: {name_match_score:.2f}, priority: {priority:.2f})"
+                                )
+                            else:
+                                logger.debug(f"[CAL] Rejected email (no name match): {email_lower}")
+        
+        # Only search emails TO this person if we didn't find any FROM emails
+        # This prevents picking the wrong email (e.g., picking recipient email instead of sender)
+        if not found_emails:
+            emails_to = email_service.search_emails(
+                to_email=name,
+                limit=20
+            )
+            
+            if emails_to and len(emails_to) > 0:
+                for email in emails_to:
+                    to_field = email.get('to', '')
+                    if to_field:
+                        matches = email_pattern.findall(str(to_field))
+                        for match in matches:
+                            email_lower = match.lower().strip()
+                            
+                            # Skip invalid emails
+                            if not is_valid_person_email(email_lower):
+                                continue
+                            
+                            if email_lower not in [e['email'] for e in found_emails]:
+                                name_match_score = email_matches_name(email_lower, name_lower, name_parts)
+                                
+                                # Only include if name matches OR if name appears in recipient field
+                                if name_match_score > 0 or name_lower in str(to_field).lower():
+                                    if name_match_score == 0:
+                                        name_match_score = 0.2  # Give some confidence if name in field
+                                    found_emails.append({
+                                        'email': email_lower,
+                                        'priority': 1.0 * (1.0 + name_match_score),  # Lower priority for recipient emails
+                                        'source': 'to',
+                                        'to_field': to_field,
+                                        'name_match': name_match_score
+                                    })
+                                    logger.debug(
+                                        f"[CAL] Found candidate email from recipient: {email_lower} "
+                                        f"(name_match: {name_match_score:.2f})"
+                                    )
+        
+        if found_emails:
+            # Sort by priority (higher is better), prioritizing sender emails and name matches
+            found_emails.sort(
+                key=lambda x: (x['priority'], x.get('name_match', 0), x['source'] == 'from'),
+                reverse=True
+            )
+            best_email = found_emails[0]['email']
+            best_source = found_emails[0]['source']
+            name_match = found_emails[0].get('name_match', 0)
+            logger.info(
+                f"[CAL] Resolved name '{name}' to email '{best_email}' from email search "
+                f"(source: {best_source}, name_match: {name_match:.2f}, priority: {found_emails[0]['priority']:.2f}, "
+                f"total candidates: {len(found_emails)})"
+            )
+            return best_email
+        else:
+            logger.debug(
+                f"[CAL] Email search found {len(emails_from) if emails_from else 0} emails FROM '{name}' "
+                f"but none passed validation (this is expected if no matching emails exist)"
+            )
         
         logger.debug(f"[CAL] Could not resolve name '{name}' to email address")
         return None
         
     except Exception as e:
-        logger.warning(f"[CAL] Failed to resolve name '{name}' to email: {e}")
+        logger.debug(f"[CAL] Email search failed for '{name}': {e}. This is expected if email service is unavailable.")
         return None
 
 
@@ -1069,7 +1379,8 @@ def resolve_attendees_to_emails(
     email_service: Optional[Any] = None,
     config: Optional[Any] = None,
     graph_manager: Optional[Any] = None,
-    user_id: Optional[int] = None
+    user_id: Optional[int] = None,
+    rag_engine: Optional[Any] = None
 ) -> Tuple[List[str], List[str]]:
     """
     Resolve attendee names to email addresses.
@@ -1084,7 +1395,14 @@ def resolve_attendees_to_emails(
         - resolved_emails: List of valid email addresses
         - unresolved_names: List of names that couldn't be resolved
     """
+    logger.debug(
+        f"[CAL] resolve_attendees_to_emails called with {len(attendees) if attendees else 0} attendees, "
+        f"services: email_service={email_service is not None}, "
+        f"graph_manager={graph_manager is not None}, rag_engine={rag_engine is not None}, user_id={user_id}"
+    )
+    
     if not attendees:
+        logger.debug("[CAL] resolve_attendees_to_emails called with empty attendees list (this is normal if no attendees specified)")
         return ([], [])
     
     resolved_emails = []
@@ -1096,18 +1414,29 @@ def resolve_attendees_to_emails(
             continue
         
         attendee = attendee.strip()
+        logger.debug(f"[CAL] Resolving attendee: '{attendee}'")
         
         # If it's already an email, use it directly
         if email_pattern.match(attendee):
+            logger.debug(f"[CAL] Attendee '{attendee}' is already an email address")
             resolved_emails.append(attendee.lower())
         else:
-            # Try to resolve name to email (uses graph first, then email search)
-            email = resolve_name_to_email(attendee, email_service, config, graph_manager, user_id)
+            # Try to resolve name to email (uses graph first, then RAG, then email search)
+            logger.debug(f"[CAL] Attempting to resolve name '{attendee}' to email...")
+            email = resolve_name_to_email(attendee, email_service, config, graph_manager, user_id, rag_engine)
             if email:
+                logger.info(f"[CAL] Successfully resolved '{attendee}' to '{email}'")
                 resolved_emails.append(email)
             else:
+                logger.debug(f"[CAL] Could not resolve '{attendee}' to email (will be added to unresolved list)")
                 unresolved_names.append(attendee)
     
+    if resolved_emails or unresolved_names:
+        logger.info(
+            f"[CAL] Resolution complete: {len(resolved_emails)} resolved, {len(unresolved_names)} unresolved"
+        )
+        if unresolved_names:
+            logger.info(f"[CAL] Unresolved names: {unresolved_names}")
     return (resolved_emails, unresolved_names)
 
 

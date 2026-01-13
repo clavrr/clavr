@@ -401,7 +401,7 @@ def sync_all_users_emails(self) -> Dict[str, Any]:
     try:
         with get_db_context() as db:
             users = db.query(User).filter(
-                User.initial_indexing_complete == True,
+                (User.initial_indexing_complete == True) | (User.indexing_status == 'completed'),
                 User.indexing_status != 'failed'
             ).all()
             

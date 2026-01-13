@@ -25,17 +25,20 @@ Usage:
     async for chunk in LLMFactory.stream_llm_response(config, "Hello"):
         print(chunk, end="")
 """
-from typing import Optional, AsyncGenerator, Generator
+from typing import Optional, AsyncGenerator, Generator, Dict, Any, List
 from threading import Lock
+import asyncio
 
-from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_google_genai import ChatGoogleGenerativeAI, HarmCategory, HarmBlockThreshold
 
 from ..utils.config import Config
 from ..utils.logger import setup_logger
 from .llm_constants import (
     PROVIDER_GEMINI, PROVIDER_GOOGLE,
-    GEMINI_ALIASES, DEFAULT_TEMPERATURE, DEFAULT_TRANSPORT,
-    LOG_ERROR, LOG_INFO, LOG_DEBUG
+    GEMINI_ALIASES, ALLOWED_MODELS, DEFAULT_TEMPERATURE, DEFAULT_MAX_TOKENS,
+    DEFAULT_TOP_P, DEFAULT_TOP_K, DEFAULT_TRANSPORT,
+    GEMINI_SAFETY_SETTINGS,
+    LOG_ERROR, LOG_INFO, LOG_DEBUG, LOG_OK
 )
 
 logger = setup_logger(__name__)
@@ -60,8 +63,8 @@ class LLMFactory:
     _instance: Optional['LLMFactory'] = None
     _lock: Lock = Lock()
     
-    # Google Gemini client cache
-    _google_client: Optional[ChatGoogleGenerativeAI] = None
+    # Google Gemini client cache (keyed by configuration parameters)
+    _client_cache: Dict[str, ChatGoogleGenerativeAI] = {}
     
     def __new__(cls):
         """Thread-safe singleton implementation"""
@@ -137,6 +140,49 @@ class LLMFactory:
             )
     
     @staticmethod
+    def _resolve_safety_settings(settings: Optional[Any]) -> Dict[HarmCategory, HarmBlockThreshold]:
+        """
+        Convert string-based safety settings to official enums.
+        """
+        if not settings:
+            return {}
+            
+        resolved = {}
+        # Mapping for string to enum conversion
+        category_map = {
+            "HARM_CATEGORY_HARASSMENT": HarmCategory.HARM_CATEGORY_HARASSMENT,
+            "HARM_CATEGORY_HATE_SPEECH": HarmCategory.HARM_CATEGORY_HATE_SPEECH,
+            "HARM_CATEGORY_SEXUALLY_EXPLICIT": HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT,
+            "HARM_CATEGORY_DANGEROUS_CONTENT": HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT,
+        }
+        threshold_map = {
+            "BLOCK_NONE": HarmBlockThreshold.BLOCK_NONE,
+            "BLOCK_LOW_AND_ABOVE": HarmBlockThreshold.BLOCK_LOW_AND_ABOVE,
+            "BLOCK_MEDIUM_AND_ABOVE": HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE,
+            "BLOCK_ONLY_HIGH": HarmBlockThreshold.BLOCK_ONLY_HIGH,
+        }
+        
+        # Handle list of dicts (Google format)
+        if isinstance(settings, list):
+            for item in settings:
+                cat_str = item.get('category')
+                thr_str = item.get('threshold')
+                cat = category_map.get(cat_str)
+                thr = threshold_map.get(thr_str)
+                if cat and thr:
+                    resolved[cat] = thr
+                    
+        # Handle dict format
+        elif isinstance(settings, dict):
+            for cat_str, thr_str in settings.items():
+                cat = category_map.get(cat_str)
+                thr = threshold_map.get(thr_str)
+                if cat and thr:
+                    resolved[cat] = thr
+                    
+        return resolved
+
+    @staticmethod
     def _extract_chunk_content(chunk) -> str:
         """
         Extract text content from a streaming chunk.
@@ -164,7 +210,10 @@ class LLMFactory:
     def get_google_llm(
         config: Config,
         temperature: float = DEFAULT_TEMPERATURE,
-        max_tokens: Optional[int] = None
+        max_tokens: Optional[int] = None,
+        top_p: float = DEFAULT_TOP_P,
+        top_k: int = DEFAULT_TOP_K,
+        safety_settings: Optional[Dict[str, str]] = None
     ) -> ChatGoogleGenerativeAI:
         """
         Get or create Google Gemini LLM client with caching.
@@ -187,70 +236,105 @@ class LLMFactory:
         LLMFactory._validate_temperature(temperature)
         LLMFactory._validate_max_tokens(max_tokens)
         
+        # Strict project-wide model validation
+        model_name = config.ai.model
+        if model_name not in ALLOWED_MODELS:
+            raise ValueError(
+                f"Model '{model_name}' is not allowed. "
+                f"This project strictly uses only: {', '.join(ALLOWED_MODELS)}"
+            )
+        
         factory = LLMFactory()
         
-        # Use cached client if parameters match
-        if (factory._google_client is None or 
-            factory._google_client.temperature != temperature):
-            
-            try:
-                factory._google_client = ChatGoogleGenerativeAI(
-                    model=config.ai.model,  # type: ignore[arg-type]
-                    google_api_key=config.ai.api_key,  # type: ignore[arg-type]
-                    temperature=temperature,
-                    max_output_tokens=max_tokens or config.ai.max_tokens,  # type: ignore[arg-type]
-                    transport=DEFAULT_TRANSPORT  # type: ignore[arg-type]
-                )
-                logger.debug(
-                    f"{LOG_DEBUG} Created Google LLM client "
-                    f"(model={config.ai.model}, temp={temperature}, "
-                    f"max_tokens={max_tokens or config.ai.max_tokens})"
-                )
-            except Exception as e:
-                logger.error(f"{LOG_ERROR} Failed to create Google LLM client: {e}")
-                raise ValueError(f"Failed to create Google LLM client: {e}") from e
+        # Resolve parameters
+        limit = max_tokens or config.ai.max_tokens or DEFAULT_MAX_TOKENS
+        resolved_safety = LLMFactory._resolve_safety_settings(safety_settings or GEMINI_SAFETY_SETTINGS)
         
-        return factory._google_client
+        # Generate stable cache key based on configuration
+        # Safety settings are stabilized to ensure consistent keys
+        safety_parts = []
+        for cat, thr in sorted(resolved_safety.items(), key=lambda x: str(x[0])):
+            safety_parts.append(f"{cat}:{thr}")
+        safety_key = "|".join(safety_parts)
+            
+        cache_key = f"{config.ai.model}:{temperature}:{limit}:{top_p}:{top_k}:{safety_key}"
+        
+        # Return cached client if available
+        if cache_key in factory._client_cache:
+            return factory._client_cache[cache_key]
+            
+        try:
+            # Create new client 
+            client = ChatGoogleGenerativeAI(
+                model=config.ai.model,  # type: ignore[arg-type]
+                google_api_key=config.ai.api_key,  # type: ignore[arg-type]
+                temperature=temperature,
+                max_output_tokens=limit,  # type: ignore[arg-type]
+                top_p=top_p,
+                top_k=top_k,
+                safety_settings=resolved_safety, # type: ignore[arg-type]
+                transport=DEFAULT_TRANSPORT  # type: ignore[arg-type]
+            )
+            
+            # Cache the new client
+            factory._client_cache[cache_key] = client
+            
+            logger.debug(
+                f"{LOG_DEBUG} Created Google LLM client "
+                f"(key={cache_key})"
+            )
+            return client
+            
+        except Exception as e:
+            logger.error(f"{LOG_ERROR} Failed to create Google LLM client: {e}")
+            raise ValueError(f"Failed to create Google LLM client: {e}") from e
     
     @staticmethod
     def get_llm_for_provider(
         config: Config, 
         temperature: Optional[float] = None,
-        max_tokens: Optional[int] = None
+        max_tokens: Optional[int] = None,
+        top_p: Optional[float] = None,
+        top_k: Optional[int] = None,
+        safety_settings: Optional[Dict[str, str]] = None
     ) -> ChatGoogleGenerativeAI:
         """
         Get LLM client for configured provider (main entry point).
         
-        This is the primary method for obtaining LLM clients. Currently only
-        supports Google Gemini providers.
+        Optimized for Google Gemini 1.5. Uses intelligent caching to reuse
+        clients with identical parameters.
         
         Args:
-            config: Configuration object with provider settings
-            temperature: Model temperature (uses config default if not specified)
-            max_tokens: Maximum output tokens (uses config default if not specified)
+            config: Configuration object
+            temperature: Model temperature (0.0 - 2.0)
+            max_tokens: Max output tokens
+            top_p: Top-p sampling
+            top_k: Top-k sampling
+            safety_settings: Gemini safety settings dict
             
         Returns:
             ChatGoogleGenerativeAI instance
-            
-        Raises:
-            ValueError: If provider is not supported or config is invalid
-            
-        Example:
-            >>> config = load_config()
-            >>> llm = LLMFactory.get_llm_for_provider(config, temperature=0.7)
-            >>> response = llm.invoke([HumanMessage(content="Hello")])
         """
         LLMFactory._validate_config(config)
         
         provider = config.ai.provider.lower()
-        temp = temperature if temperature is not None else config.ai.temperature
+        temp = temperature if temperature is not None else (config.ai.temperature or DEFAULT_TEMPERATURE)
+        p = top_p if top_p is not None else DEFAULT_TOP_P
+        k = top_k if top_k is not None else DEFAULT_TOP_K
         
         if provider in GEMINI_ALIASES:
-            return LLMFactory.get_google_llm(config, temperature=temp, max_tokens=max_tokens)
+            return LLMFactory.get_google_llm(
+                config, 
+                temperature=temp, 
+                max_tokens=max_tokens,
+                top_p=p,
+                top_k=k,
+                safety_settings=safety_settings
+            )
         else:
             raise ValueError(
                 f"Unsupported AI provider: '{provider}'. "
-                f"Only Gemini/Google providers are supported: {', '.join(GEMINI_ALIASES)}"
+                f"This project is strictly specialized for Google Gemini Flash."
             )
     
     @staticmethod
@@ -289,9 +373,14 @@ class LLMFactory:
         try:
             llm = LLMFactory.get_google_llm(config, temperature=temp)
             
-            # Stream the response using async iteration
-            async for chunk in llm.astream(prompt):
-                yield LLMFactory._extract_chunk_content(chunk)
+            # Using synchronous stream in an async generator loop as a robust fallback.
+            # astream currently has a ResponseIterator await bug in some library versions.
+            # We yield control with asyncio.sleep(0) to keep the loop responsive.
+            for chunk in llm.stream(prompt):
+                content = LLMFactory._extract_chunk_content(chunk)
+                if content:
+                    yield content
+                await asyncio.sleep(0)
                         
         except ValueError as e:
             logger.error(f"{LOG_ERROR} Unsupported provider for streaming: {e}", exc_info=True)
@@ -361,19 +450,21 @@ class LLMFactory:
             >>> llm = LLMFactory.get_llm_for_provider(config)  # Creates new instance
         """
         factory = LLMFactory()
-        factory._google_client = None
+        factory._client_cache.clear()
         logger.info(f"{LOG_INFO} Reset all LLM clients and caches")
     
     @staticmethod
-    def get_cache_stats() -> dict[str, bool]:
+    def get_cache_stats() -> dict[str, Any]:
         """
         Get statistics about cached LLM instances.
         
         Returns:
             Dictionary with cache statistics:
-            - google_client_cached: Whether Google client is cached
+            - client_count: Number of cached clients
+            - cache_keys: List of cache keys
         """
         factory = LLMFactory()
         return {
-            'google_client_cached': factory._google_client is not None
+            'client_count': len(factory._client_cache),
+            'cache_keys': list(factory._client_cache.keys())
         }

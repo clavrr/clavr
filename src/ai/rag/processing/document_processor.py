@@ -11,13 +11,19 @@ The pipeline ensures high-quality document processing for optimal retrieval.
 import asyncio
 from typing import List, Dict, Any, Optional, Union
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timezone
+import hashlib
+from typing import TYPE_CHECKING
 
 from ....utils.logger import setup_logger
-from ....services.indexing.parsers.attachment_parser import AttachmentParser
-from ....services.indexing.parsers.base import ParsedNode
+
+if TYPE_CHECKING:
+    from ....services.indexing.parsers.base import ParsedNode
+
 from ..chunking import RecursiveTextChunker
 from ..core.rag_engine import RAGEngine
+
+
 
 logger = setup_logger(__name__)
 
@@ -60,7 +66,11 @@ class DocumentProcessor:
             preserve_structure: Preserve document structure (headings, tables)
         """
         self.rag_engine = rag_engine
+        
+        # Local import to avoid circular dependency
+        from ....services.indexing.parsers.attachment_parser import AttachmentParser
         self.attachment_parser = AttachmentParser(llm_client=llm_client)
+
         
         # Initialize advanced recursive text chunker
         self.chunker = RecursiveTextChunker(
@@ -102,7 +112,8 @@ class DocumentProcessor:
         """
         # Read file if path provided
         if file_path and not file_bytes:
-            file_bytes = Path(file_path).read_bytes()
+            loop = asyncio.get_running_loop()
+            file_bytes = await loop.run_in_executor(None, Path(file_path).read_bytes)
             filename = filename or Path(file_path).name
         
         if not file_bytes or not filename:
@@ -110,7 +121,6 @@ class DocumentProcessor:
         
         # Generate doc_id if not provided
         if not doc_id:
-            import hashlib
             doc_id = f"doc_{hashlib.md5(file_bytes).hexdigest()[:12]}"
         
         logger.info(f"Processing document: {filename} (id: {doc_id})")
@@ -197,7 +207,33 @@ class DocumentProcessor:
         
         return results
     
-    def _extract_content_from_node(self, parsed_node: ParsedNode) -> Dict[str, Any]:
+    def _extract_content_from_node(self, parsed_node: 'ParsedNode') -> Dict[str, Any]:
+        """
+        Extract content and structure from parsed node.
+        
+        Args:
+            parsed_node: Parsed document node from AttachmentParser
+        """
+        properties = parsed_node.properties
+        
+        # Extract main text
+        text = properties.get('full_text', '')
+        
+        # Extract structured elements
+        tables = properties.get('tables', [])
+        headings = properties.get('headings', [])
+        sections = properties.get('sections', [])
+        
+        return {
+            'text': text,
+            'tables': tables,
+            'headings': headings,
+            'sections': sections,
+            'has_tables': len(tables) > 0,
+            'doc_type': properties.get('doc_type', 'document')
+        }
+    
+    def _extract_content_from_node(self, parsed_node: 'ParsedNode') -> Dict[str, Any]:
         """
         Extract content and structure from parsed node.
         
@@ -414,7 +450,7 @@ class DocumentProcessor:
                 'chunk_index': idx,
                 'total_chunks': len(chunks),
                 'chunk_type': chunk.get('chunk_type', 'text'),
-                'indexed_at': datetime.utcnow().isoformat()
+                'indexed_at': datetime.now(timezone.utc).isoformat()
             }
             
             # Add chunk-specific metadata

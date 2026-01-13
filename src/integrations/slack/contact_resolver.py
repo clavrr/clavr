@@ -1,7 +1,7 @@
 """
 Slack Contact Resolver
 
-Resolves Slack user IDs/names to email addresses using Slack API and Neo4j graph.
+Resolves Slack user IDs/names to email addresses using Slack API and ArangoDB graph.
 Implements the Contact Resolver role from the architecture.
 """
 from typing import Optional, Dict, Any
@@ -20,7 +20,7 @@ class SlackContactResolver:
     
     Resolves Slack user IDs/names to email addresses using:
     1. Slack API (users:read.email scope) - gets email from Slack
-    2. Neo4j graph lookup - matches email to Person nodes in graph
+    2. ArangoDB graph lookup - matches email to Person nodes in graph
     
     This implements the Contact Resolver role from the architecture.
     """
@@ -36,7 +36,7 @@ class SlackContactResolver:
         
         Args:
             slack_client: SlackClient instance for API calls
-            graph_manager: Optional KnowledgeGraphManager for Neo4j queries
+            graph_manager: Optional KnowledgeGraphManager for ArangoDB
             user_id: Optional user ID for multi-user support
         """
         self.slack_client = slack_client
@@ -88,7 +88,7 @@ class SlackContactResolver:
         """
         Resolve a name to email address using two-tier approach:
         1. If slack_user_id provided: Use Slack API to get email
-        2. Use Neo4j graph lookup to find email by name
+        2. Use ArangoDB graph lookup to find email by name
         
         This implements the Contact Resolver role from the architecture.
         
@@ -105,7 +105,7 @@ class SlackContactResolver:
             if email:
                 return email
         
-        # Tier 2: Use Neo4j graph lookup (Contact Resolver role)
+        # Tier 2: Use ArangoDB graph lookup (Contact Resolver role)
         if self.graph_manager:
             try:
                 # Use existing graph resolution function
@@ -116,7 +116,7 @@ class SlackContactResolver:
                 )
                 
                 if email:
-                    logger.info(f"Resolved name '{name}' to email '{email}' via Neo4j graph")
+                    logger.info(f"Resolved name '{name}' to email '{email}' via ArangoDB graph")
                     return email
                     
             except Exception as e:
@@ -162,4 +162,3 @@ class SlackContactResolver:
             Email address or None
         """
         return self.resolve_slack_user_to_email(slack_user_id)
-

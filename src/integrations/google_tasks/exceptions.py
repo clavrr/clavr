@@ -2,68 +2,45 @@
 Google Tasks-specific exceptions
 
 Provides structured error handling for Google Tasks API operations.
+Uses unified base exceptions from src.integrations.base_exceptions.
 """
 from typing import Optional, Dict, Any
-import traceback
+
+from src.integrations.base_exceptions import (
+    TaskServiceException,
+    ServiceUnavailableException as BaseServiceUnavailable,
+    AuthenticationException as BaseAuthException,
+    ConfigurationException as BaseConfigException,
+    ResourceNotFoundException,
+    ValidationException,
+    wrap_external_exception as base_wrap_exception,
+)
 
 
 def wrap_external_exception(
     exc: Exception,
-    service_name: str,
-    operation: str,
+    service_name: str = "GoogleTasks",
+    operation: str = "",
     details: Optional[Dict[str, Any]] = None
 ) -> 'TaskServiceException':
     """
     Wrap an external exception into a TaskServiceException with context.
-    
-    Args:
-        exc: The original exception to wrap
-        service_name: Name of the service where error occurred
-        operation: The operation that failed
-        details: Optional additional details
-        
-    Returns:
-        TaskServiceException with full context
     """
-    error_details = details or {}
-    error_details.update({
-        'operation': operation,
-        'original_error': str(exc),
-        'error_type': type(exc).__name__,
-        'traceback': traceback.format_exc()
-    })
-    
+    base_exc = base_wrap_exception(exc, service_name, operation, details)
     return TaskServiceException(
-        message=f"{service_name} operation '{operation}' failed: {str(exc)}",
-        service_name=service_name,
-        details=error_details,
-        cause=exc
+        message=base_exc.message,
+        service_name=base_exc.service_name,
+        details=base_exc.details,
+        cause=base_exc.cause
     )
 
 
-class TaskServiceException(Exception):
-    """Exception for task service operations"""
-    
-    def __init__(
-        self, 
-        message: str, 
-        service_name: str = "GoogleTasks",
-        details: Optional[Dict[str, Any]] = None,
-        cause: Optional[Exception] = None
-    ):
-        self.message = message
-        self.service_name = service_name
-        self.details = details or {}
-        self.cause = cause
-        super().__init__(self.message)
-
-
-class TaskNotFoundException(TaskServiceException):
+class TaskNotFoundException(TaskServiceException, ResourceNotFoundException):
     """Exception raised when task is not found"""
     pass
 
 
-class TaskValidationException(TaskServiceException):
+class TaskValidationException(TaskServiceException, ValidationException):
     """Exception raised when task validation fails"""
     pass
 
@@ -73,16 +50,16 @@ class TaskIntegrationException(TaskServiceException):
     pass
 
 
-class ServiceUnavailableException(TaskServiceException):
+class ServiceUnavailableException(TaskServiceException, BaseServiceUnavailable):
     """Exception raised when Tasks service is unavailable"""
     pass
 
 
-class AuthenticationException(TaskServiceException):
+class AuthenticationException(TaskServiceException, BaseAuthException):
     """Exception raised for Tasks authentication failures"""
     pass
 
 
-class ConfigurationException(TaskServiceException):
+class ConfigurationException(TaskServiceException, BaseConfigException):
     """Exception raised for Tasks configuration issues"""
     pass

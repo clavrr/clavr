@@ -2,7 +2,7 @@
 Knowledge Graph Package
 
 Manages the knowledge graph for structured email and document data.
-Supports both Neo4j (production) and in-memory NetworkX (fallback) backends.
+Supports both ArangoDB (production) and in-memory NetworkX (fallback) backends.
 
 New in Phase 2.5: GraphRAG Analyzer for reasoning and advice generation.
 """

@@ -11,9 +11,9 @@ from typing import Optional, Dict, Any
 from google.oauth2.credentials import Credentials
 from googleapiclient.errors import HttpError
 
-from ...utils.logger import setup_logger
-from ...core.email.google_client import GoogleGmailClient
-from ...utils.config import Config
+from src.utils.logger import setup_logger
+from src.core.email.google_client import GoogleGmailClient
+from src.utils.config import Config
 
 logger = setup_logger(__name__)
 
@@ -110,7 +110,12 @@ class GmailWatchService:
             
             history_id = response.get('historyId')
             expiration_ms = response.get('expiration')
-            expiration_dt = datetime.fromtimestamp(expiration_ms / 1000) if expiration_ms else None
+            # Convert expiration_ms to int if it's a string (Gmail API sometimes returns strings)
+            if expiration_ms:
+                expiration_ms = int(expiration_ms) if isinstance(expiration_ms, str) else expiration_ms
+                expiration_dt = datetime.fromtimestamp(expiration_ms / 1000)
+            else:
+                expiration_dt = None
             
             logger.info(
                 f"✅ Gmail watch setup successful! "
@@ -241,6 +246,8 @@ class GmailWatchService:
         if not expiration_ms:
             return False
         
+        # Convert expiration_ms to int if it's a string
+        expiration_ms = int(expiration_ms) if isinstance(expiration_ms, str) else expiration_ms
         expiration_dt = datetime.fromtimestamp(expiration_ms / 1000)
         return datetime.now() < expiration_dt
     

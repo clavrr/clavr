@@ -5,9 +5,9 @@ Handles automatic refresh of expired or soon-to-expire OAuth tokens
 and persists them back to the database with encryption.
 """
 import os
-import time
+import asyncio
 from datetime import datetime, timedelta
-from typing import Optional, Tuple, cast
+from typing import Optional, Tuple, cast, List
 from sqlalchemy.orm import Session
 
 from google.oauth2.credentials import Credentials
@@ -16,7 +16,7 @@ from google.auth.transport.requests import Request
 from ..database.models import Session as DBSession
 from ..utils.logger import setup_logger
 from ..utils import decrypt_token, encrypt_token
-from .oauth import SCOPES
+from .oauth import LOGIN_SCOPES, SCOPES
 from .audit import log_auth_event, AuditEventType
 
 logger = setup_logger(__name__)
@@ -25,6 +25,7 @@ logger = setup_logger(__name__)
 async def refresh_token_with_retry(
     db: Session,
     session: DBSession,
+    scopes: Optional[List[str]] = None,
     refresh_threshold_minutes: int = 5,
     max_retries: int = 3,
     backoff_factor: float = 2.0
@@ -48,6 +49,17 @@ async def refresh_token_with_retry(
         - was_refreshed: True if token was refreshed
         - credentials: Credentials object (refreshed or original)
     """
+    if scopes is None:
+        # Fallback 1: Use granted_scopes from session if available
+        if hasattr(session, 'granted_scopes') and session.granted_scopes:
+            scopes = session.granted_scopes.split(',')
+            logger.debug(f"Using granted_scopes from session: {scopes}")
+        else:
+            # Fallback 2: Use minimal login scopes instead of the full monolithic list
+            # This prevents invalid_scope errors for users who haven't granted all permissions
+            scopes = LOGIN_SCOPES
+            logger.debug(f"No scopes provided or found in session, using LOGIN_SCOPES: {scopes}")
+
     if not session.gmail_refresh_token:
         logger.debug(f"Session {session.id} has no refresh token - cannot refresh")
         return False, None
@@ -95,7 +107,7 @@ async def refresh_token_with_retry(
         token_uri="https://oauth2.googleapis.com/token",
         client_id=client_id,
         client_secret=client_secret,
-        scopes=SCOPES
+        scopes=scopes
     )
     
     # Set expiry from database if available
@@ -134,15 +146,15 @@ async def refresh_token_with_retry(
             credentials.refresh(Request())
             logger.info(f"Successfully refreshed token for session {session.id} (attempt {attempt + 1})")
             
-            # Encrypt refreshed token before saving to database
-            try:
-                encrypted_access_token = encrypt_token(credentials.token)
-            except Exception as e:
-                logger.error(f"Failed to encrypt refreshed token: {e}")
-                raise
-            
-            # Save encrypted token to database
+            # Encrypt and save refreshed tokens to database
+            # Google may rotate the refresh token, so we should check for it
+            encrypted_access_token = encrypt_token(credentials.token)
             session.gmail_access_token = cast(str, encrypted_access_token)
+            
+            if credentials.refresh_token and credentials.refresh_token != refresh_token:
+                logger.info(f"Refresh token rotated for session {session.id} - saving new token")
+                session.gmail_refresh_token = cast(str, encrypt_token(credentials.refresh_token))
+            
             if credentials.expiry:
                 session.token_expiry = credentials.expiry.replace(tzinfo=None)
             
@@ -263,7 +275,7 @@ async def refresh_token_with_retry(
                         f"(attempt {attempt + 1}/{max_retries}): {error_type}: {error_str}. "
                         f"Retrying in {wait_time}s..."
                     )
-                time.sleep(wait_time)
+                await asyncio.sleep(wait_time)
             else:
                 if is_network_error:
                     logger.error(
@@ -302,6 +314,7 @@ async def refresh_token_with_retry(
 async def refresh_token_if_needed(
     db: Session,
     session: DBSession,
+    scopes: Optional[List[str]] = None,
     refresh_threshold_minutes: int = 5
 ) -> Tuple[bool, Optional[Credentials]]:
     """
@@ -317,12 +330,13 @@ async def refresh_token_if_needed(
         - was_refreshed: True if token was refreshed
         - credentials: Credentials object (refreshed or original)
     """
-    return await refresh_token_with_retry(db, session, refresh_threshold_minutes)
+    return await refresh_token_with_retry(db, session, scopes=scopes, refresh_threshold_minutes=refresh_threshold_minutes)
 
 
 def get_valid_credentials(
     db: Session,
     session: DBSession,
+    scopes: Optional[List[str]] = None,
     auto_refresh: bool = True,
     refresh_threshold_minutes: int = 5
 ) -> Optional[Credentials]:
@@ -371,7 +385,7 @@ def get_valid_credentials(
             token_uri="https://oauth2.googleapis.com/token",
             client_id=client_id,
             client_secret=client_secret,
-            scopes=SCOPES
+            scopes=scopes or (session.granted_scopes.split(',') if hasattr(session, 'granted_scopes') and session.granted_scopes else LOGIN_SCOPES)
         )
         
         # CRITICAL: Set expiry from database to prevent unnecessary refresh attempts
@@ -405,7 +419,7 @@ def get_valid_credentials(
             token_uri="https://oauth2.googleapis.com/token",
             client_id=client_id,
             client_secret=client_secret,
-            scopes=SCOPES
+            scopes=scopes or (session.granted_scopes.split(',') if hasattr(session, 'granted_scopes') and session.granted_scopes else LOGIN_SCOPES)
         )
         
         # Set expiry from database
@@ -416,7 +430,7 @@ def get_valid_credentials(
     except RuntimeError:
         # No running event loop - we can use asyncio.run safely
         was_refreshed, credentials = asyncio.run(
-            refresh_token_with_retry(db, session, refresh_threshold_minutes)
+            refresh_token_with_retry(db, session, scopes=scopes, refresh_threshold_minutes=refresh_threshold_minutes)
         )
         return credentials
 
@@ -424,6 +438,7 @@ def get_valid_credentials(
 async def get_valid_credentials_async(
     db: Session,
     session: DBSession,
+    scopes: Optional[List[str]] = None,
     auto_refresh: bool = True,
     refresh_threshold_minutes: int = 5
 ) -> Optional[Credentials]:
@@ -472,7 +487,7 @@ async def get_valid_credentials_async(
             token_uri="https://oauth2.googleapis.com/token",
             client_id=client_id,
             client_secret=client_secret,
-            scopes=SCOPES
+            scopes=scopes or (session.granted_scopes.split(',') if hasattr(session, 'granted_scopes') and session.granted_scopes else LOGIN_SCOPES)
         )
         
         if session.token_expiry:
@@ -481,7 +496,7 @@ async def get_valid_credentials_async(
         return credentials
     
     # Auto-refresh if needed (async version)
-    was_refreshed, credentials = await refresh_token_if_needed(db, session, refresh_threshold_minutes)
+    was_refreshed, credentials = await refresh_token_if_needed(db, session, scopes=scopes, refresh_threshold_minutes=refresh_threshold_minutes)
     return credentials
 
 

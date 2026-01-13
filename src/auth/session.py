@@ -30,6 +30,7 @@ async def create_session(
     gmail_access_token: str,
     gmail_refresh_token: Optional[str] = None,
     token_expiry: Optional[datetime] = None,
+    granted_scopes: Optional[list] = None,
     days: int = 7,
     request: Optional[Request] = None
 ) -> DBSession:
@@ -49,6 +50,7 @@ async def create_session(
         gmail_access_token: Gmail API access token (will be encrypted)
         gmail_refresh_token: Gmail API refresh token (will be encrypted)
         token_expiry: Token expiration time
+        granted_scopes: List of OAuth scopes granted by user (e.g., ['openid', 'email', 'calendar'])
         days: Session duration in days
         request: FastAPI request (for audit logging)
         
@@ -69,12 +71,16 @@ async def create_session(
             detail="Failed to secure tokens"
         )
     
+    # Convert scopes list to comma-separated string for storage
+    scopes_str = ",".join(granted_scopes) if granted_scopes else None
+    
     # Create session with HASHED session token and ENCRYPTED Gmail tokens
     db_session = DBSession(
         user_id=user_id,
         session_token=hashed_token,  # Store HASH, not raw token
         gmail_access_token=encrypted_access_token,  # Store ENCRYPTED token
         gmail_refresh_token=encrypted_refresh_token,  # Store ENCRYPTED token
+        granted_scopes=scopes_str,  # Store granted OAuth scopes
         token_expiry=token_expiry,
         expires_at=datetime.utcnow() + timedelta(days=days)
     )
@@ -140,13 +146,10 @@ def get_session(db: Session, session_token: str) -> Optional[DBSession]:
     Returns:
         Session object or None if expired/not found
     """
-    # Debug logging - show FULL token for debugging
-    logger.warning(f"🔍 Looking up session - FULL RAW TOKEN: {session_token}")
-    logger.debug(f"Looking up session - token length: {len(session_token)}, first 20 chars: {session_token[:20]}...")
+    logger.debug(f"Looking up session - token length: {len(session_token)}")
     
     # Hash the incoming token to match stored hash
     hashed_token = hash_token(session_token)
-    logger.warning(f"🔍 Hashed token FULL: {hashed_token}")
     logger.debug(f"Hashed token (first 20 chars): {hashed_token[:20]}...")
     
     # Query by hashed token
@@ -155,15 +158,7 @@ def get_session(db: Session, session_token: str) -> Optional[DBSession]:
     ).first()
     
     if not session:
-        logger.warning(f"❌ No session found for hashed token")
-        # Debug: Check if ANY sessions exist and show their hashes
-        all_sessions = db.query(DBSession).all()
-        total_sessions = len(all_sessions)
-        logger.warning(f"📊 Total sessions in database: {total_sessions}")
-        if all_sessions:
-            logger.warning(f"🔍 Session hashes in DB:")
-            for s in all_sessions:
-                logger.warning(f"  - Session {s.id}: {s.session_token}")
+        logger.debug(f"No session found for hashed token")
         return None
     
     logger.debug(f"Found session: id={session.id}, user_id={session.user_id}, expires_at={session.expires_at}")
@@ -176,32 +171,77 @@ def get_session(db: Session, session_token: str) -> Optional[DBSession]:
     return session
 
 
+async def get_session_async(db, session_token: str) -> Optional[DBSession]:
+    """
+    Get session by token (ASYNC version with non-blocking database queries)
+    
+    Use this version in async contexts to avoid blocking the event loop.
+    
+    Security:
+        - Hashes the incoming raw token
+        - Compares hash against stored hash in database
+        - Never stores or logs raw tokens
+    
+    Args:
+        db: AsyncSession database session
+        session_token: Raw session token from client
+        
+    Returns:
+        Session object or None if expired/not found
+    """
+    from sqlalchemy import select
+    from datetime import datetime
+    
+    logger.debug(f"[ASYNC] Looking up session - token length: {len(session_token)}")
+    
+    # Hash the incoming token to match stored hash
+    hashed_token = hash_token(session_token)
+    logger.debug(f"[ASYNC] Hashed token (first 20 chars): {hashed_token[:20]}...")
+    
+    # Query by hashed token using async select
+    stmt = select(DBSession).where(
+        DBSession.session_token == hashed_token,
+        DBSession.expires_at > datetime.utcnow()
+    )
+    result = await db.execute(stmt)
+    session = result.scalar_one_or_none()
+    
+    if not session:
+        logger.debug(f"[ASYNC] No valid session found for hashed token")
+        return None
+    
+    logger.debug(f"[ASYNC] Found session: id={session.id}, user_id={session.user_id}")
+    return session
+
+
+from sqlalchemy import select
+
 async def delete_session(db: Session, session_token: str, request: Optional[Request] = None) -> bool:
     """
     Delete a session (logout) with secure hash verification
-    
-    Args:
-        db: Database session
-        session_token: Raw session token from client
-        request: FastAPI request (for audit logging)
-        
-    Returns:
-        True if deleted
     """
-    # Hash the incoming token to match stored hash
     hashed_token = hash_token(session_token)
+    stmt = select(DBSession).where(DBSession.session_token == hashed_token)
     
-    # Query by hashed token
-    session = db.query(DBSession).filter(
-        DBSession.session_token == hashed_token
-    ).first()
+    is_async = False
+    try:
+        result = await db.execute(stmt)
+        session = result.scalar_one_or_none()
+        is_async = True
+    except (AttributeError, TypeError):
+        result = db.execute(stmt)
+        session = result.scalar_one_or_none()
     
     if session:
         user_id = session.user_id
         session_id = session.id
         
-        db.delete(session)
-        db.commit()
+        db.delete(session) # Sync operation on both
+        
+        if is_async:
+            await db.commit()
+        else:
+            db.commit()
         
         # Log session deletion
         await log_auth_event(
@@ -222,22 +262,27 @@ async def delete_session(db: Session, session_token: str, request: Optional[Requ
 async def delete_user_sessions(db: Session, user_id: int, request: Optional[Request] = None) -> int:
     """
     Delete all sessions for a user (logout all devices)
-    
-    Args:
-        db: Database session
-        user_id: User ID
-        request: FastAPI request (for audit logging)
-        
-    Returns:
-        Number of sessions deleted
     """
-    sessions = db.query(DBSession).filter(DBSession.user_id == user_id).all()
+    stmt = select(DBSession).where(DBSession.user_id == user_id)
+    
+    is_async = False
+    try:
+        result = await db.execute(stmt)
+        sessions = result.scalars().all()
+        is_async = True
+    except (AttributeError, TypeError):
+        result = db.execute(stmt)
+        sessions = result.scalars().all()
+        
     count = len(sessions)
     
     for session in sessions:
-        db.delete(session)
+        db.delete(session) # Sync operation
     
-    db.commit()
+    if is_async:
+        await db.commit()
+    else:
+        db.commit()
     
     # Log logout event
     await log_auth_event(
@@ -251,6 +296,92 @@ async def delete_user_sessions(db: Session, user_id: int, request: Optional[Requ
     
     logger.info(f"Deleted {count} sessions for user_id: {user_id}")
     return count
+
+
+async def invalidate_other_sessions(
+    db: Session,
+    user_id: int,
+    current_session_id: int,
+    reason: str = "security_action",
+    request: Optional[Request] = None
+) -> int:
+    """
+    Invalidate all sessions except the current one.
+    """
+    stmt = select(DBSession).where(
+        DBSession.user_id == user_id,
+        DBSession.id != current_session_id
+    )
+    
+    is_async = False
+    try:
+        result = await db.execute(stmt)
+        other_sessions = result.scalars().all()
+        is_async = True
+    except (AttributeError, TypeError):
+        result = db.execute(stmt)
+        other_sessions = result.scalars().all()
+    
+    count = len(other_sessions)
+    
+    for session in other_sessions:
+        db.delete(session)
+    
+    if is_async:
+        await db.commit()
+    else:
+        db.commit()
+    
+    # Log the event
+    await log_auth_event(
+        db=db,
+        event_type=AuditEventType.SESSION_REVOKED,
+        user_id=user_id,
+        success=True,
+        request=request,
+        sessions_invalidated=count,
+        reason=reason,
+        kept_session_id=current_session_id
+    )
+    
+    logger.info(
+        f"Invalidated {count} other sessions for user_id: {user_id} (kept session {current_session_id}). "
+        f"Reason: {reason}"
+    )
+    return count
+
+
+async def invalidate_all_sessions_except(
+    db: Session,
+    user_id: int,
+    except_session_token: Optional[str] = None,
+    reason: str = "security_action",
+    request: Optional[Request] = None
+) -> int:
+    """
+    Invalidate all sessions for a user, optionally keeping one by token.
+    """
+    if except_session_token:
+        # Hash the token to find the session to keep
+        hashed_token = hash_token(except_session_token)
+        
+        stmt = select(DBSession).where(DBSession.session_token == hashed_token)
+        
+        # We need check usage here too, but can reuse helper logic or just try/except
+        try:
+            result = await db.execute(stmt)
+            current_session = result.scalar_one_or_none()
+        except (AttributeError, TypeError):
+            result = db.execute(stmt)
+            current_session = result.scalar_one_or_none()
+        
+        if current_session:
+            return await invalidate_other_sessions(
+                db, user_id, current_session.id, reason, request
+            )
+    
+    # If no token or session not found, invalidate all
+    return await delete_user_sessions(db, user_id, request)
 
 
 def rotate_session_token(
@@ -310,6 +441,9 @@ async def get_current_user(
     """
     Get current authenticated user from Bearer token or session cookie
     
+    OPTIMIZED: First checks request.state (populated by SessionMiddleware with caching)
+    before falling back to database lookup. This avoids redundant DB queries.
+    
     Supports two authentication methods:
     1. Bearer token in Authorization header (preferred for API calls)
     2. Session cookie (fallback for browser-based flows)
@@ -329,6 +463,13 @@ async def get_current_user(
     Raises:
         HTTPException 401: If authentication fails
     """
+    # FAST PATH: Check if SessionMiddleware already populated user in request.state
+    # This avoids redundant database queries when middleware cache is working
+    if hasattr(request.state, 'user') and request.state.user is not None:
+        logger.debug(f"Using cached user from middleware: user_id={request.state.user.id}")
+        return request.state.user
+    
+    # SLOW PATH: Fallback to database lookup (only if middleware didn't populate)
     session_token = None
     auth_method = None
     
@@ -360,7 +501,7 @@ async def get_current_user(
             headers={"WWW-Authenticate": "Bearer"},
         )
     
-    logger.info(f"Authenticating via {auth_method}")
+    logger.info(f"Authenticating via {auth_method} (middleware cache miss)")
     
     # Get session
     session = get_session(db, session_token)
@@ -384,6 +525,7 @@ async def get_current_user(
     
     logger.info(f"Authenticated user {user.id} ({user.email}) via {auth_method}")
     return user
+
 
 
 async def get_admin_user(

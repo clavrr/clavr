@@ -52,7 +52,7 @@ class GoogleGmailClient(BaseGoogleAPIClient):
     
     def _build_service(self) -> Any:
         """Build Gmail API service"""
-        return build('gmail', 'v1', credentials=self.credentials)
+        return build('gmail', 'v1', credentials=self.credentials, cache_discovery=False)
     
     def _get_required_scopes(self) -> List[str]:
         """Get required Gmail scopes"""
@@ -112,6 +112,13 @@ class GoogleGmailClient(BaseGoogleAPIClient):
             id=message_id,
             format=format
         ).execute()
+    
+    def get_message_raw(self, message_id: str, format: str = 'full') -> Dict[str, Any]:
+        """
+        Public wrapper for _get_message_with_retry to allow raw message access.
+        Useful for internal services that need the raw Gmail API response.
+        """
+        return self._get_message_with_retry(message_id, format=format)
     
     @with_gmail_circuit_breaker()
     @retry_gmail_api()
@@ -218,7 +225,6 @@ class GoogleGmailClient(BaseGoogleAPIClient):
         Returns:
             List of message details
         """
-        from googleapiclient.http import BatchHttpRequest
         from googleapiclient.errors import HttpError
         
         messages = []
@@ -236,24 +242,48 @@ class GoogleGmailClient(BaseGoogleAPIClient):
                 messages.append(response)
         
         try:
-            # Create batch request
-            batch = BatchHttpRequest(callback=callback)
+            # Limit batch size to avoid rate limiting (429 errors)
+            # Gmail API recommends max 100 per batch, but concurrent limits are stricter
+            MAX_BATCH_SIZE = 10
             
-            # Add all message requests to the batch
-            for msg_id in message_ids:
-                batch.add(
-                    self.service.users().messages().get(
-                        userId='me',
-                        id=msg_id,
-                        format=format
+            if len(message_ids) > MAX_BATCH_SIZE:
+                # Split into smaller batches to avoid rate limiting
+                import time
+                for i in range(0, len(message_ids), MAX_BATCH_SIZE):
+                    batch_ids = message_ids[i:i + MAX_BATCH_SIZE]
+                    batch = self.service.new_batch_http_request(callback=callback)
+                    
+                    for msg_id in batch_ids:
+                        batch.add(
+                            self.service.users().messages().get(
+                                userId='me',
+                                id=msg_id,
+                                format=format
+                            )
+                        )
+                    
+                    batch.execute()
+                    
+                    # Small delay between batches to avoid rate limiting
+                    if i + MAX_BATCH_SIZE < len(message_ids):
+                        time.sleep(0.1)  # 100ms delay
+            else:
+                # Single batch for small requests
+                batch = self.service.new_batch_http_request(callback=callback)
+                
+                for msg_id in message_ids:
+                    batch.add(
+                        self.service.users().messages().get(
+                            userId='me',
+                            id=msg_id,
+                            format=format
+                        )
                     )
-                )
-            
-            # Execute batch request (single HTTP call for all messages)
-            batch.execute()
+                
+                batch.execute()
             
             if errors:
-                logger.warning(f"Batch request had {len(errors)} errors out of {len(message_ids)} messages")
+                logger.debug(f"Batch request had {len(errors)} partial errors out of {len(message_ids)} messages")
             
             return messages
             
@@ -277,6 +307,7 @@ class GoogleGmailClient(BaseGoogleAPIClient):
     ) -> List[Dict[str, Any]]:
         """
         Fetch messages one by one (fallback for batch API failures)
+        Uses retry-protected method to handle transient network errors.
         
         Args:
             message_ids: List of message IDs to fetch
@@ -288,14 +319,25 @@ class GoogleGmailClient(BaseGoogleAPIClient):
         messages = []
         for msg_id in message_ids:
             try:
-                message = self.service.users().messages().get(
-                    userId='me',
-                    id=msg_id,
-                    format=format
-                ).execute()
+                # Use retry-protected method to handle network errors and timeouts
+                message = self._get_message_with_retry(msg_id, format=format)
                 messages.append(message)
             except Exception as e:
-                logger.warning(f"Failed to fetch message {msg_id}: {e}")
+                # Log error but continue with other messages
+                # Retry logic already attempted, so this is likely a permanent failure
+                error_type = type(e).__name__
+                error_msg = str(e)
+                
+                # Check if it's a transient error that might succeed later
+                is_transient = any(keyword in error_msg.lower() for keyword in [
+                    'timeout', 'timed out', 'no route to host', 'connection', 
+                    'network', 'temporary', 'retry'
+                ])
+                
+                if is_transient:
+                    logger.warning(f"Failed to fetch message {msg_id} after retries (transient error): {error_type}: {error_msg}")
+                else:
+                    logger.warning(f"Failed to fetch message {msg_id} after retries (permanent error): {error_type}: {error_msg}")
                 # Continue with other messages
                 continue
         
@@ -326,6 +368,8 @@ class GoogleGmailClient(BaseGoogleAPIClient):
             return []
         
         try:
+            # Default to INBOX only if label_ids is explicitly None.
+            # If label_ids is [] (empty list), it means "search all" (no label filter).
             if label_ids is None:
                 label_ids = [GMAIL_FOLDERS['inbox']]
             
@@ -574,10 +618,16 @@ class GoogleGmailClient(BaseGoogleAPIClient):
             'drafts': [GMAIL_FOLDERS['drafts']],
             'trash': [GMAIL_FOLDERS['trash']],
             'spam': [GMAIL_FOLDERS['spam']],
-            'important': [GMAIL_FOLDERS['important']]
+            'important': [GMAIL_FOLDERS['important']],
+            'all': None, # Search all mail
+            'any': None  # Alias
         }
         
-        label_ids = folder_to_label.get(folder.lower(), [GMAIL_FOLDERS['inbox']])
+        # Use defaults if folder not found, BUT if folder is explicitly 'all', we get empty list -> Global Search
+        if folder.lower() in ['all', 'any']:
+            label_ids = []
+        else:
+            label_ids = folder_to_label.get(folder.lower(), [GMAIL_FOLDERS['inbox']])
         
         return self.search_messages(
             query=query or "",
@@ -778,6 +828,36 @@ class GoogleGmailClient(BaseGoogleAPIClient):
         except Exception as e:
             logger.error(f"Failed to get Gmail message: {e}")
             return None
+
+    def get_attachment_data(self, message_id: str, attachment_id: str) -> Optional[bytes]:
+        """
+        Get attachment data
+        
+        Args:
+            message_id: Message ID
+            attachment_id: Attachment ID
+            
+        Returns:
+            Decoded attachment bytes or None
+        """
+        if not self.is_available():
+             return None
+             
+        try:
+            attachment = self.service.users().messages().attachments().get(
+                userId='me',
+                messageId=message_id,
+                id=attachment_id
+            ).execute()
+            
+            data = attachment.get('data')
+            if data:
+                import base64
+                return base64.urlsafe_b64decode(data)
+            return None
+        except Exception as e:
+            logger.error(f"Failed to get attachment data: {e}")
+            return None
     
     def mark_as_read(self, message_id: str) -> bool:
         """
@@ -833,3 +913,19 @@ class GoogleGmailClient(BaseGoogleAPIClient):
         except Exception as e:
             logger.error(f"Failed to add labels to Gmail message: {e}")
             return False
+    @with_gmail_circuit_breaker()
+    @retry_gmail_api()
+    def get_label_stats(self, label_id: str) -> Dict[str, Any]:
+        """
+        Get statistics for a specific label (like UNREAD or INBOX)
+        
+        Args:
+            label_id: Label ID (e.g., 'UNREAD', 'INBOX', 'TRASH')
+            
+        Returns:
+            Label resource containing messagesTotal, messagesUnread, threadsTotal, threadsUnread
+        """
+        return self.service.users().labels().get(
+            userId='me',
+            id=label_id
+        ).execute()

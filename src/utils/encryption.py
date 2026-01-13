@@ -199,14 +199,17 @@ class TokenEncryption:
         """
         Decrypt a token.
         
+        Attempts to decrypt the token. If decryption fails, checks if the token
+        might be plaintext (unencrypted) from an older version of the system.
+        
         Args:
-            ciphertext: Base64-encoded encrypted token
+            ciphertext: Base64-encoded encrypted token, or potentially plaintext token
             
         Returns:
-            Decrypted token
+            Decrypted token (or plaintext token if it wasn't encrypted)
             
         Raises:
-            Exception: If decryption fails (invalid token, wrong key, etc.)
+            Exception: If decryption fails and token doesn't appear to be plaintext
         """
         if ciphertext is None:
             raise TypeError("Cannot decrypt None value")
@@ -214,16 +217,39 @@ class TokenEncryption:
         if not ciphertext or not isinstance(ciphertext, str):
             raise ValueError(f"Cannot decrypt invalid ciphertext: {type(ciphertext)}")
         
+        # Try to decrypt
         try:
             decrypted_bytes = self.fernet.decrypt(ciphertext.encode('utf-8'))
             return decrypted_bytes.decode('utf-8')
         except Exception as e:
-            # Provide detailed error message with exception type and message
+            # Decryption failed - check if it might be plaintext
+            # OAuth tokens typically have specific patterns:
+            # - Access tokens: start with "ya29." or similar
+            # - Refresh tokens: start with "1//" or are long base64-like strings
             error_type = type(e).__name__
             error_msg = str(e) if str(e) else "Unknown error"
-            logger.error(
+            
+            # Check if it looks like a plaintext OAuth token
+            is_likely_plaintext = (
+                ciphertext.startswith('ya29.') or  # Google access token pattern
+                ciphertext.startswith('1//') or    # Google refresh token pattern
+                (len(ciphertext) > 50 and not '=' in ciphertext[-10:])  # Long token without base64 padding
+            )
+            
+            if is_likely_plaintext:
+                # Token appears to be plaintext (from before encryption was added)
+                logger.debug(
+                    f"Token appears to be plaintext (not encrypted). "
+                    f"Using as-is. This may indicate an old token format."
+                )
+                return ciphertext
+            
+            # Not plaintext and decryption failed - this is a real error
+            # Log at warning level (not error) since stale tokens are expected
+            logger.warning(
                 f"Decryption failed: {error_type} - {error_msg} "
-                f"(ciphertext length: {len(ciphertext) if ciphertext else 0})"
+                f"(ciphertext length: {len(ciphertext) if ciphertext else 0}). "
+                f"Token may be encrypted with a different key or corrupted."
             )
             raise
 

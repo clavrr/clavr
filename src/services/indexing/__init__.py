@@ -2,7 +2,7 @@
 Indexing Package - Production Email Indexing with Knowledge Graph
 
 Main Components:
-- IntelligentEmailIndexer: Production email indexer with graph + vector support
+- UnifiedIndexerService: Central orchestration for all indexers
 - HybridIndexCoordinator: Coordinates graph and vector stores
 - Parsers: EmailParser, ReceiptParser, AttachmentParser
 - Graph: KnowledgeGraphManager, schema definitions
@@ -20,7 +20,7 @@ from .parsers import (
     AttachmentParser
 )
 
-# Phase 2: Knowledge Graph
+# Knowledge Graph
 from .graph import (
     KnowledgeGraphManager,
     NodeType,
@@ -30,23 +30,28 @@ from .graph import (
     AnalysisType
 )
 
-# Phase 2: Hybrid Index
+# Hybrid Index
 from .hybrid_index import HybridIndexCoordinator
 
-# Phase 2.5: RAG-Graph Integration Bridge
+# RAG-Graph Integration Bridge
 from .rag_graph_bridge import (
     RAGVectorAdapter,
     GraphRAGIntegrationService
 )
 
-# Phase 3: Main Indexer + Helper Functions
-from .indexer import (
-    IntelligentEmailIndexer,
-    get_background_indexer,
-    start_background_indexing,
-    start_user_background_indexing,
-    stop_background_indexing,
-    get_user_background_indexer
+# Unified Indexer (replaces legacy indexer)
+from .unified_indexer import (
+    UnifiedIndexerService,
+    get_unified_indexer,
+    start_unified_indexing,
+    stop_unified_indexing
+)
+
+# Phase 4: Cross-App Intelligence
+from .cross_app_correlator import (
+    CrossAppCorrelator,
+    get_cross_app_correlator,
+    init_cross_app_correlator
 )
 
 __all__ = [
@@ -75,11 +80,14 @@ __all__ = [
     'RAGVectorAdapter',
     'GraphRAGIntegrationService',
     
-    # Main Indexer
-    'IntelligentEmailIndexer',
-    'get_background_indexer',
-    'start_background_indexing',
-    'start_user_background_indexing',
-    'stop_background_indexing',
-    'get_user_background_indexer',
+    # Unified Indexer
+    'UnifiedIndexerService',
+    'get_unified_indexer',
+    'start_unified_indexing',
+    'stop_unified_indexing',
+    
+    # Cross-App Intelligence
+    'CrossAppCorrelator',
+    'get_cross_app_correlator',
+    'init_cross_app_correlator',
 ]

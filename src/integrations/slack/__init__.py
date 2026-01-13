@@ -2,7 +2,7 @@
 Slack Integration Module
 
 Provides Slack integration for Clavr agent using Socket Mode.
-Implements the GraphRAG architecture with Neo4j and Pinecone.
+Implements the GraphRAG architecture with ArangoDB and Qdrant.
 """
 
 from .client import SlackClient

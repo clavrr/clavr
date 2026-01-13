@@ -69,7 +69,7 @@ class RAGService:
         except Exception as e:
             logger.debug(f"NLP initialization skipped: {e}")
     
-    def get_context(self, query: str, max_results: int = 3, use_llm: bool = True) -> Dict[str, Any]:
+    async def get_context(self, query: str, max_results: int = 3, use_llm: bool = True) -> Dict[str, Any]:
         """
         Get context for a query using semantic search with optional LLM enhancement.
         
@@ -90,15 +90,15 @@ class RAGService:
                 return cached_entry['context']
         
         try:
-            # Perform semantic search
-            results = self.rag_engine.search(query, k=max_results, rerank=True)
+            # Perform semantic search (use async)
+            results = await self.rag_engine.asearch(query, k=max_results, rerank=True)
             
             if not results:
                 context = {'summary': '', 'results': [], 'confidence': 0.0}
             else:
                 # Extract context using LLM if available
                 if use_llm and self.llm_client:
-                    context = self._extract_context_with_llm(query, results)
+                    context = await self._extract_context_with_llm(query, results)
                 else:
                     context = self._extract_context_simple(results)
             
@@ -114,7 +114,7 @@ class RAGService:
             logger.error(f"Failed to get context: {e}")
             return {'summary': '', 'results': [], 'confidence': 0.0, 'error': str(e)}
     
-    def _extract_context_with_llm(self, query: str, results: List[Dict[str, Any]]) -> Dict[str, Any]:
+    async def _extract_context_with_llm(self, query: str, results: List[Dict[str, Any]]) -> Dict[str, Any]:
         """Extract context using LLM for better understanding."""
         try:
             # Build results summary for LLM
@@ -139,7 +139,8 @@ Please provide:
 
 Format as JSON with keys: summary, topics, entities, relevance_score"""
             
-            response = self.llm_client.invoke(prompt)
+            # Use async invoke
+            response = await self.llm_client.ainvoke(prompt)
             llm_context = self._parse_llm_response(response)
             
             return {
@@ -288,9 +289,9 @@ Format as JSON with keys: summary, topics, entities, relevance_score"""
         """Index a single document."""
         if metadata is None:
             metadata = {}
-        # Ensure neo4j_node_id exists for hybrid GraphRAG integration (THE BRIDGE)
-        if 'neo4j_node_id' not in metadata:
-            metadata['neo4j_node_id'] = doc_id
+        # Ensure arango_node_id exists for hybrid GraphRAG integration (THE BRIDGE)
+        if 'arango_node_id' not in metadata:
+            metadata['arango_node_id'] = doc_id
         if 'node_id' not in metadata:
             metadata['node_id'] = doc_id  # Also keep for backward compatibility
         self.rag_engine.index_document(doc_id, content, metadata)
@@ -300,9 +301,9 @@ Format as JSON with keys: summary, topics, entities, relevance_score"""
         if metadata is None:
             metadata = {}
         metadata['doc_type'] = 'email'
-        # Ensure neo4j_node_id exists for hybrid GraphRAG integration (THE BRIDGE)
-        if 'neo4j_node_id' not in metadata:
-            metadata['neo4j_node_id'] = email_id
+        # Ensure arango_node_id exists for hybrid GraphRAG integration (THE BRIDGE)
+        if 'arango_node_id' not in metadata:
+            metadata['arango_node_id'] = email_id
         if 'node_id' not in metadata:
             metadata['node_id'] = email_id  # Also keep for backward compatibility
         self.rag_engine.index_document(email_id, content, metadata)

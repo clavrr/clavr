@@ -40,7 +40,7 @@ class NotionService:
     Features:
     - Page CRUD operations (create, read, update, delete)
     - Database queries with filtering and sorting
-    - Graph-grounded search (Notion + Neo4j)
+    - Graph-grounded search (Notion + ArangoDB)
     - Cross-platform synthesis
     - Autonomous database management
     - Error handling and retries
@@ -59,8 +59,8 @@ class NotionService:
         Args:
             config: Application configuration
             api_key: Notion API key (defaults to NOTION_API_KEY env var)
-            graph_manager: Optional KnowledgeGraphManager for Neo4j
-            rag_engine: Optional RAGEngine for Pinecone vectorization
+            graph_manager: Optional KnowledgeGraphManager for ArangoDB
+            rag_engine: Optional RAGEngine for Qdrant vectorization
         """
         self.config = config
         self.api_key = api_key
@@ -314,7 +314,7 @@ class NotionService:
         num_results: int = 5
     ) -> Dict[str, Any]:
         """
-        Perform graph-grounded search combining Notion + Neo4j
+        Perform graph-grounded search combining Notion + ArangoDB
         
         Args:
             query: Search query

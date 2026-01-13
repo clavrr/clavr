@@ -8,10 +8,10 @@ import os
 from typing import Optional, Dict, Any
 from datetime import datetime
 
-from ...utils.logger import setup_logger
-from ...core.email.google_client import GoogleGmailClient
+from src.utils.logger import setup_logger
+from src.core.email.google_client import GoogleGmailClient
 from .watch_service import GmailWatchService
-from ...utils.config import Config
+from src.utils.config import Config
 
 logger = setup_logger(__name__)
 
@@ -98,7 +98,28 @@ async def setup_gmail_watch_for_user(
             'channel_token': channel_token
         }
         
+    except ValueError as e:
+        # Expected error when GOOGLE_CLOUD_PROJECT_ID is not set
+        # This is a configuration issue, not a runtime error
+        error_msg = str(e)
+        if 'Pub/Sub topic name' in error_msg or 'GOOGLE_CLOUD_PROJECT_ID' in error_msg:
+            logger.warning(
+                f"⚠️ Gmail watch setup failed for user {user_id}: {error_msg}"
+            )
+            logger.info("   Will use polling fallback for real-time indexing")
+        else:
+            logger.warning(
+                f"⚠️ Gmail watch setup failed for user {user_id}: {error_msg}"
+            )
+            logger.info("   Will use polling fallback for real-time indexing")
+        return {
+            'success': False,
+            'error': error_msg,
+            'user_id': user_id,
+            'fallback': 'polling'  # Will fall back to polling
+        }
     except Exception as e:
+        # Unexpected errors - log with traceback for debugging
         logger.error(
             f"❌ Failed to set up Gmail watch for user {user_id}: {e}",
             exc_info=True

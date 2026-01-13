@@ -6,7 +6,7 @@ CRITICAL CONFIGURATION NOTES:
 ------------------------------
 1. WORKER POOL MODE:
    - MUST use --pool=solo when starting workers
-   - Default 'prefork' pool causes SIGSEGV crashes with Pinecone/OpenAI
+   - Default 'prefork' pool causes SIGSEGV crashes with Qdrant/OpenAI
    - Solo pool is single-threaded but compatible with threading libraries
    
    CORRECT: celery -A src.workers.celery_app worker --pool=solo
@@ -27,11 +27,12 @@ from celery import Celery
 from kombu import Queue, Exchange
 
 from ..utils.logger import setup_logger
+from ..utils.urls import URLs
 
 logger = setup_logger(__name__)
 
-# Redis configuration from environment
-REDIS_URL = os.getenv('REDIS_URL', 'redis://localhost:6379/0')
+# Redis configuration - Use centralized URLs
+REDIS_URL = URLs.REDIS
 CELERY_BROKER_URL = os.getenv('CELERY_BROKER_URL', REDIS_URL)
 CELERY_RESULT_BACKEND = os.getenv('CELERY_RESULT_BACKEND', REDIS_URL)
 
@@ -45,7 +46,9 @@ celery_app = Celery(
         'src.workers.tasks.calendar_tasks',
         'src.workers.tasks.indexing_tasks',
         'src.workers.tasks.notification_tasks',
+        'src.workers.tasks.notification_tasks',
         'src.workers.tasks.maintenance_tasks',
+        'src.workers.tasks.autonomy_tasks',
     ]
 )
 
@@ -145,6 +148,13 @@ celery_app.conf.update(
         'health-check-every-5-minutes': {
             'task': 'src.workers.tasks.maintenance_tasks.health_check_task',
             'schedule': 300.0,  # 5 minutes
+            'options': {'queue': 'default'}
+        },
+        
+        # Autonomy: Proactive Think Loop (Phase 1)
+        'proactive-think-every-15-minutes': {
+            'task': 'src.workers.tasks.autonomy_tasks.proactive_think',
+            'schedule': 900.0,  # 15 minutes
             'options': {'queue': 'default'}
         },
     },

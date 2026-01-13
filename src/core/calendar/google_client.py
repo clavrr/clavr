@@ -48,11 +48,14 @@ class GoogleCalendarClient(BaseGoogleAPIClient):
     
     def _build_service(self) -> Any:
         """Build Google Calendar API service"""
-        return build('calendar', 'v3', credentials=self.credentials)
+        return build('calendar', 'v3', credentials=self.credentials, cache_discovery=False)
     
     def _get_required_scopes(self) -> List[str]:
         """Get required Google Calendar scopes"""
-        return ['https://www.googleapis.com/auth/calendar']
+        return [
+            'https://www.googleapis.com/auth/calendar',
+            'https://www.googleapis.com/auth/calendar.readonly'
+        ]
     
     def _get_service_name(self) -> str:
         """Get service name"""
@@ -104,7 +107,8 @@ class GoogleCalendarClient(BaseGoogleAPIClient):
         maxResults: int,
         singleEvents: bool = True,
         orderBy: str = 'startTime',
-        pageToken: Optional[str] = None
+        pageToken: Optional[str] = None,
+        q: Optional[str] = None
     ) -> Dict[str, Any]:
         """
         List calendar events with pagination support and automatic retry
@@ -121,14 +125,26 @@ class GoogleCalendarClient(BaseGoogleAPIClient):
         Returns:
             API response with event list and nextPageToken if more pages exist
         """
-        request = self.service.events().list(
-            calendarId=calendarId,
-            timeMin=timeMin,
-            timeMax=timeMax,
-            maxResults=maxResults,
-            singleEvents=singleEvents,
-            orderBy=orderBy
-        )
+        if q:
+            request_params = {
+                'calendarId': calendarId,
+                'timeMin': timeMin,
+                'timeMax': timeMax,
+                'maxResults': maxResults,
+                'singleEvents': singleEvents,
+                'orderBy': orderBy,
+                'q': q
+            }
+            request = self.service.events().list(**request_params)
+        else:
+            request = self.service.events().list(
+                calendarId=calendarId,
+                timeMin=timeMin,
+                timeMax=timeMax,
+                maxResults=maxResults,
+                singleEvents=singleEvents,
+                orderBy=orderBy
+            )
         
         if pageToken:
             request.pageToken = pageToken
@@ -221,7 +237,8 @@ class GoogleCalendarClient(BaseGoogleAPIClient):
         end_date: Optional[datetime] = None,
         max_results: int = 20,
         calendar_id: str = 'primary',
-        show_deleted: bool = False
+        show_deleted: bool = False,
+        query: Optional[str] = None
     ) -> List[Dict[str, Any]]:
         """
         List events from Google Calendar
@@ -274,6 +291,9 @@ class GoogleCalendarClient(BaseGoogleAPIClient):
                     'singleEvents': True,
                     'orderBy': 'startTime'
                 }
+                
+                if query:
+                    request_params['q'] = query
                 
                 if page_token:
                     request_params['pageToken'] = page_token
@@ -354,9 +374,12 @@ class GoogleCalendarClient(BaseGoogleAPIClient):
                 logger.error(f"Google Calendar API error: {e}")
                 logger.error("This usually means the OAuth credentials don't have the required scopes.")
                 logger.error("Please re-authenticate with the Google Calendar scope: https://www.googleapis.com/auth/calendar")
-            else:
-                logger.error(f"Google Calendar API error: {e}")
-            return []
+                # Raise exception so agent can inform user to connect Calendar
+                raise AuthenticationException(
+                    "Calendar isn't connected yet. Please connect it from Settings → Integrations to access your calendar.",
+                    service_name="calendar",
+                    details={'error': 'insufficientPermissions', 'status': 403}
+                )
         except AuthenticationException:
             # Re-raise authentication exceptions
             raise
@@ -420,7 +443,9 @@ class GoogleCalendarClient(BaseGoogleAPIClient):
             
             # Calculate end time if not provided
             if not end_time:
-                end_dt = start_dt + timedelta(minutes=duration_minutes)
+                # Use default of 60 minutes if duration_minutes is None
+                actual_duration = duration_minutes if duration_minutes is not None else 60
+                end_dt = start_dt + timedelta(minutes=actual_duration)
                 end_time = format_datetime_rfc3339(end_dt, preserve_timezone=True)
             else:
                 end_dt = parse_datetime_with_timezone(end_time, self.config)

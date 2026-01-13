@@ -5,15 +5,17 @@ import os
 from typing import Optional
 from urllib.parse import urljoin
 
+from .urls import URLs
+
+
+from .urls import URLs
+
 
 def get_api_base_url() -> str:
     """
-    Get the base API URL from environment or default
-    
-    Returns:
-        Base API URL
+    Get the base API URL (centralized source of truth).
     """
-    return os.getenv("API_BASE_URL", "http://localhost:8000")
+    return URLs.API_BASE
 
 
 def get_api_url_with_fallback(
@@ -21,20 +23,9 @@ def get_api_url_with_fallback(
     fallback_url: Optional[str] = None
 ) -> str:
     """
-    Get API URL with fallback
-    
-    Args:
-        primary_url: Primary URL to use
-        fallback_url: Fallback URL if primary not available
-        
-    Returns:
-        API URL
+    Get API URL with fallback.
     """
-    if primary_url:
-        return primary_url
-    if fallback_url:
-        return fallback_url
-    return get_api_base_url()
+    return primary_url or fallback_url or get_api_base_url()
 
 
 def build_api_url(
@@ -43,28 +34,18 @@ def build_api_url(
     version: str = "v1"
 ) -> str:
     """
-    Build a full API URL
-    
-    Args:
-        path: API path (e.g., "/users")
-        base_url: Optional base URL override
-        version: API version (default "v1")
-        
-    Returns:
-        Full API URL
+    Build a full API URL with proper path joining and versioning.
     """
-    base = base_url or get_api_base_url()
-    
-    # Ensure base ends without slash
-    base = base.rstrip('/')
+    base = (base_url or get_api_base_url()).rstrip('/')
     
     # Ensure path starts with slash
     if not path.startswith('/'):
         path = '/' + path
     
     # Add version if not already in path
-    if version and not path.startswith(f'/api/{version}') and not path.startswith(f'/{version}'):
-        path = f'/api/{version}{path}'
+    api_prefix = f'/api/{version}'
+    if version and not path.startswith(api_prefix) and not path.startswith(f'/{version}'):
+        path = f'{api_prefix}{path}'
     
     return f"{base}{path}"
 

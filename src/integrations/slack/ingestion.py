@@ -3,15 +3,9 @@ Slack Ingestion Pipeline
 
 Converts Slack messages, files, and threads into structured knowledge for the graph.
 Implements the "Effortless Context Capture" architecture:
-1        try:
-            from ...services.indexing.graph.schema import NodeType
-            
-            # Create Person node propertiestract Entities (Person, Channel nodes)
+1. Extract Entities (Person, Channel nodes)
 2. Extract Relationships (MENTIONED, POSTED_IN, REACTED_TO)
-3. Vectorize Unstructured Data (message/t        try:
-            from ...services.indexing.graph.schema import NodeType, RelationType
-            
-            message_node_id = f"message_slack_{message_ts.replace('.', '_')}"d text to Pinecone)
+3. Vectorize Unstructured Data (message/thread text to Qdrant)
 """
 from typing import Dict, Any, Optional, List
 from datetime import datetime
@@ -29,9 +23,9 @@ class SlackIngestionPipeline:
     Ingestion pipeline for Slack messages.
     
     Converts Slack conversations into structured knowledge:
-    - Creates Person and Channel nodes in Neo4j
+    - Creates Person and Channel nodes in ArangoDB
     - Records relationships (MENTIONED, POSTED_IN, REACTED_TO)
-    - Vectorizes message/thread text to Pinecone for semantic retrieval
+    - Vectorizes message/thread text to Qdrant for semantic retrieval
     """
     
     def __init__(
@@ -46,8 +40,8 @@ class SlackIngestionPipeline:
         
         Args:
             slack_client: SlackClient instance
-            graph_manager: Optional KnowledgeGraphManager for Neo4j
-            rag_engine: Optional RAGEngine for Pinecone vectorization
+            graph_manager: Optional KnowledgeGraphManager for ArangoDB
+            rag_engine: Optional RAGEngine for Qdrant vectorization
             config: Optional configuration object
         """
         self.slack_client = slack_client
@@ -68,7 +62,7 @@ class SlackIngestionPipeline:
         Performs:
         1. Extract Entities: Creates Person and Channel nodes
         2. Extract Relationships: Records MENTIONED, POSTED_IN, REACTED_TO
-        3. Vectorize: Sends message/thread text to Pinecone
+        3. Vectorize: Sends message/thread text to Qdrant
         
         Args:
             message_data: Slack message event data
@@ -123,7 +117,7 @@ class SlackIngestionPipeline:
         channel_data: Optional[Dict[str, Any]] = None
     ):
         """
-        Extract entities: Create Person and Channel nodes in Neo4j.
+        Extract entities: Create Person and Channel nodes in ArangoDB.
         
         Args:
             user_id: Slack user ID
@@ -174,7 +168,7 @@ class SlackIngestionPipeline:
         name: str,
         slack_profile: Dict[str, Any]
     ):
-        """Create Person node in Neo4j"""
+        """Create Person node in ArangoDB"""
         if not self.graph_manager:
             return
         
@@ -241,7 +235,7 @@ class SlackIngestionPipeline:
         channel_name: str,
         channel_data: Dict[str, Any]
     ):
-        """Create Channel node in Neo4j"""
+        """Create Channel node in ArangoDB"""
         if not self.graph_manager:
             return
         
@@ -404,15 +398,16 @@ class SlackIngestionPipeline:
             return None
         
         try:
-            # Query Neo4j for Person node with slack_user_id
+            # Query ArangoDB for Person node with slack_user_id (AQL)
             query = """
-            MATCH (p:Person {slack_user_id: $slack_user_id})
-            RETURN id(p) as node_id, p.slack_user_id as slack_user_id
-            LIMIT 1
+            FOR p IN Person 
+                FILTER p.slack_user_id == @slack_user_id
+                LIMIT 1
+                RETURN { node_id: p._id, slack_user_id: p.slack_user_id }
             """
             result = self.graph_manager.query(query, {'slack_user_id': slack_user_id})
             if result and len(result) > 0:
-                # Return the node ID (could be Neo4j internal ID or our custom ID)
+                # Return the node ID (could be ArangoDB internal ID or our custom ID)
                 # For consistency, use our custom ID format
                 return f"person_slack_{slack_user_id}"
             return None
@@ -427,9 +422,10 @@ class SlackIngestionPipeline:
         
         try:
             query = """
-            MATCH (c:Channel {slack_channel_id: $slack_channel_id})
-            RETURN id(c) as node_id, c.slack_channel_id as slack_channel_id
-            LIMIT 1
+            FOR c IN Channel 
+                FILTER c.slack_channel_id == @slack_channel_id
+                LIMIT 1
+                RETURN { node_id: c._id, slack_channel_id: c.slack_channel_id }
             """
             result = self.graph_manager.query(query, {'slack_channel_id': slack_channel_id})
             if result and len(result) > 0:
@@ -447,7 +443,7 @@ class SlackIngestionPipeline:
         thread_ts: Optional[str],
         message_text: str = ''
     ) -> Optional[str]:
-        """Create Message node in Neo4j and return node ID"""
+        """Create Message node in ArangoDB and return node ID"""
         if not self.graph_manager:
             return None
         
@@ -488,9 +484,10 @@ class SlackIngestionPipeline:
         
         try:
             query = """
-            MATCH (m:Message {slack_message_ts: $message_ts})
-            RETURN id(m) as node_id, m.slack_message_ts as message_ts
-            LIMIT 1
+            FOR m IN Message 
+                FILTER m.slack_message_ts == @message_ts
+                LIMIT 1
+                RETURN { node_id: m._id, message_ts: m.slack_message_ts }
             """
             result = self.graph_manager.query(query, {'message_ts': message_ts})
             if result and len(result) > 0:
@@ -509,10 +506,10 @@ class SlackIngestionPipeline:
         message_ts: str
     ):
         """
-        Vectorize message/thread text and send to Pinecone.
+        Vectorize message/thread text and send to Qdrant.
         
         Implements Step 3 of Knowledge Graph Hydration:
-        - Sends unstructured message/thread text to Pinecone for semantic retrieval
+        - Sends unstructured message/thread text to Qdrant for semantic retrieval
         - Preserves metadata for context
         
         Args:
@@ -550,7 +547,7 @@ class SlackIngestionPipeline:
             # Uses the index_document method which:
             # 1. Chunks the content intelligently
             # 2. Generates embeddings
-            # 3. Stores in Pinecone (or configured vector store)
+            # 3. Stores in Qdrant (or configured vector store)
             # 4. Preserves metadata for filtering and context
             await asyncio.to_thread(
                 self.rag_engine.index_document,

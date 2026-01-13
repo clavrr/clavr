@@ -17,7 +17,7 @@ from datetime import datetime, timedelta
 
 from ...core.calendar.google_client import GoogleCalendarClient
 from ...utils.logger import setup_logger
-from ...utils.config import Config
+from ...utils.config import Config, ConfigDefaults
 from .exceptions import (
     CalendarServiceException,
     EventNotFoundException,
@@ -66,12 +66,20 @@ class CalendarService:
         except Exception as e:
             logger.error(f"[CALENDAR_SERVICE] Failed to initialize Calendar client: {e}")
             self.calendar_client = None
+
+        # Initialize Maps Service
+        try:
+            from ..google_maps.service import MapsService
+            self.maps_service = MapsService(config)
+        except Exception as e:
+            logger.warning(f"[CALENDAR_SERVICE] Failed to initialize Maps Service: {e}")
+            self.maps_service = None
     
     def _ensure_available(self):
         """Ensure Calendar client is available"""
         if not self.calendar_client or not self.calendar_client.is_available():
             raise ServiceUnavailableException(
-                "Calendar service is not available. Please authenticate.",
+                "[INTEGRATION_REQUIRED] Calendar permission not granted. Please enable Google integration in Settings.",
                 service_name="calendar"
             )
     
@@ -119,20 +127,49 @@ class CalendarService:
         try:
             # Check for conflicts if requested
             if check_conflicts:
-                conflicts = self.find_conflicts(start_time, end_time or start_time, duration_minutes)
-                if conflicts:
-                    raise SchedulingConflictException(
-                        f"Found {len(conflicts)} conflicting event(s)",
-                        service_name="calendar",
-                        details={'conflicting_events': conflicts}
-                    )
+                # CRITICAL: start_time must be provided for conflict checking
+                if not start_time:
+                    logger.warning("[CALENDAR_SERVICE] start_time is missing, skipping conflict check but creation will likely fail.")
+                else:
+                    # CRITICAL: Pass None as end_time if not strictly provided, so find_conflicts
+                    # can calculate the true end time using duration_minutes.
+                    # Previous bug: passing start_time as end_time created a 0-duration check window.
+                    check_end = end_time if end_time else None
+                    # FORCE a default duration if none provided, ensuring find_conflicts
+                    # has data to calculate a check window.
+                    check_duration = duration_minutes if duration_minutes is not None else ConfigDefaults.CALENDAR_DEFAULT_DURATION
+                    conflicts = self.find_conflicts(start_time, check_end, check_duration, location=location)
+                    if conflicts:
+                        # Find alternative time slots
+                        try:
+                            suggestions = self.find_free_time(
+                                duration_minutes=duration_minutes or ConfigDefaults.CALENDAR_DEFAULT_DURATION,
+                                start_date=start_time,
+                                end_date=(datetime.fromisoformat(start_time.replace('Z', '+00:00')) + timedelta(days=ConfigDefaults.CALENDAR_SUGGESTIONS_DAYS_AHEAD)).isoformat(),
+                                max_suggestions=ConfigDefaults.CALENDAR_SUGGESTIONS_MAX,
+                                working_hours_only=False # Be flexible for suggestions
+                            )
+                        except Exception as suggest_err:
+                            logger.warning(f"Failed to find suggestions during conflict: {suggest_err}")
+                            suggestions = []
+
+                        suggestion_str = ""
+                        if suggestions:
+                            times = [f"{s['start']}" for s in suggestions] # format nicely in tool/agent layer
+                            suggestion_str = f". Alternative times: {', '.join(times)}"
+
+                        raise SchedulingConflictException(
+                            f"Found {len(conflicts)} conflicting event(s){suggestion_str}",
+                            service_name="calendar",
+                            details={'conflicting_events': conflicts, 'suggestions': suggestions}
+                        )
             
             logger.info(f"[CALENDAR_SERVICE] Creating event: {title}")
             
             # CRITICAL: Validate attendees are email addresses (safety check)
             # If names are passed, they should have been resolved upstream, but validate here
             if attendees:
-                from ..core.calendar.utils import validate_attendees
+                from ...core.calendar.utils import validate_attendees
                 validated_attendees = validate_attendees(attendees)
                 
                 # If validation filtered out invalid emails, log warning
@@ -375,8 +412,8 @@ class CalendarService:
                 end_date=end_dt,
                 days_back=days_back,
                 days_ahead=days_ahead,
-                max_results=max_results
-                # Note: query parameter not supported by client
+                max_results=max_results,
+                query=query
             )
             
             logger.info(f"[CALENDAR_SERVICE] Found {len(events)} events")
@@ -482,7 +519,8 @@ class CalendarService:
         start_time: str,
         end_time: str,
         duration_minutes: Optional[int] = None,
-        exclude_event_id: Optional[str] = None
+        exclude_event_id: Optional[str] = None,
+        location: Optional[str] = None
     ) -> List[Dict[str, Any]]:
         """
         Find conflicting events for a given time range
@@ -496,24 +534,126 @@ class CalendarService:
         Returns:
             List of conflicting events
         """
+        # Robustness: start_time is required
+        if not start_time:
+            logger.error("[CALENDAR_SERVICE] find_conflicts called without start_time")
+            return []
+
         self._ensure_available()
         
         try:
             # Calculate end time if duration provided
             if duration_minutes and not end_time:
+                # Guard against None or invalid start_time
+                try:
+                    start_dt = datetime.fromisoformat(start_time.replace('Z', '+00:00'))
+                    end_dt = start_dt + timedelta(minutes=duration_minutes)
+                    end_time = end_dt.isoformat()
+                except (AttributeError, ValueError) as e:
+                    logger.warning(f"[CALENDAR_SERVICE] Invalid start_time format in find_conflicts: {start_time}")
+                    return []
+            
+            # Get events in the time range (list_events might return loose matches, so we must filter)
+            # Expand search window BACKWARDS to check for travel time from previous event
+            check_start_raw = start_time
+            if self.maps_service and location:
+                # Look back 2 hours to find the preceding event
+                # We need to parse first to subtract time
+                s_dt = datetime.fromisoformat(start_time.replace('Z', '+00:00'))
+                check_start_raw = (s_dt - timedelta(hours=2)).isoformat()
+
+            events = self.list_events(start_date=check_start_raw, end_date=end_time)
+            
+            # Strict Filter: Verify overlap and exclude self
+            from ...core.calendar.utils import events_overlap, parse_event_time, parse_datetime_with_timezone
+            
+            # Calculate precise window for strict overlap check using config for timezone context
+            start_dt = parse_datetime_with_timezone(start_time, self.config)
+            
+            # ... (rest of existing setup) ...
+
+            if not start_dt:
+                # Fallback to naive parsing if util fails, but force simple UTC awareness to avoid crash
                 start_dt = datetime.fromisoformat(start_time.replace('Z', '+00:00'))
-                end_dt = start_dt + timedelta(minutes=duration_minutes)
-                end_time = end_dt.isoformat()
+                if start_dt.tzinfo is None:
+                     import pytz
+                     start_dt = start_dt.replace(tzinfo=pytz.UTC)
+
+            if end_time:
+                end_dt = parse_datetime_with_timezone(end_time, self.config)
+            else:
+                end_dt = start_dt + timedelta(minutes=duration_minutes or 60)
             
-            # Get events in the time range
-            events = self.list_events(start_date=start_time, end_date=end_time)
+            # Ensure end_dt is also aware if it was calculated or parsed naively
+            if end_dt and end_dt.tzinfo is None and start_dt.tzinfo:
+                 end_dt = end_dt.replace(tzinfo=start_dt.tzinfo)
+
+            # Normalize to remove microseconds to prevent false positives from slight drift
+            if start_dt:
+                start_dt = start_dt.replace(microsecond=0)
+            if end_dt:
+                end_dt = end_dt.replace(microsecond=0)
+
+            conflicts = []
             
-            # Filter out excluded event
-            conflicts = [
-                event for event in events
-                if event.get('id') != exclude_event_id
-            ]
+            # 1. Sort events to find the one immediately BEFORE our proposed start
+            # This is needed for travel time calculation
+            sorted_events = sorted(events, key=lambda e: parse_event_time(e.get('start', {})).timestamp() if parse_event_time(e.get('start', {})) else 0)
             
+            previous_event = None
+            
+            for event in sorted_events:
+                if event.get('id') == exclude_event_id:
+                    continue
+
+                # Fix 1: Transparency Handling
+                # If event is marked as "transparent" (Free), it does not block time
+                if event.get('transparency') == 'transparent':
+                    continue
+                    
+                e_start = parse_event_time(event.get('start', {}))
+                e_end = parse_event_time(event.get('end', {}))
+                
+                if e_start and e_end:
+                    # Fix 2: Microsecond Drift
+                    # Normalize existing event times too
+                    e_start = e_start.replace(microsecond=0)
+                    e_end = e_end.replace(microsecond=0)
+
+                    # Strict overlap check for direct conflicts
+                    is_overlap = events_overlap(start_dt, end_dt, e_start, e_end)
+                    logger.info(f"[DEBUG_CONFLICT] Checking: Proposed {start_dt} - {end_dt} vs Existing {e_start} - {e_end} | Overlap: {is_overlap}")
+                    if is_overlap:
+                        conflicts.append(event)
+                    
+                    # Track potential previous event for travel time
+                    # Logic: If event ENDS before we START, it is a candidate for "previous event"
+                    # We want the *latest* one that ends before we start.
+                    if e_end <= start_dt:
+                        previous_event = event
+
+            # 2. Check Travel Time from Previous Event
+            if self.maps_service and location and previous_event and not conflicts:
+                prev_loc = previous_event.get('location')
+                if prev_loc:
+                    # Calculate travel time
+                    # We aim to arrive exactly at start_dt
+                    travel_minutes = self.maps_service.get_travel_duration(prev_loc, location, start_dt)
+                    
+                    if travel_minutes:
+                        # Required departure time
+                        departure_dt = start_dt - timedelta(minutes=travel_minutes)
+                        
+                        e_end = parse_event_time(previous_event.get('end', {}))
+                        
+                        # If we need to leave BEFORE the previous event ends = CONFLICT
+                        # We add a small buffer (e.g. 5 mins) for sanity? No, strict for now.
+                        if departure_dt < e_end:
+                            # Create a synthetic conflict description or attach to the event
+                            # We treat the previous event as a conflict because of travel time
+                            previous_event['_conflict_reason'] = f"Travel time of {travel_minutes} min required from '{prev_loc}'."
+                            conflicts.append(previous_event)
+
             return conflicts
             
         except Exception as e:
@@ -633,17 +773,36 @@ class CalendarService:
             
             for event in events:
                 # Calculate duration
+                # Calculate duration
                 if 'start' in event and 'end' in event:
-                    start = event['start'].get('dateTime', '')
-                    end = event['end'].get('dateTime', '')
-                    if start and end:
-                        try:
-                            start_dt = datetime.fromisoformat(start.replace('Z', '+00:00'))
-                            end_dt = datetime.fromisoformat(end.replace('Z', '+00:00'))
+                    # Handle both dictionary (raw API) and datetime (client object) formats
+                    start_data = event['start']
+                    end_data = event['end']
+                    
+                    try:
+                        start_dt = None
+                        end_dt = None
+                        
+                        if isinstance(start_data, datetime):
+                            start_dt = start_data
+                        elif isinstance(start_data, dict):
+                            val = start_data.get('dateTime') or start_data.get('date')
+                            if val:
+                                start_dt = datetime.fromisoformat(val.replace('Z', '+00:00'))
+                                
+                        if isinstance(end_data, datetime):
+                            end_dt = end_data
+                        elif isinstance(end_data, dict):
+                            val = end_data.get('dateTime') or end_data.get('date')
+                            if val:
+                                end_dt = datetime.fromisoformat(val.replace('Z', '+00:00'))
+
+                        if start_dt and end_dt:
                             duration = (end_dt - start_dt).total_seconds() / 60
                             total_duration += duration
-                        except:
-                            pass
+                    except Exception as e:
+                        logger.warning(f"[CALENDAR_SERVICE] Error parsing duration: {e}")
+                        pass
                 
                 # Count event types (based on title keywords)
                 title = event.get('summary', '').lower()
@@ -680,34 +839,38 @@ class CalendarService:
         max_suggestions: int
     ) -> List[Dict[str, str]]:
         """Find available time gaps between events"""
-        # Sort events by start time
-        sorted_events = sorted(
-            events,
-            key=lambda e: e.get('start', {}).get('dateTime', '')
-        )
+        # Use parse_event_time to handle both dicts and objects safely
+        from ...core.calendar.utils import parse_event_time, format_datetime_rfc3339
+        
+        # Sort events by start time safely
+        def get_start(e):
+            dt = parse_event_time(e.get('start', {}))
+            return dt.timestamp() if dt else 0
+            
+        sorted_events = sorted(events, key=get_start)
         
         free_slots = []
         
         # Simple implementation - can be enhanced with working hours logic
         for i in range(len(sorted_events) - 1):
-            current_end = sorted_events[i].get('end', {}).get('dateTime')
-            next_start = sorted_events[i + 1].get('start', {}).get('dateTime')
+            current_end_dt = parse_event_time(sorted_events[i].get('end', {}))
+            next_start_dt = parse_event_time(sorted_events[i + 1].get('start', {}))
             
-            if current_end and next_start:
+            if current_end_dt and next_start_dt:
                 try:
-                    end_dt = datetime.fromisoformat(current_end.replace('Z', '+00:00'))
-                    start_dt = datetime.fromisoformat(next_start.replace('Z', '+00:00'))
-                    gap_minutes = (start_dt - end_dt).total_seconds() / 60
+                    # Both are datetime objects now (aware or naive consistently from utils)
+                    gap_minutes = (next_start_dt - current_end_dt).total_seconds() / 60
                     
                     if gap_minutes >= duration_minutes:
                         free_slots.append({
-                            'start': end_dt.isoformat(),
-                            'end': (end_dt + timedelta(minutes=duration_minutes)).isoformat()
+                            'start': format_datetime_rfc3339(current_end_dt),
+                            'end': format_datetime_rfc3339(current_end_dt + timedelta(minutes=duration_minutes))
                         })
                         
                         if len(free_slots) >= max_suggestions:
                             break
-                except:
+                except Exception as e:
+                    logger.warning(f"Error calculating gap: {e}")
                     continue
         
         return free_slots

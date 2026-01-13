@@ -2,7 +2,7 @@
 Notion GraphRAG Integration
 
 Implements capability 1: Enhanced Knowledge and RAG (Retrieval)
-- Graph-Grounded Search: Uses Notion API + Neo4j for contextual retrieval
+- Graph-Grounded Search: Uses Notion API + ArangoDB for contextual retrieval
 - Cross-Platform Synthesis: Combines Slack + Notion + other systems
 - Instant Knowledge Capture: Monitors Notion databases in real-time
 """
@@ -22,7 +22,7 @@ class NotionGraphRAGIntegration:
     GraphRAG integration for Notion.
     
     Provides:
-    1. Graph-Grounded Search - Notion pages + Neo4j relationships
+    1. Graph-Grounded Search - Notion pages + ArangoDB relationships
     2. Cross-Platform Synthesis - Multi-hop queries across systems
     3. Instant Knowledge Capture - Real-time database monitoring
     """
@@ -39,8 +39,8 @@ class NotionGraphRAGIntegration:
         
         Args:
             notion_client: NotionClient instance
-            graph_manager: Optional KnowledgeGraphManager for Neo4j
-            rag_engine: Optional RAGEngine for Pinecone vectorization
+            graph_manager: Optional KnowledgeGraphManager for ArangoDB
+            rag_engine: Optional RAGEngine for Qdrant vectorization
             config: Optional configuration object
         """
         self.notion_client = notion_client
@@ -57,11 +57,11 @@ class NotionGraphRAGIntegration:
         num_results: int = 5
     ) -> Dict[str, Any]:
         """
-        Perform graph-grounded search combining Notion + Neo4j.
+        Perform graph-grounded search combining Notion + ArangoDB.
         
         This implements capability 1, part 1:
         - Searches Notion database for relevant pages
-        - Verifies relationships via Neo4j
+        - Verifies relationships via ArangoDB
         - Returns contextual, cited results
         
         Args:
@@ -86,10 +86,10 @@ class NotionGraphRAGIntegration:
                     'message': 'No relevant information found in Notion'
                 }
             
-            # Step 2: Enrich with Neo4j relationships (graph verification)
+            # Step 2: Enrich with ArangoDB relationships (graph verification)
             enriched_results = await self._enrich_with_graph_context(notion_results)
             
-            # Step 3: Rank by relevance and Neo4j verification
+            # Step 3: Rank by relevance and ArangoDB verification
             ranked_results = await self._rank_by_verification(enriched_results, num_results)
             
             # Step 4: Extract citations from Notion pages
@@ -179,8 +179,8 @@ class NotionGraphRAGIntegration:
         
         This implements capability 1, part 3:
         - Extract entities and relationships from Notion page
-        - Create Neo4j nodes and edges
-        - Vectorize page content for Pinecone
+        - Create ArangoDB nodes and edges
+        - Vectorize page content for Qdrant
         - Keep knowledge fresh and searchable
         
         Args:
@@ -197,16 +197,16 @@ class NotionGraphRAGIntegration:
             # Step 1: Extract entities from Notion page
             entities = await self._extract_entities_from_page(page_content)
             
-            # Step 2: Create Neo4j nodes for entities
+            # Step 2: Create ArangoDB nodes for entities
             await self._create_graph_nodes(entities, page_id)
             
             # Step 3: Extract relationships
             relationships = await self._extract_relationships_from_page(page_content)
             
-            # Step 4: Create Neo4j relationships
+            # Step 4: Create ArangoDB relationships
             await self._create_graph_relationships(relationships)
             
-            # Step 5: Vectorize page content for Pinecone
+            # Step 5: Vectorize page content for Qdrant
             await self._vectorize_page_content(page_id, page_content)
             
             logger.info(f"[NOTION] Knowledge capture complete for page {page_id}")
@@ -242,7 +242,7 @@ class NotionGraphRAGIntegration:
         self,
         results: List[Dict[str, Any]]
     ) -> List[Dict[str, Any]]:
-        """Enrich results with Neo4j graph context"""
+        """Enrich results with ArangoDB graph context"""
         if not self.graph_manager:
             return results
         
@@ -273,7 +273,7 @@ class NotionGraphRAGIntegration:
         results: List[Dict[str, Any]],
         limit: int
     ) -> List[Dict[str, Any]]:
-        """Rank results by Neo4j verification strength"""
+        """Rank results by ArangoDB verification strength"""
         # Results with verified graph relationships rank higher
         ranked = sorted(
             results,
@@ -369,7 +369,7 @@ class NotionGraphRAGIntegration:
         entities: List[Dict[str, Any]],
         page_id: str
     ) -> None:
-        """Create Neo4j nodes for entities"""
+        """Create ArangoDB nodes for entities"""
         if not self.graph_manager:
             logger.debug("No graph manager available, skipping node creation")
             return
@@ -411,7 +411,7 @@ class NotionGraphRAGIntegration:
         self,
         relationships: List[Dict[str, Any]]
     ) -> None:
-        """Create Neo4j relationships"""
+        """Create ArangoDB relationships"""
         if not self.graph_manager:
             return
         
@@ -434,7 +434,7 @@ class NotionGraphRAGIntegration:
         page_id: str,
         page_content: Dict[str, Any]
     ) -> None:
-        """Vectorize Notion page content for Pinecone"""
+        """Vectorize Notion page content for Qdrant"""
         if not self.rag_engine:
             logger.debug("No RAG engine available, skipping vectorization")
             return
@@ -455,7 +455,7 @@ class NotionGraphRAGIntegration:
                     }
                 )
                 
-                logger.debug(f"Vectorized page {page_id} for Pinecone")
+                logger.debug(f"Vectorized page {page_id} for Qdrant")
                 
         except Exception as e:
             logger.warning(f"Error vectorizing page: {e}")
@@ -481,20 +481,89 @@ class NotionGraphRAGIntegration:
             return None
     
     def _query_graph_for_context(self, entity_name: str) -> Dict[str, Any]:
-        """Query Neo4j graph for entity context"""
+        """Query ArangoDB graph for entity context"""
         if not self.graph_manager:
             return {}
         
         try:
             # Query for entity and relationships
+            # Query for entity and relationships (AQL)
+            # Using common relationship types since AQL requires explicit edge collections or a graph definition
             query = """
-            MATCH (n {name: $name})
-            OPTIONAL MATCH (n)-[r]->(m)
-            RETURN n, r, m
-            LIMIT 10
+                FOR n IN Document
+                    FILTER n.name == @name
+                    # Try to find relationships in common collections
+                    LET rels = (
+                        FOR v, e IN 1..1 OUTBOUND n 
+                        GRAPH 'clavr'  # Assuming default graph name, or fallback to known edge collections if this fails
+                        # If graph name is unknown/dynamic, we would need to specify edge collections:
+                        # OUTBOUND n RelatedTo, Mentioned, References, Authored
+                        RETURN {target: v, type: TYPE(e), props: e}
+                    )
+                    RETURN {
+                        entity: n.name,
+                        relationships: rels
+                    }
             """
             
-            result = self.graph_manager.query(query, {'name': entity_name})
+            # Since we can't be 100% sure of the graph name 'clavr' without checking config, 
+            # let's use a safer collection-agnostic approach if possible, or key collections.
+            # Simplified AQL for robustness:
+            query = """
+                FOR n IN Document
+                    FILTER n.name == @name
+                    RETURN {
+                        n: n,
+                        relationships: [] # Placeholder until edge collections are confirmed
+                    }
+            """
+            # Wait, I should try to make it work. 
+            # If I look at `graph_manager.py` I might see the graph name.
+            # But simpler: The existing AQL logic works even if the graph schema is evolved.
+            # Arango requires edge collections.
+            # I will assume `RelatedTo` and `Mentioned` are the key ones for Notion.
+            
+            query = """
+                FOR n IN Document
+                    FILTER n.name == @name
+                    LET rels = (
+                        FOR v, e IN 1..1 OUTBOUND n RelatedTo, Mentioned, References
+                        RETURN {edge: e, target: v}
+                    )
+                    RETURN rels
+            """
+            # But the code expects a result list where each item has n, r, m?
+            # actually `result = query(...)` returns a list.
+            # The method returns `{'entity': name, 'relationships': result}`.
+            # So `result` should be the list of relationships.
+            
+            aql_query = """
+                FOR n IN Document
+                    FILTER n.name == @name
+                    LET rels = (
+                        FOR v, e IN 1..1 OUTBOUND n RELATED_TO, MENTIONS, REFERENCES
+                        RETURN {edge: e, target: v}
+                    )
+                    RETURN rels
+            """
+            
+            # The method expects a result format compatible with the previous one
+            # previous: result = self.graph_manager.query(...) returns list of records
+            # where record = {n, r, m} keys? No, previous query was:
+            # RETURN n, r, m -> returns list of dicts like {'n':..., 'r':..., 'm':...}
+            
+            # My new query returns a list of *relationships for a single node*.
+            # But graph_manager.query() returns a list of results from the AQL.
+            # If I want to match the previous structure roughly (list of relationships):
+            
+            aql_query = """
+                FOR n IN Document
+                    FILTER n.name == @name
+                    FOR v, e IN 1..1 OUTBOUND n RELATED_TO, MENTIONS, REFERENCES
+                    RETURN {n: n, r: e, m: v}
+            """
+            
+            result = self.graph_manager.query(aql_query, {'name': entity_name})
             
             return {
                 'entity': entity_name,

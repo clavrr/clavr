@@ -1,0 +1,294 @@
+# Intent Keywords Configuration
+# Used for natural language intent detection in chat queries
+
+# Email-specific action keywords
+email_actions:
+  - send email
+  - send an email
+  - compose email
+  - write email
+  - draft email
+  - email send
+  - email to
+  - send to
+  - reply to
+  - reply email
+  - forward email
+  - email list
+  - show emails
+  - my emails
+  - recent emails
+  - email search
+  - unread emails
+  - unread
+  - left unread
+  - oldest unread
+  - which emails
+  - emails have i left
+  - longest unread
+  - oldest emails
+  - emails i haven't read
+  - haven't read
+  - urgent matters
+  - urgent emails
+  - most urgent
+  - priority emails
+  - important emails
+  - inbox analysis
+  - inbox summary
+  - email summary
+  - what matters
+  - urgent in my inbox
+  - priority matters
+  - inbox priority
+  - urgent items
+  - important items
+  - urgent messages
+  - important messages
+  - inbox urgent
+  - urgent inbox
+  - priority inbox
+  - inbox important
+  - show me all emails
+  - find emails
+  - search for emails
+  - emails about
+  - emails from
+  - emails containing
+  - emails with
+  - emails regarding
+  - emails related to
+  - when was the last time
+  - last email from
+  - most recent email
+  - latest email
+  - last time i received
+  - when did i last
+  - what was the email
+  - what was the emaill
+  - what did it say
+  - what was in it
+  - what was the subject
+  - tell me more about it
+  - what was that email
+  - what did the email contain
+  - new emails
+  - new email
+  - any new
+  - do i have
+  - have i received
+  - check my emails
+  - check emails
+  - check inbox
+  - any emails today
+  - emails today
+  - new messages today
+  - email from
+  - from monique
+  - from rodney
+  - responded
+  - respond
+  - all about
+  - what was
+  - what did
+
+# General action keywords (schedule, create, etc.)
+general_actions:
+  - schedule
+  - create
+  - add
+  - book
+  - set up
+  - make
+  - remind
+  - block
+  - cancel
+  - delete
+  - update
+  - show
+  - list
+  - display
+  - get my
+  - find my
+  - analyze
+  - check
+  - who have i been emailing
+  - most contacts
+  - frequent contacts
+  - emailing the most
+  - top contacts
+  - contact analysis
+  - who do i email
+  - email frequency
+  - who i email most
+  - my contacts
+  - email patterns
+  - response time
+  - email response time
+  - reply patterns
+  - email behavior
+  - email habits
+  - email trends
+  - response patterns
+  - categories dominate
+  - most common emails
+  - productivity patterns
+  - my email activity
+  - email statistics
+
+# Calendar-specific keywords
+calendar_keywords:
+  - schedule meeting
+  - book appointment
+  - calendar
+  - event
+  - meeting
+  - appointment
+  - schedule
+  - book
+  - free time
+  - available
+  - busy
+  - conflict
+  - conflicts
+  - double booked
+  - overlapping
+  - schedule conflict
+  - time conflict
+  - what's on my calendar
+  - what's scheduled
+  - do i have anything
+  - am i free
+  - what time works
+  - find time for
+  - when can i
+  - when am i
+  - tomorrow
+  - today
+  - this week
+  - next week
+  - morning
+  - afternoon
+  - evening
+
+# Task-specific keywords
+task_keywords:
+  - task
+  - tasks
+  - todo
+  - to-do
+  - to do
+  - reminder
+  - deadline
+  - due
+  - complete
+  - finish
+  - done
+  - mark as done
+  - check off
+  - pending
+  - overdue
+  - upcoming
+  - my tasks
+  - show tasks
+  - list tasks
+  - what do i need to do
+  - what's on my list
+  - add task
+  - create task
+  - new task
+  - set reminder
+
+# Email recipient keywords (specific people)
+recipient_keywords:
+  - monique
+  - rodney
+  - john
+  - sarah
+  - mike
+  - team
+  - manager
+  - boss
+  - client
+  - customer
+
+# Time-related keywords
+time_keywords:
+  - today
+  - tomorrow
+  - yesterday
+  - this week
+  - last week
+  - next week
+  - this month
+  - last month
+  - next month
+  - morning
+  - afternoon
+  - evening
+  - night
+  - noon
+  - midnight
+  - am
+  - pm
+  - at
+  - on
+  - by
+  - before
+  - after
+  - until
+  - since
+  - from
+  - to
+
+# Priority keywords
+priority_keywords:
+  - urgent
+  - important
+  - high priority
+  - low priority
+  - critical
+  - asap
+  - immediately
+  - soon
+  - later
+  - priority
+  - priorities
+
+# Search/Filter keywords
+search_keywords:
+  - find
+  - search
+  - look for
+  - show me
+  - get
+  - fetch
+  - retrieve
+  - filter
+  - containing
+  - with
+  - about
+  - regarding
+  - related to
+  - from
+  - to
+  - sent by
+  - received from
+  - attachment
+  - has attachment
+  - with attachment
+  - pdf
+  - document
+  - file
+
+# Content query phrases (for detecting email content queries)
+content_query_phrases:
+  - tell me about
+  - tell me more about
+  - what is
+  - what was
+  - what does
+  - summarize
+  - explain
+  - what did
+  - what does it say

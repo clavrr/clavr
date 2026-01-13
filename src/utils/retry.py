@@ -6,14 +6,16 @@ import functools
 from typing import Callable, Any, Optional, Type, Tuple
 from dataclasses import dataclass
 
+from .config import ConfigDefaults
+
 
 @dataclass
 class RetryConfig:
     """Configuration for retry behavior"""
-    max_retries: int = 3
-    base_delay: float = 1.0
-    max_delay: float = 60.0
-    exponential_base: float = 2.0
+    max_retries: int = ConfigDefaults.RETRY_MAX_RETRIES
+    base_delay: float = ConfigDefaults.RETRY_BASE_DELAY
+    max_delay: float = ConfigDefaults.RETRY_MAX_DELAY
+    exponential_base: float = ConfigDefaults.RETRY_EXPONENTIAL_BASE
     retryable_exceptions: Tuple[Type[Exception], ...] = (Exception,)
 
 
@@ -66,49 +68,35 @@ def _retry_decorator(config: RetryConfig) -> Callable:
     return decorator
 
 
+
 def retry_gmail_api(
-    max_retries: int = 3,
-    base_delay: float = 1.0
+    max_retries: int = ConfigDefaults.RETRY_MAX_RETRIES,
+    base_delay: float = ConfigDefaults.RETRY_BASE_DELAY
 ) -> Callable:
     """Retry decorator for Gmail API calls"""
-    config = RetryConfig(
-        max_retries=max_retries,
-        base_delay=base_delay,
-        max_delay=60.0
-    )
-    return _retry_decorator(config)
+    return retry_generic_api(max_retries=max_retries, base_delay=base_delay)
 
 
 def retry_calendar_api(
-    max_retries: int = 3,
-    base_delay: float = 1.0
+    max_retries: int = ConfigDefaults.RETRY_MAX_RETRIES,
+    base_delay: float = ConfigDefaults.RETRY_BASE_DELAY
 ) -> Callable:
     """Retry decorator for Calendar API calls"""
-    config = RetryConfig(
-        max_retries=max_retries,
-        base_delay=base_delay,
-        max_delay=60.0
-    )
-    return _retry_decorator(config)
+    return retry_generic_api(max_retries=max_retries, base_delay=base_delay)
 
 
 def retry_tasks_api(
-    max_retries: int = 3,
-    base_delay: float = 1.0
+    max_retries: int = ConfigDefaults.RETRY_MAX_RETRIES,
+    base_delay: float = ConfigDefaults.RETRY_BASE_DELAY
 ) -> Callable:
     """Retry decorator for Tasks API calls"""
-    config = RetryConfig(
-        max_retries=max_retries,
-        base_delay=base_delay,
-        max_delay=60.0
-    )
-    return _retry_decorator(config)
+    return retry_generic_api(max_retries=max_retries, base_delay=base_delay)
 
 
 def retry_generic_api(
-    max_retries: int = 3,
-    base_delay: float = 1.0,
-    max_delay: float = 60.0,
+    max_retries: int = ConfigDefaults.RETRY_MAX_RETRIES,
+    base_delay: float = ConfigDefaults.RETRY_BASE_DELAY,
+    max_delay: float = ConfigDefaults.RETRY_MAX_DELAY,
     exceptions: Tuple[Type[Exception], ...] = (Exception,)
 ) -> Callable:
     """Generic retry decorator for API calls"""

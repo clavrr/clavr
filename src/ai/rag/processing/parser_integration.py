@@ -12,11 +12,20 @@ It acts as the central orchestrator for all document ingestion into the RAG syst
 from typing import List, Dict, Any, Optional, Union
 from datetime import datetime
 from pathlib import Path
+import hashlib
+import asyncio
+
+
+from typing import TYPE_CHECKING, List, Dict, Any, Optional, Union
 
 from ....utils.logger import setup_logger
-from ....services.indexing.parsers import EmailParser, ReceiptParser, AttachmentParser
-from ....services.indexing.parsers.base import ParsedNode
+
+if TYPE_CHECKING:
+    from ....services.indexing.parsers.base import ParsedNode
+    from ....services.indexing.parsers import EmailParser, ReceiptParser, AttachmentParser
+
 from ..core.rag_engine import RAGEngine
+
 from ..chunking import RecursiveTextChunker
 from ..chunking import EmailChunker
 from .document_processor import DocumentProcessor
@@ -60,13 +69,17 @@ class UnifiedParserRAGBridge:
         self.rag_engine = rag_engine
         self.llm_client = llm_client
         
+        # Local imports to avoid circular dependency
+        from ....services.indexing.parsers import EmailParser, ReceiptParser, AttachmentParser
+        
         # Initialize specialized parsers
         self.email_parser = EmailParser(llm_client=llm_client)
+
         self.receipt_parser = ReceiptParser(llm_client=llm_client)
         self.attachment_parser = AttachmentParser(llm_client=llm_client)
         
         # Initialize specialized chunkers
-        self.email_chunker = EmailChunker(max_chunk_words=300)
+        self.email_chunker = EmailChunker(chunk_size=300)
         
         # Initialize advanced recursive text chunker
         self.text_chunker = RecursiveTextChunker(
@@ -115,7 +128,6 @@ class UnifiedParserRAGBridge:
         try:
             # Generate email_id if not provided
             if not email_id:
-                import hashlib
                 email_str = f"{email_data.get('subject', '')}{email_data.get('date', '')}"
                 email_id = f"email_{hashlib.md5(email_str.encode()).hexdigest()[:12]}"
             
@@ -248,12 +260,12 @@ class UnifiedParserRAGBridge:
         """Index a receipt with specialized parsing."""
         # Read file if needed
         if file_path and not file_bytes:
-            file_bytes = Path(file_path).read_bytes()
+            loop = asyncio.get_running_loop()
+            file_bytes = await loop.run_in_executor(None, Path(file_path).read_bytes)
             filename = filename or Path(file_path).name
         
         # Generate doc_id
         if not doc_id:
-            import hashlib
             doc_id = f"receipt_{hashlib.md5(file_bytes).hexdigest()[:12]}"
         
         logger.info(f"Indexing receipt: {filename}")
@@ -275,7 +287,7 @@ class UnifiedParserRAGBridge:
             'amount': parsed_node.properties.get('total_amount'),
             'date': parsed_node.properties.get('date'),
             'category': parsed_node.properties.get('category'),
-            'neo4j_node_id': doc_id,  # ← THE BRIDGE: Links receipt to graph node (matches architecture)
+            'arango_node_id': doc_id,  # ← THE BRIDGE: Links receipt to graph node (matches architecture)
             'node_id': doc_id  # Also keep for backward compatibility
         }
         
@@ -320,7 +332,7 @@ class UnifiedParserRAGBridge:
     
     def _extract_email_metadata(
         self,
-        parsed_node: ParsedNode,
+        parsed_node: 'ParsedNode',
         email_data: Dict[str, Any]
     ) -> Dict[str, Any]:
         """Extract enriched metadata from parsed email."""
@@ -337,7 +349,7 @@ class UnifiedParserRAGBridge:
             'key_entities': parsed_node.properties.get('key_entities', [])
         }
     
-    def _format_receipt_for_indexing(self, parsed_node: ParsedNode) -> str:
+    def _format_receipt_for_indexing(self, parsed_node: 'ParsedNode') -> str:
         """Format receipt data as searchable text."""
         props = parsed_node.properties
         

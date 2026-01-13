@@ -16,6 +16,12 @@ from typing import Optional, Tuple, Dict, Any, Union
 import calendar
 
 try:
+    import pytz
+    PYTZ_AVAILABLE = True
+except ImportError:
+    PYTZ_AVAILABLE = False
+
+try:
     import dateutil.parser
     from dateutil.relativedelta import relativedelta
     DATEUTIL_AVAILABLE = True
@@ -38,17 +44,11 @@ class FlexibleDateParser:
             config: Optional config object with timezone settings
         """
         self.config = config
-        self.timezone = None
+        self.timezone_name = None
         
         # Try to get timezone from config
-        if config:
-            try:
-                if hasattr(config, 'agent') and hasattr(config.agent, 'timezone'):
-                    self.timezone = config.agent.timezone
-                elif hasattr(config, 'timezone'):
-                    self.timezone = config.timezone
-            except Exception:
-                pass
+        from src.utils.config import get_timezone
+        self.timezone_name = get_timezone(config)
         
         # Day name mappings
         self.day_names = {
@@ -84,13 +84,35 @@ class FlexibleDateParser:
             'evening': (17, 21),
             'night': (21, 6),
         }
+        
+        # Timezone abbreviations to IANA names
+        self.tz_abbrev_map = {
+            'pst': 'America/Los_Angeles',
+            'pdt': 'America/Los_Angeles',
+            'est': 'America/New_York',
+            'edt': 'America/New_York',
+            'cst': 'America/Chicago',
+            'cdt': 'America/Chicago',
+            'mst': 'America/Denver',
+            'mdt': 'America/Denver',
+            'utc': 'UTC',
+            'gmt': 'GMT',
+        }
+        
+        # Special time words
+        self.special_time_words = {
+            'noon': (12, 0),
+            'midday': (12, 0),
+            'midnight': (0, 0),
+        }
     
-    def parse(self, query: str) -> Optional[Tuple[datetime, datetime]]:
+    def parse(self, query: str, now: Optional[datetime] = None) -> Optional[Tuple[datetime, datetime]]:
         """
         Parse a date query and return start/end datetime range.
         
         Args:
             query: Natural language date expression
+            now: Optional reference datetime (defaults to now)
             
         Returns:
             Tuple of (start_datetime, end_datetime) or None if not parseable
@@ -98,42 +120,163 @@ class FlexibleDateParser:
         if not query:
             return None
             
-        query_lower = query.lower().strip()
-        now = datetime.now()
+        # 0. Check for ISO format first (fast path)
+        if re.match(r'^\d{4}-\d{2}-\d{2}', query):
+            if DATEUTIL_AVAILABLE:
+                try:
+                    parsed = dateutil.parser.parse(query)
+                    return (self._localize(parsed), self._localize(parsed + timedelta(hours=1)))
+                except Exception:
+                    pass
+                    
+        # 1. Extract timezone if present
+        query_remaining, tz_info = self._extract_timezone(query)
+        query_lower = query_remaining.lower().strip()
+        
+        # 2. Extract specific time if present
+        target_time = self._parse_time(query_lower)
+        
+        # Get base dates
+        if now is None:
+            now = datetime.now()
+        
+        # Ensure now is localized if config has timezone
+        if now.tzinfo is None:
+            now = self._localize(now, tz_info)
+            
         today = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        
+        # 3. Try parsing date part
+        result = None
         
         # Try relative date patterns first
         result = self._parse_relative(query_lower, now, today)
-        if result:
-            return result
         
-        # Try day of week
-        result = self._parse_day_of_week(query_lower, today)
-        if result:
-            return result
+        # Try day of week if not found
+        if not result:
+            result = self._parse_day_of_week(query_lower, today)
         
-        # Try month/date patterns
-        result = self._parse_month_date(query_lower, now)
-        if result:
-            return result
+        # Try month/date patterns if not found
+        if not result:
+            result = self._parse_month_date(query_lower, now)
         
-        # Try duration patterns (last X days, past X weeks)
-        result = self._parse_duration(query_lower, now, today)
+        if not result and target_time:
+            result = (today, today + timedelta(days=1) - timedelta(seconds=1))
+            
         if result:
-            return result
+            start, end = result
+            
+            # Apply target time if found
+            if target_time:
+                h, m = target_time
+                start = start.replace(hour=h, minute=m, second=0, microsecond=0)
+                # If it's a specific time, the range is small (e.g., 1 hour) or just that point
+                # For most queries, 1 hour duration is a sensible default if not specified
+                end = start + timedelta(hours=1)
+            
+            # Localize
+            return (self._localize(start, tz_info), self._localize(end, tz_info))
         
         # Fallback to dateutil if available
         if DATEUTIL_AVAILABLE:
             try:
-                parsed = dateutil.parser.parse(query, fuzzy=True)
-                start = parsed.replace(hour=0, minute=0, second=0, microsecond=0)
-                end = start + timedelta(days=1) - timedelta(seconds=1)
-                return (start, end)
+                parsed = dateutil.parser.parse(query_remaining, fuzzy=True)
+                start = parsed
+                if not target_time:
+                    start = start.replace(hour=0, minute=0, second=0, microsecond=0)
+                    end = start + timedelta(days=1) - timedelta(seconds=1)
+                else:
+                    end = start + timedelta(hours=1)
+                
+                return (self._localize(start, tz_info), self._localize(end, tz_info))
             except Exception:
                 pass
         
         return None
     
+    def _extract_timezone(self, query: str) -> Tuple[str, Optional[Any]]:
+        """
+        Extract timezone abbreviation from query and return (remaining_query, tz_info).
+        """
+        query_lower = query.lower()
+        for abbrev, tz_name in self.tz_abbrev_map.items():
+            # Match abbreviation as a whole word
+            if re.search(rf'\b{abbrev}\b', query_lower):
+                remaining = re.sub(rf'\b{abbrev}\b', '', query_lower).strip()
+                if PYTZ_AVAILABLE:
+                    return remaining, pytz.timezone(tz_name)
+                return remaining, None
+        return query, None
+
+    def _localize(self, dt: datetime, tz: Optional[Any] = None) -> datetime:
+        """
+        Localize a naive datetime or convert an aware one.
+        """
+        target_tz = tz
+        if not target_tz and PYTZ_AVAILABLE and self.timezone_name:
+            target_tz = pytz.timezone(self.timezone_name)
+            
+        if not target_tz:
+            return dt
+            
+        if dt.tzinfo is None:
+            if hasattr(target_tz, 'localize'): # pytz
+                return target_tz.localize(dt)
+            return dt.replace(tzinfo=target_tz)
+        
+        return dt.astimezone(target_tz)
+
+    def _parse_time(self, query: str) -> Optional[Tuple[int, int]]:
+        """
+        Extract time (hour, minute) from query.
+        """
+        query_lower = query.lower().strip()
+        
+        # 1. Check special time words
+        for word, (h, m) in self.special_time_words.items():
+            if re.search(rf'\b{word}\b', query_lower):
+                return h, m
+        
+        # 2. Check for time patterns
+        time_patterns = [
+            r'(\d{1,2}):(\d{2})\s*([ap]\.?m\.?)',  # "2:30 pm", "2:30 p.m."
+            r'(\d{1,2})\s*([ap]\.?m\.?)',          # "10am", "3 p.m."
+            r'(\d{1,2}):(\d{2})',                  # "14:30"
+            r'\b(\d{1,2})\s*o\'clock\b',           # "3 o'clock"
+        ]
+        
+        for pattern in time_patterns:
+            match = re.search(pattern, query_lower)
+            if match:
+                groups = match.groups()
+                try:
+                    hour = int(groups[0])
+                    minute = 0
+                    am_pm = None
+                    
+                    if len(groups) >= 2:
+                        # Normalize am/pm (remove dots)
+                        potential_am_pm = groups[1].replace('.', '').lower()
+                        if potential_am_pm in ('am', 'pm'):
+                            am_pm = potential_am_pm
+                        else:
+                            minute = int(groups[1])
+                            if len(groups) >= 3:
+                                am_pm = groups[2].replace('.', '').lower()
+                    
+                    # Convert to 24-hour format
+                    if am_pm == 'pm' and hour < 12:
+                        hour += 12
+                    elif am_pm == 'am' and hour == 12:
+                        hour = 0
+                    
+                    if 0 <= hour <= 23 and 0 <= minute <= 59:
+                        return hour, minute
+                except (ValueError, TypeError):
+                    continue
+        
+        return None
+
     def _parse_relative(
         self, 
         query: str, 
@@ -345,6 +488,53 @@ class FlexibleDateParser:
                 return (start, end)
         
         return None
+    
+    def parse_date_expression(
+        self, 
+        query: str, 
+        prefer_future: bool = True,
+        now: Optional[datetime] = None
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Parse a date expression and return a dict with start and end datetimes.
+        
+        This is similar to parse() but returns a dict format that's more convenient
+        for some use cases.
+        
+        Args:
+            query: Natural language date expression
+            prefer_future: If True, prefer future dates when ambiguous
+            now: Optional reference datetime
+            
+        Returns:
+            Dict with 'start' and 'end' datetime keys, or None if not parseable
+        """
+        result = self.parse(query, now=now)
+        if not result:
+            return None
+        
+        start, end = result
+        
+        # If prefer_future is True and the date is in the past, adjust it
+        if now is None:
+            now = datetime.now()
+        if start.tzinfo:
+            now = self._localize(now)
+            
+        if prefer_future and start < now:
+            # For relative dates like "Monday", move to next occurrence
+            if any(day in query.lower() for day in self.day_names.keys()):
+                # Already handled in _parse_day_of_week, but double-check
+                if start < datetime.now():
+                    start = start + timedelta(weeks=1)
+                    end = start + timedelta(days=1) - timedelta(seconds=1)
+        
+        return {
+            'start': start,
+            'end': end,
+            'start_datetime': start,
+            'end_datetime': end
+        }
     
     def extract_date_filter(
         self, 

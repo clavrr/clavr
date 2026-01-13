@@ -10,7 +10,7 @@ from datetime import datetime
 
 from ..utils.logger import setup_logger
 from ..core.email.google_client import GoogleGmailClient
-from .gmail_watch_service import GmailWatchService
+from ..integrations.gmail.watch_service import GmailWatchService
 from ..utils.config import Config
 
 logger = setup_logger(__name__)
@@ -42,9 +42,21 @@ async def setup_gmail_watch_for_user(
         - expiration_datetime: str (ISO format)
         - error: str (if failed)
     """
+    import asyncio
+    
     try:
-        # Get webhook URL from environment
-        webhook_url = os.getenv('WEBHOOK_BASE_URL')
+        # Get webhook URL from config or environment
+        webhook_url = None
+        if config:
+            # Try to get from config object (handle dict or object access)
+            if isinstance(config, dict):
+                webhook_url = config.get('WEBHOOK_BASE_URL') or config.get('webhook_base_url')
+            elif hasattr(config, 'webhook_base_url'):
+                webhook_url = getattr(config, 'webhook_base_url', None) or getattr(config, 'WEBHOOK_BASE_URL', None)
+        
+        # Fallback to environment variable
+        if not webhook_url:
+            webhook_url = os.getenv('WEBHOOK_BASE_URL')
         
         if not webhook_url:
             logger.warning(
@@ -58,8 +70,10 @@ async def setup_gmail_watch_for_user(
             }
         
         # Ensure webhook URL includes the Gmail push endpoint
+        # Use simple string concatenation to be safe
         if not webhook_url.endswith('/api/gmail/push/notification'):
-            webhook_url = f"{webhook_url.rstrip('/')}/api/gmail/push/notification"
+            base = webhook_url.rstrip('/')
+            webhook_url = f"{base}/api/gmail/push/notification"
         
         # Create watch service
         watch_service = GmailWatchService(
@@ -80,8 +94,10 @@ async def setup_gmail_watch_for_user(
             f"with labels: {label_ids}"
         )
         
-        # Set up watch subscription
-        result = watch_service.setup_watch(
+        # Set up watch subscription - RUN IN THREAD TO AVOID BLOCKING
+        # Gmail API calls are synchronous and can take seconds
+        result = await asyncio.to_thread(
+            watch_service.setup_watch,
             user_id='me',
             label_ids=label_ids
         )
@@ -98,7 +114,28 @@ async def setup_gmail_watch_for_user(
             'channel_token': channel_token
         }
         
+    except ValueError as e:
+        # Expected error when GOOGLE_CLOUD_PROJECT_ID is not set
+        # This is a configuration issue, not a runtime error
+        error_msg = str(e)
+        if 'Pub/Sub topic name' in error_msg or 'GOOGLE_CLOUD_PROJECT_ID' in error_msg:
+            logger.warning(
+                f"⚠️ Gmail watch setup failed for user {user_id}: {error_msg}"
+            )
+            logger.info("   Will use polling fallback for real-time indexing")
+        else:
+            logger.warning(
+                f"⚠️ Gmail watch setup failed for user {user_id}: {error_msg}"
+            )
+            logger.info("   Will use polling fallback for real-time indexing")
+        return {
+            'success': False,
+            'error': error_msg,
+            'user_id': user_id,
+            'fallback': 'polling'  # Will fall back to polling
+        }
     except Exception as e:
+        # Unexpected errors - log with traceback for debugging
         logger.error(
             f"❌ Failed to set up Gmail watch for user {user_id}: {e}",
             exc_info=True

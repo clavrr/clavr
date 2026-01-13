@@ -7,6 +7,8 @@ from typing import Callable, Any, Optional, List, Dict
 from enum import Enum
 from dataclasses import dataclass, field
 
+from .config import ConfigDefaults
+
 
 class CircuitState(Enum):
     """Circuit breaker states"""
@@ -24,9 +26,9 @@ class ServiceUnavailableError(Exception):
 class CircuitBreaker:
     """Circuit breaker implementation"""
     name: str
-    failure_threshold: int = 5
-    recovery_timeout: float = 30.0
-    half_open_max_calls: int = 3
+    failure_threshold: int = ConfigDefaults.CIRCUIT_BREAKER_FAILURE_THRESHOLD
+    recovery_timeout: float = ConfigDefaults.CIRCUIT_BREAKER_RECOVERY_TIMEOUT
+    half_open_max_calls: int = ConfigDefaults.CIRCUIT_BREAKER_HALF_OPEN_MAX_CALLS
     
     _state: CircuitState = field(default=CircuitState.CLOSED, init=False)
     _failure_count: int = field(default=0, init=False)
@@ -83,18 +85,20 @@ def _get_circuit_breaker(name: str, **kwargs) -> CircuitBreaker:
     return _circuit_breakers[name]
 
 
-def with_gmail_circuit_breaker(
-    failure_threshold: int = 5,
-    recovery_timeout: float = 30.0
+
+def with_service_circuit_breaker(
+    service_name: str,
+    failure_threshold: int = ConfigDefaults.CIRCUIT_BREAKER_FAILURE_THRESHOLD,
+    recovery_timeout: float = ConfigDefaults.CIRCUIT_BREAKER_RECOVERY_TIMEOUT
 ) -> Callable:
-    """Circuit breaker decorator factory for Gmail API calls"""
-    cb = _get_circuit_breaker("gmail", failure_threshold=failure_threshold, recovery_timeout=recovery_timeout)
+    """Generic circuit breaker decorator factory for service API calls"""
+    cb = _get_circuit_breaker(service_name, failure_threshold=failure_threshold, recovery_timeout=recovery_timeout)
     
     def decorator(func: Callable) -> Callable:
         @functools.wraps(func)
         def wrapper(*args, **kwargs) -> Any:
             if not cb.allow_request():
-                raise ServiceUnavailableError(f"Gmail service unavailable (circuit open)")
+                raise ServiceUnavailableError(f"{service_name.capitalize()} service unavailable (circuit open)")
             try:
                 result = func(*args, **kwargs)
                 cb.record_success()
@@ -104,52 +108,30 @@ def with_gmail_circuit_breaker(
                 raise
         return wrapper
     return decorator
+
+
+def with_gmail_circuit_breaker(
+    failure_threshold: int = ConfigDefaults.CIRCUIT_BREAKER_FAILURE_THRESHOLD,
+    recovery_timeout: float = ConfigDefaults.CIRCUIT_BREAKER_RECOVERY_TIMEOUT
+) -> Callable:
+    """Circuit breaker decorator factory for Gmail API calls"""
+    return with_service_circuit_breaker("gmail", failure_threshold, recovery_timeout)
 
 
 def with_calendar_circuit_breaker(
-    failure_threshold: int = 5,
-    recovery_timeout: float = 30.0
+    failure_threshold: int = ConfigDefaults.CIRCUIT_BREAKER_FAILURE_THRESHOLD,
+    recovery_timeout: float = ConfigDefaults.CIRCUIT_BREAKER_RECOVERY_TIMEOUT
 ) -> Callable:
     """Circuit breaker decorator factory for Calendar API calls"""
-    cb = _get_circuit_breaker("calendar", failure_threshold=failure_threshold, recovery_timeout=recovery_timeout)
-    
-    def decorator(func: Callable) -> Callable:
-        @functools.wraps(func)
-        def wrapper(*args, **kwargs) -> Any:
-            if not cb.allow_request():
-                raise ServiceUnavailableError(f"Calendar service unavailable (circuit open)")
-            try:
-                result = func(*args, **kwargs)
-                cb.record_success()
-                return result
-            except Exception as e:
-                cb.record_failure()
-                raise
-        return wrapper
-    return decorator
+    return with_service_circuit_breaker("calendar", failure_threshold, recovery_timeout)
 
 
 def with_tasks_circuit_breaker(
-    failure_threshold: int = 5,
-    recovery_timeout: float = 30.0
+    failure_threshold: int = ConfigDefaults.CIRCUIT_BREAKER_FAILURE_THRESHOLD,
+    recovery_timeout: float = ConfigDefaults.CIRCUIT_BREAKER_RECOVERY_TIMEOUT
 ) -> Callable:
     """Circuit breaker decorator factory for Tasks API calls"""
-    cb = _get_circuit_breaker("tasks", failure_threshold=failure_threshold, recovery_timeout=recovery_timeout)
-    
-    def decorator(func: Callable) -> Callable:
-        @functools.wraps(func)
-        def wrapper(*args, **kwargs) -> Any:
-            if not cb.allow_request():
-                raise ServiceUnavailableError(f"Tasks service unavailable (circuit open)")
-            try:
-                result = func(*args, **kwargs)
-                cb.record_success()
-                return result
-            except Exception as e:
-                cb.record_failure()
-                raise
-        return wrapper
-    return decorator
+    return with_service_circuit_breaker("tasks", failure_threshold, recovery_timeout)
 
 
 # Fallback functions

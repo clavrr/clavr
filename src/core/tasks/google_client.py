@@ -43,11 +43,15 @@ class GoogleTasksClient(BaseGoogleAPIClient):
     
     def _build_service(self) -> Any:
         """Build Google Tasks API service"""
-        return build('tasks', 'v1', credentials=self.credentials)
+        return build('tasks', 'v1', credentials=self.credentials, cache_discovery=False)
     
     def _get_required_scopes(self) -> List[str]:
         """Get required Google Tasks scopes"""
-        return ['https://www.googleapis.com/auth/tasks']
+        # Accept either full access or readonly access
+        return [
+            'https://www.googleapis.com/auth/tasks',
+            'https://www.googleapis.com/auth/tasks.readonly'
+        ]
     
     def _get_service_name(self) -> str:
         """Get service name"""
@@ -127,27 +131,9 @@ class GoogleTasksClient(BaseGoogleAPIClient):
             tasks = list(all_tasks_dict.values())
             logger.info(f"[GOOGLE_TASKS] Combined results: {len(tasks_pending)} pending-only + {len(all_tasks_dict)} total unique = {len(tasks)} tasks")
             
-            # Debug: Log raw task details before formatting
+            # Debug: Log raw task details summary
             if tasks:
-                # Log ALL raw tasks with their raw status values from Google API
-                logger.info(f"[GOOGLE_TASKS] Raw tasks retrieved: {len(tasks)} total from tasklist={tasklist_id}")
-                for i, task in enumerate(tasks, 1):
-                    raw_status = task.get('status', 'MISSING')
-                    raw_title = task.get('title', 'NO TITLE')[:50]
-                    raw_due = task.get('due', 'NO DUE')
-                    raw_deleted = task.get('deleted', False)
-                    raw_updated = task.get('updated', 'NO UPDATED')
-                    raw_completed = task.get('completed', 'NO COMPLETED')
-                    logger.info(f"[GOOGLE_TASKS]   Raw task {i}: status='{raw_status}', title='{raw_title}', due={raw_due}, deleted={raw_deleted}, updated={raw_updated}, completed={raw_completed}")
-                
-                # Check for specific tasks the user mentioned
-                user_task_titles = ['going for a walk', 'calling mom', 'going to the gym']
-                for title_search in user_task_titles:
-                    matching = [t for t in tasks if title_search.lower() in t.get('title', '').lower()]
-                    if matching:
-                        logger.info(f"[GOOGLE_TASKS] Found task matching '{title_search}': {[(t.get('id', 'NO_ID')[:10], t.get('status', 'NO_STATUS'), t.get('title', 'NO_TITLE')[:30]) for t in matching]}")
-                    else:
-                        logger.warning(f"[GOOGLE_TASKS] Task matching '{title_search}' NOT FOUND in API results!")
+                logger.info(f"[GOOGLE_TASKS] Retrieved {len(tasks)} total unique tasks from tasklist={tasklist_id}")
                 
                 raw_statuses = [task.get('status', 'MISSING') for task in tasks[:10]]
                 raw_titles = [task.get('title', 'NO TITLE')[:30] for task in tasks[:10]]
@@ -204,7 +190,7 @@ class GoogleTasksClient(BaseGoogleAPIClient):
         Args:
             title: Task title
             notes: Task notes/description
-            due: Due date (RFC 3339 format)
+            due: Due date (YYYY-MM-DD format or RFC 3339 format)
             tasklist_id: ID of the task list
             
         Returns:
@@ -221,7 +207,22 @@ class GoogleTasksClient(BaseGoogleAPIClient):
             }
             
             if due:
-                task_body['due'] = due
+                # Google Tasks API requires RFC 3339 format (YYYY-MM-DDTHH:MM:SS.000Z)
+                # Convert from YYYY-MM-DD if needed
+                if 'T' not in due:
+                    # Simple date format like "2025-12-05" - convert to RFC 3339
+                    # Use midnight UTC as the default time (standard convention for all-day due dates)
+                    try:
+                        due_datetime = datetime.strptime(due, "%Y-%m-%d")
+                        due = due_datetime.replace(hour=0, minute=0, second=0, tzinfo=timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+                        logger.debug(f"[GOOGLE_TASKS] Converted due date to RFC 3339: {due}")
+                    except ValueError:
+                        logger.warning(f"[GOOGLE_TASKS] Could not parse due date: {due}")
+                        # Don't set due date if we can't parse it
+                        due = None
+                
+                if due:
+                    task_body['due'] = due
             
             result = self.service.tasks().insert(
                 tasklist=tasklist_id,

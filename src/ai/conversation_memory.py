@@ -21,21 +21,29 @@ import json
 from typing import List, Dict, Any, Optional, TYPE_CHECKING
 from datetime import datetime, timedelta
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, delete, and_, func
+from sqlalchemy import select, delete, and_, func, or_
 
 from ..database.models import ConversationMessage
 from ..utils.logger import setup_logger
+from .rag.query.rules import SEARCH_STOPWORDS
+from .memory.semantic_memory import SemanticMemory
+from .memory.extractor import FactExtractor
 from .memory_constants import (
     LOG_OK, LOG_ERROR, LOG_INFO, LOG_WARNING,
     ROLE_USER, ROLE_ASSISTANT, VALID_ROLES,
     DEFAULT_MESSAGE_LIMIT, DEFAULT_MAX_AGE_MINUTES, DEFAULT_CLEANUP_DAYS,
-    DEFAULT_CONTEXT_LIMIT, SESSION_ID_DISPLAY_LENGTH, ENTITY_TYPES
+    DEFAULT_CONTEXT_LIMIT, SESSION_ID_DISPLAY_LENGTH, ENTITY_TYPES,
+    DEFAULT_CONVERSATION_LIST_LIMIT, DEFAULT_CONVERSATION_MESSAGES_LIMIT,
+    PREVIEW_MESSAGE_LENGTH, DEFAULT_PREVIEW_TEXT
 )
+
+
 
 # Type checking import to avoid circular dependencies
 if TYPE_CHECKING:
     from .rag import RAGEngine
 
+from ..database import get_async_db_context
 logger = setup_logger(__name__)
 
 
@@ -92,8 +100,9 @@ class ConversationMemory:
         if rag_engine is None and auto_init_rag:
             try:
                 from api.dependencies import AppState
-                rag_engine = AppState.get_rag_engine()
-                logger.debug(f"{LOG_OK} Auto-initialized RAG engine from AppState")
+                # CRITICAL: Use dedicated conversation RAG engine to prevent polluting email-knowledge
+                rag_engine = AppState.get_conversation_rag_engine()
+                logger.debug(f"{LOG_OK} Auto-initialized Conversation RAG engine from AppState")
             except Exception as e:
                 logger.debug(f"{LOG_INFO} Could not auto-initialize RAG engine: {e}")
         
@@ -104,6 +113,10 @@ class ConversationMemory:
             logger.info(f"{LOG_OK} ConversationMemory initialized with RAG support (semantic search enabled)")
         else:
             logger.info(f"{LOG_INFO} ConversationMemory initialized without RAG (semantic search disabled)")
+
+        # Initialize Semantic Memory (Fact Store)
+        self.semantic = SemanticMemory(db, rag_engine)
+        self.extractor = FactExtractor()
     
     async def add_message(
         self,
@@ -139,6 +152,18 @@ class ConversationMemory:
         self._validate_message_inputs(role, content)
         
         try:
+            # Ensure clean transaction state before proceeding
+            # Rollback any existing transaction to handle cases where a previous 
+            # operation failed and left the session in an aborted/failed state.
+            # This is safe because:
+            # 1. If there's no active transaction, rollback is a no-op
+            # 2. If there's a failed transaction, this clears it
+            # 3. Each add_message should be its own atomic transaction anyway
+            try:
+                await self.db.rollback()
+            except Exception:
+                pass  # Ignore errors - rollback is best-effort cleanup
+            
             message = ConversationMessage(
                 user_id=user_id,
                 session_id=session_id,
@@ -162,6 +187,19 @@ class ConversationMemory:
             # Index in RAG if enabled (both user and assistant messages for better context)
             if self._rag_enabled:
                 await self._index_message_in_rag(message)
+
+            # Background task: Fact Extraction (Observer)
+            # Only analyze if user message, to capture user statements
+            if role == ROLE_USER:
+                 # Pass recent context + this message
+                 # We construct a mini-history list for the extractor
+                 # Ideally we should fetch recent history, but for efficiency we just pass this one 
+                 # and maybe the previous assistant message if possible.
+                 # Actually, let's just trigger it. The extractor can fetch what it needs or accept a list.
+                 # Our extractor accepts 'messages'. Let's build a small list.
+                 # WARNING: fetching history here might block? No, it's async.
+                 # Better: Fire and forget.
+                 asyncio.create_task(self._run_extraction(user_id, role, content))
             
             return message.id
             
@@ -310,12 +348,181 @@ class ConversationMemory:
             return result.scalar_one()
             
         except Exception as e:
+            await self.db.rollback()
             logger.error(
                 f"{LOG_ERROR} Failed to get message count: {e}",
                 exc_info=True,
                 extra={'user_id': user_id, 'session_id': session_id}
             )
             return 0
+    
+    async def list_conversations(
+        self,
+        user_id: int,
+        limit: int = DEFAULT_CONVERSATION_LIST_LIMIT
+    ) -> List[Dict[str, Any]]:
+        """
+        List all conversations (sessions) for a user - async.
+        
+        Returns conversations sorted by most recent activity, with preview of first message.
+        Used for sidebar "Your Actions" list.
+        
+        Args:
+            user_id: User ID
+            limit: Maximum number of conversations to return (default: DEFAULT_CONVERSATION_LIST_LIMIT)
+            
+        Returns:
+            List of conversation dictionaries with keys:
+            - session_id: Session identifier
+            - preview: First user message (truncated to PREVIEW_MESSAGE_LENGTH chars)
+            - last_activity: Timestamp of most recent message
+            - message_count: Number of messages in conversation
+            Returns empty list on error
+        """
+        try:
+            # Get distinct sessions with their latest message timestamp
+            stmt = (
+                select(
+                    ConversationMessage.session_id,
+                    func.max(ConversationMessage.timestamp).label('last_activity'),
+                    func.count(ConversationMessage.id).label('message_count'),
+                    func.min(ConversationMessage.id).label('first_message_id')
+                )
+                .where(ConversationMessage.user_id == user_id)
+                .group_by(ConversationMessage.session_id)
+                .order_by(func.max(ConversationMessage.timestamp).desc())
+                .limit(limit)
+            )
+            
+            result = await self.db.execute(stmt)
+            sessions = result.all()
+            
+            # Get preview (first user message) for each session
+            conversations = []
+            for session in sessions:
+                # Get first user message as preview
+                preview_stmt = (
+                    select(ConversationMessage.content)
+                    .where(
+                        and_(
+                            ConversationMessage.user_id == user_id,
+                            ConversationMessage.session_id == session.session_id,
+                            ConversationMessage.role == 'user'
+                        )
+                    )
+                    .order_by(ConversationMessage.timestamp.asc())
+                    .limit(1)
+                )
+                
+                preview_result = await self.db.execute(preview_stmt)
+                preview_msg = preview_result.scalar_one_or_none()
+                
+                if preview_msg and len(preview_msg) > PREVIEW_MESSAGE_LENGTH:
+                    preview = preview_msg[:PREVIEW_MESSAGE_LENGTH] + "..."
+                else:
+                    preview = preview_msg or DEFAULT_PREVIEW_TEXT
+                
+                conversations.append({
+                    'session_id': session.session_id,
+                    'preview': preview,
+                    'last_activity': session.last_activity.isoformat() if session.last_activity else None,
+                    'message_count': session.message_count
+                })
+            
+            logger.info(f"{LOG_OK} Listed {len(conversations)} conversations for user {user_id}")
+            return conversations
+            
+        except Exception as e:
+            await self.db.rollback()
+            logger.error(
+                f"{LOG_ERROR} Failed to list conversations: {e}",
+                exc_info=True,
+                extra={'user_id': user_id, 'limit': limit}
+            )
+            return []
+    
+    async def get_conversation_messages(
+        self,
+        user_id: int,
+        session_id: str,
+        limit: Optional[int] = None
+    ) -> List[Dict[str, Any]]:
+        """
+        Get all messages for a specific conversation (session) - async.
+        
+        Used when user clicks on a conversation in the sidebar to view full history.
+        
+        Args:
+            user_id: User ID
+            session_id: Session ID
+            limit: Optional limit on number of messages (None = all messages)
+            
+        Returns:
+            List of message dictionaries with keys: role, content, timestamp, intent, entities
+            Returns empty list on error
+        """
+        try:
+            messages = await self._query_messages(
+                user_id=user_id,
+                session_id=session_id,
+                limit=limit or DEFAULT_CONVERSATION_MESSAGES_LIMIT
+            )
+            
+            formatted = [self._format_message(msg) for msg in messages]
+            
+            session_display = self._format_session_id(session_id)
+            logger.info(f"{LOG_OK} Retrieved {len(formatted)} messages for session {session_display}")
+            return formatted
+            
+        except Exception as e:
+            logger.error(f"Failed to get recent messages: {e}")
+            return []
+
+    async def generate_conversation_title(
+        self,
+        user_id: int,
+        session_id: str
+    ) -> str:
+        """
+        Generate a concise title for a conversation based on its content - async.
+        
+        Args:
+            user_id: User ID
+            session_id: Session ID
+            
+        Returns:
+            A short (3-6 words) title for the conversation
+        """
+        try:
+            # Get first few messages
+            messages = await self.get_recent_messages(user_id, session_id, limit=5)
+            if not messages:
+                return "New Conversation"
+            
+            # Use LLM to summarize if available, otherwise use first message preview
+            if self._rag_enabled and hasattr(self.rag, 'llm'):
+                # Simple prompt for title generation
+                history_text = "\n".join([f"{m['role']}: {m['content']}" for m in messages])
+                prompt = (
+                    "Based on the following conversation start, generate a very concise title "
+                    "(max 5 words) that captures the main topic. Return ONLY the title.\n\n"
+                    f"{history_text}"
+                )
+                
+                try:
+                    title = await self.rag.llm.agenerate(prompt)
+                    return title.strip().replace('"', '')
+                except Exception as llm_err:
+                    logger.debug(f"LLM title generation failed: {llm_err}")
+            
+            # Fallback to preview
+            first_user_msg = next((m['content'] for m in messages if m['role'] == ROLE_USER), "New Chat")
+            title = first_user_msg[:40] + "..." if len(first_user_msg) > 40 else first_user_msg
+            return title
+            
+        except Exception as e:
+            logger.error(f"Failed to generate title: {e}")
+            return "Conversation"
     
     # RAG-Powered Semantic Search Methods 
     
@@ -412,11 +619,71 @@ class ConversationMemory:
             return formatted_results
             
         except Exception as e:
-            logger.error(
-                f"{LOG_ERROR} Semantic search failed: {e}",
-                exc_info=True,
-                extra={'query': query, 'user_id': user_id, 'k': k}
-            )
+            logger.warning(f"Semantic search failed, falling back to keyword search: {e}")
+            return await self.search_conversations_keyword(query, user_id, k=k, session_id_filter=session_id_filter)
+
+    async def search_conversations_keyword(
+        self,
+        query: str,
+        user_id: int,
+        k: int = 5,
+        session_id_filter: Optional[str] = None
+    ) -> List[Dict[str, Any]]:
+        """
+        Fallback keyword-based search for conversation messages - async.
+        Used when RAG is unavailable or fails.
+        """
+        try:
+            # Simple keyword matching using SQL LIKE
+            # 1. Clean query
+            clean_query = re.sub(r'[^a-zA-Z0-9\s]', '', query).strip()
+            if not clean_query:
+                return []
+            
+            # 2. Build search terms
+            terms = [t for t in clean_query.split() if t.lower() not in SEARCH_STOPWORDS]
+            if not terms:
+                # If all stopwords, use original query minus special chars
+                terms = [clean_query]
+            
+            # 3. Build conditions
+            conditions = [
+                ConversationMessage.user_id == user_id,
+                ConversationMessage.role == ROLE_USER
+            ]
+            
+            if session_id_filter:
+                conditions.append(ConversationMessage.session_id == session_id_filter)
+                
+            # Use OR for multiple terms
+            term_conditions = []
+            for term in terms:
+                term_conditions.append(ConversationMessage.content.ilike(f"%{term}%"))
+            
+            if term_conditions:
+                conditions.append(or_(*term_conditions))
+            
+            # 4. Execute query
+            stmt = select(ConversationMessage).where(
+                and_(*conditions)
+            ).order_by(ConversationMessage.timestamp.desc()).limit(k)
+            
+            result = await self.db.execute(stmt)
+            messages = result.scalars().all()
+            
+            # 5. Format results (Score is static 0.5 for keyword hits)
+            return [{
+                'message_id': msg.id,
+                'content': msg.content,
+                'session_id': msg.session_id,
+                'intent': msg.intent,
+                'timestamp': msg.timestamp.isoformat() if msg.timestamp else None,
+                'relevance_score': 0.5,
+                'search_method': 'keyword'
+            } for msg in messages]
+            
+        except Exception as e:
+            logger.error(f"Keyword search failed: {e}")
             return []
     
     async def get_relevant_context_from_history(
@@ -500,6 +767,36 @@ class ConversationMemory:
                 extra={'query': current_query, 'user_id': user_id, 'exclude_session': exclude_session_id}
             )
             return []
+
+    async def get_extended_semantic_context(
+        self,
+        user_id: int,
+        query: str,
+        k_messages: int = 3,
+        k_facts: int = 5
+    ) -> Dict[str, Any]:
+        """
+        Get comprehensive context combining recent messages, cross-session history, and facts.
+        
+        Args:
+            user_id: User ID
+            query: Current user query
+            k_messages: Number of historical messages to retrieve
+            k_facts: Number of facts to retrieve
+            
+        Returns:
+            Combined context dictionary
+        """
+        # 1. Get facts from SemanticMemory
+        facts = await self.semantic.search_facts(user_id, query, k=k_facts)
+        
+        # 2. Get cross-session history
+        history = await self.get_relevant_context_from_history(query, user_id, k=k_messages)
+        
+        return {
+            "facts": facts,
+            "related_history": history
+        }
     
     async def get_conversation_summary(
         self,
@@ -667,7 +964,7 @@ class ConversationMemory:
             List of message IDs (None for failed messages)
         """
         message_ids = []
-        
+
         try:
             for msg_data in messages:
                 try:
@@ -694,7 +991,61 @@ class ConversationMemory:
                 exc_info=True
             )
             return message_ids
-    
+
+    async def get_user_preferences(self, user_id: int) -> str:
+        """
+        Get explicit user preferences from semantic memory.
+        
+        Args:
+            user_id: User ID
+            
+        Returns:
+            Formatted string of preferences
+        """
+        try:
+            facts = await self.semantic.get_facts(user_id, category="preference")
+            if not facts:
+                return ""
+            
+            return "EXPLICIT USER PREFERENCES:\n" + "\n".join([f"- {f['content']}" for f in facts])
+        except Exception as e:
+            logger.error(f"Failed to get user preferences: {e}")
+            return ""
+
+    async def learn_fact(self, user_id: int, content: str, category: str = "general") -> Optional[int]:
+        """
+        Learn a new fact about the user.
+        
+        Args:
+            user_id: User ID
+            content: Fact content
+            category: Fact category
+            
+        Returns:
+            Fact ID or None
+        """
+        return await self.semantic.learn_fact(user_id, content, category)
+
+    async def _run_extraction(self, user_id: int, role: str, content: str):
+        """
+        Helper to run fact extraction in background with its own DB session.
+        Uses get_async_db_context to ensure session lifetime safely.
+        """
+        try:
+             # Use a fresh context manager session for background task
+             async with get_async_db_context() as db:
+                 # Re-initialize SemanticMemory with the fresh session
+                 # This avoids 'Session is closed' errors in background tasks
+                 bg_semantic = SemanticMemory(db, self.rag)
+                 
+                 msgs = [{"role": role, "content": content}]
+                 await self.extractor.extract_and_learn(msgs, user_id, bg_semantic)
+                 
+                 logger.debug(f"Background extraction successful for user {user_id}")
+             
+        except Exception as e:
+            logger.debug(f"Background extraction failed: {e}")
+
     # Helper methods (private)
     
     def _validate_message_inputs(self, role: str, content: str) -> None:
@@ -734,20 +1085,25 @@ class ConversationMemory:
         Returns:
             List of ConversationMessage objects (newest first)
         """
-        conditions = [
-            ConversationMessage.user_id == user_id,
-            ConversationMessage.session_id == session_id
-        ]
-        
-        if since:
-            conditions.append(ConversationMessage.timestamp >= since)
-        
-        stmt = select(ConversationMessage).where(
-            and_(*conditions)
-        ).order_by(ConversationMessage.timestamp.desc()).limit(limit)
-        
-        result = await self.db.execute(stmt)
-        return result.scalars().all()
+        try:
+            conditions = [
+                ConversationMessage.user_id == user_id,
+                ConversationMessage.session_id == session_id
+            ]
+            
+            if since:
+                conditions.append(ConversationMessage.timestamp >= since)
+            
+            stmt = select(ConversationMessage).where(
+                and_(*conditions)
+            ).order_by(ConversationMessage.timestamp.desc()).limit(limit)
+            
+            result = await self.db.execute(stmt)
+            return result.scalars().all()
+        except Exception as e:
+            await self.db.rollback()
+            logger.error(f"{LOG_ERROR} _query_messages failed: {e}")
+            return []
     
     def _format_message(self, msg: ConversationMessage) -> Dict[str, Any]:
         """Format a ConversationMessage object into a dictionary."""
@@ -812,12 +1168,12 @@ class ConversationMemory:
             'recent_intents': [],
             'message_count': 0
         }
-    
+
     def _extract_topics(self, messages: List[str], max_topics: int = 5) -> List[str]:
         """
         Extract key topics from message content.
         
-        Simple keyword-based topic extraction. Could be enhanced with LLM.
+        Simple keyword-based topic extraction using centralized stopwords.
         
         Args:
             messages: List of message content strings
@@ -829,20 +1185,12 @@ class ConversationMemory:
         import re
         from collections import Counter
         
-        # Common stopwords to ignore
-        stopwords = {
-            'the', 'a', 'an', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for',
-            'of', 'with', 'by', 'is', 'are', 'was', 'were', 'be', 'been', 'have',
-            'has', 'had', 'do', 'does', 'did', 'will', 'would', 'should', 'could',
-            'may', 'might', 'must', 'can', 'this', 'that', 'these', 'those',
-            'i', 'you', 'he', 'she', 'it', 'we', 'they', 'me', 'him', 'her', 'us', 'them'
-        }
-        
-        # Extract words (3+ characters, not stopwords)
+        # Extract words (3+ characters, not in centralized stopword list)
         words = []
         for msg in messages:
+            # Use simple regex for tokenization
             msg_words = re.findall(r'\b[a-z]{3,}\b', msg.lower())
-            words.extend([w for w in msg_words if w not in stopwords])
+            words.extend([w for w in msg_words if w not in SEARCH_STOPWORDS])
         
         # Count and return most common
         word_counts = Counter(words)
@@ -855,7 +1203,9 @@ class ConversationMemory:
         Index a message in RAG vector store for semantic search - async.
         
         Wraps the synchronous RAG.index_document() call in asyncio.to_thread()
-        to avoid blocking the async event loop.
+        Internal method to index a single message in RAG asynchronously.
+        
+        OPTIMIZATION: Skips indexing if message already exists to save Qdrant write units.
         
         Args:
             message: ConversationMessage object to index
@@ -863,7 +1213,22 @@ class ConversationMemory:
         try:
             doc_id = f"conv_msg_{message.id}"
             
-            # Build metadata, excluding None values (Pinecone doesn't accept None)
+            # Check if already indexed to prevent duplicate writes (save Qdrant quota)
+            try:
+                already_exists = await asyncio.to_thread(
+                    self.rag.document_exists,
+                    doc_id
+                )
+                if already_exists:
+                    logger.debug(
+                        f"{LOG_INFO} Message {message.id} already indexed, skipping (doc_id={doc_id})"
+                    )
+                    return
+            except Exception as check_error:
+                # If check fails, proceed with indexing (safer to index than miss)
+                logger.debug(f"Could not check if message {message.id} exists, proceeding: {check_error}")
+            
+            # 1. Build Base Metadata
             metadata = {
                 "type": "conversation_message",
                 "user_id": message.user_id,
@@ -872,19 +1237,17 @@ class ConversationMemory:
                 "role": message.role,
             }
             
-            # Add optional fields only if they have values
+            # 2. Add Conditional Fields
             if message.intent:
                 metadata["intent"] = message.intent
             if message.timestamp:
                 metadata["timestamp"] = message.timestamp.isoformat()
-            
-            # Pinecone metadata must be string, number, boolean, or list of strings
-            # Convert dict to JSON string, exclude if None/empty dict
-            if message.entities and isinstance(message.entities, (str, int, float, bool, list, dict)):
-                if isinstance(message.entities, dict) and message.entities:
-                    metadata["entities"] = json.dumps(message.entities)
-                elif isinstance(message.entities, (str, int, float, bool, list)):
-                    metadata["entities"] = message.entities
+                
+            # 3. Handle Entities (robust serialization)
+            # Qdrant accepts str, int, float, bool, or list[str]
+            # It does NOT accept dicts or nested lists. We must JSON serialize them.
+            if message.entities:
+                 metadata["entities"] = json.dumps(message.entities)
             
             # Wrap sync RAG call in thread to avoid blocking
             await asyncio.to_thread(
@@ -905,3 +1268,5 @@ class ConversationMemory:
                 f"{LOG_WARNING} Failed to index message {message.id} in RAG: {e}. "
                 "Message saved to database but not searchable via semantic search."
             )
+    
+

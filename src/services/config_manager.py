@@ -260,7 +260,7 @@ class ConfigManager:
             'email': ['gmail_credentials'],
             'calendar': ['calendar_credentials'],
             'task': ['task_credentials'],
-            'rag': ['openai_api_key', 'pinecone_api_key']
+            'rag': ['openai_api_key', 'qdrant_api_key']
         }
         
         missing = []

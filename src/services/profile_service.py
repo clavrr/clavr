@@ -13,7 +13,9 @@ from ..database.models import User, UserWritingProfile, Session as DBSession
 from ..ai.profile_builder import ProfileBuilder
 from ..utils.config import load_config
 from ..utils.logger import setup_logger
+from ..utils.config import load_config, get_frontend_url
 import os
+import uuid
 
 logger = setup_logger(__name__)
 
@@ -31,9 +33,9 @@ class ProfileUpdateService:
     
     def __init__(
         self,
-        stale_threshold_days: int = 7,
-        max_updates_per_run: int = 10,
-        update_interval_hours: int = 1
+        stale_threshold_days: Optional[int] = None,
+        max_updates_per_run: Optional[int] = None,
+        update_interval_hours: Optional[int] = None
     ):
         """
         Initialize profile update service
@@ -43,17 +45,20 @@ class ProfileUpdateService:
             max_updates_per_run: Maximum profiles to update per cycle
             update_interval_hours: Hours between update cycles
         """
-        self.stale_threshold_days = stale_threshold_days
-        self.max_updates_per_run = max_updates_per_run
-        self.update_interval_hours = update_interval_hours
+        from .service_constants import SERVICE_CONSTANTS
+        
+        # Use constants as defaults
+        self.stale_threshold_days = stale_threshold_days or SERVICE_CONSTANTS.PROFILE_STALE_THRESHOLD_DAYS
+        self.max_updates_per_run = max_updates_per_run or SERVICE_CONSTANTS.PROFILE_MAX_UPDATES_PER_RUN
+        self.update_interval_hours = update_interval_hours or SERVICE_CONSTANTS.PROFILE_UPDATE_INTERVAL_HOURS
         self.is_running = False
         self._task: Optional[asyncio.Task] = None
         
         logger.info(
             f"ProfileUpdateService initialized: "
-            f"stale_threshold={stale_threshold_days}d, "
-            f"max_per_run={max_updates_per_run}, "
-            f"interval={update_interval_hours}h"
+            f"stale_threshold={self.stale_threshold_days}d, "
+            f"max_per_run={self.max_updates_per_run}, "
+            f"interval={self.update_interval_hours}h"
         )
     
     async def start(self):
@@ -244,7 +249,8 @@ class ProfileUpdateService:
             profile_data = await builder.build_profile(sent_emails)
             
             # Calculate confidence
-            confidence = min(1.0, len(sent_emails) / 50.0)
+            from .service_constants import SERVICE_CONSTANTS
+            confidence = min(1.0, len(sent_emails) / SERVICE_CONSTANTS.PROFILE_SAMPLE_SIZE_FOR_CONFIDENCE)
             
             # Update profile
             profile.profile_data = profile_data
@@ -298,10 +304,88 @@ class ProfileUpdateService:
                 logger.info(f"Marked profile for user {user_id} for refresh")
                 
                 return True
-                
         except Exception as e:
             logger.error(f"Error marking profile for refresh: {e}", exc_info=True)
             return False
+                
+    async def trigger_profile_build(self, user_id: int, max_emails: int = 100):
+        """Trigger a background profile build."""
+        asyncio.create_task(self._build_profile_background(user_id, max_emails))
+        logger.info(f"Triggered background profile build for user {user_id}")
+
+    async def _build_profile_background(self, user_id: int, max_emails: int = 100):
+        """Background task to build user profile."""
+        try:
+            logger.info(f"Starting background profile build for user {user_id}")
+            async with get_async_db_context() as db:
+                from src.core.async_credential_provider import AsyncCredentialFactory
+                
+                config = load_config()
+                async_factory = AsyncCredentialFactory(config=config)
+                
+                # Use async factory to get email service
+                email_service = await async_factory.create_service(
+                    service_type="email", 
+                    user_id=user_id, 
+                    db_session=db
+                )
+                
+                if not email_service or not email_service.gmail_client or not email_service.gmail_client.is_available():
+                    logger.error(f"Email service not available for user {user_id}")
+                    return
+
+                # Fetch sent emails (blocking call in threadpool)
+                loop = asyncio.get_event_loop()
+                sent_emails = await loop.run_in_executor(
+                    None, 
+                    lambda: email_service.gmail_client.fetch_sent_emails(max_results=max_emails)
+                )
+                
+                if not sent_emails:
+                    logger.warning(f"No sent emails found for user {user_id}")
+                    sent_emails = []
+                
+                # Build profile
+                builder = ProfileBuilder(config=config)
+                profile_data = await builder.build_profile(sent_emails)
+                
+                # Calculate confidence
+                from .service_constants import SERVICE_CONSTANTS
+                confidence = min(1.0, len(sent_emails) / SERVICE_CONSTANTS.PROFILE_SAMPLE_SIZE_FOR_CONFIDENCE)
+                
+                # Save to database
+                stmt = select(UserWritingProfile).where(UserWritingProfile.user_id == user_id)
+                result = await db.execute(stmt)
+                existing = result.scalar_one_or_none()
+                
+                if existing:
+                    existing.profile_data = profile_data
+                    existing.sample_size = len(sent_emails)
+                    existing.last_rebuilt_at = datetime.utcnow()
+                    existing.updated_at = datetime.utcnow()
+                    existing.confidence_score = confidence
+                    existing.needs_refresh = False
+                else:
+                    new_profile = UserWritingProfile(
+                        user_id=user_id,
+                        profile_data=profile_data,
+                        sample_size=len(sent_emails),
+                        last_rebuilt_at=datetime.utcnow(),
+                        confidence_score=confidence,
+                        needs_refresh=False
+                    )
+                    db.add(new_profile)
+                
+                await db.commit()
+                
+                # Invalidate cache
+                from src.services.profile_cache import get_profile_cache
+                cache = get_profile_cache()
+                await cache.invalidate(user_id)
+                
+                logger.info(f"Profile build complete for user {user_id}")
+        except Exception as e:
+            logger.error(f"Background profile build failed for {user_id}: {e}", exc_info=True)
     
     async def get_service_stats(self) -> dict:
         """
@@ -361,15 +445,12 @@ def get_profile_service() -> ProfileUpdateService:
     global _profile_service
     
     if _profile_service is None:
-        # Read configuration from environment
-        stale_threshold = int(os.getenv('PROFILE_STALE_THRESHOLD_DAYS', '7'))
-        max_updates = int(os.getenv('PROFILE_MAX_UPDATES_PER_RUN', '10'))
-        interval = int(os.getenv('PROFILE_UPDATE_INTERVAL_HOURS', '1'))
+        from .service_constants import SERVICE_CONSTANTS
         
         _profile_service = ProfileUpdateService(
-            stale_threshold_days=stale_threshold,
-            max_updates_per_run=max_updates,
-            update_interval_hours=interval
+            stale_threshold_days=SERVICE_CONSTANTS.PROFILE_STALE_THRESHOLD_DAYS,
+            max_updates_per_run=SERVICE_CONSTANTS.PROFILE_MAX_UPDATES_PER_RUN,
+            update_interval_hours=SERVICE_CONSTANTS.PROFILE_UPDATE_INTERVAL_HOURS
         )
     
     return _profile_service

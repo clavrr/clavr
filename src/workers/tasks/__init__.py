@@ -23,7 +23,7 @@ class WorkerState:
     def get_config(cls):
         """Get or create config singleton for workers"""
         if cls._config is None:
-            from ...utils.config import load_config
+            from src.utils.config import load_config
             cls._config = load_config()
             logger.info("[Worker Cache] Configuration loaded")
         return cls._config
@@ -32,7 +32,7 @@ class WorkerState:
     def get_rag_engine(cls):
         """Get or create RAG engine singleton for workers"""
         if cls._rag_engine is None:
-            from ...ai.rag import RAGEngine
+            from src.ai.rag import RAGEngine
             config = cls.get_config()
             cls._rag_engine = RAGEngine(config)
             logger.info("[Worker Cache] RAG engine initialized and cached")

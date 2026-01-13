@@ -38,8 +38,7 @@ class SlackBot(BaseIntegration):
         db: Optional[Any] = None,
         enable_ingestion: bool = True,
         enable_services: bool = True,
-        enable_ai: bool = True,
-        enable_roles: bool = True
+        enable_ai: bool = True
     ):
         """
         Initialize Slack bot.
@@ -50,42 +49,24 @@ class SlackBot(BaseIntegration):
             enable_ingestion: Whether to enable message ingestion pipeline
             enable_services: Whether to initialize services (inherited from BaseIntegration)
             enable_ai: Whether to initialize AI components (inherited from BaseIntegration)
-            enable_roles: Whether to initialize agent roles (inherited from BaseIntegration)
         """
         # Validate configuration
         if not SlackConfig.validate():
             raise ValueError("Slack configuration is invalid. Please check environment variables.")
         
-        # Initialize base integration (services, AI, roles)
+        # Initialize base integration (services, AI)
         super().__init__(
             config=config,
             db=db,
             enable_services=enable_services,
-            enable_ai=enable_ai,
-            enable_roles=enable_roles
+            enable_ai=enable_ai
         )
         
         self.enable_ingestion = enable_ingestion
         
         # Initialize Slack client
         self.slack_client = SlackClient()
-        
-        # Initialize Contact Resolver Role with Slack client
-        if enable_roles and 'contact_resolver' not in self.roles:
-            try:
-                from ...agent.roles import ContactResolverRole
-                # Get email service from tool
-                email_service = self.get_email_service()
-                
-                self.roles['contact_resolver'] = ContactResolverRole(
-                    slack_client=self.slack_client,
-                    graph_manager=self._get_graph_manager(),
-                    email_service=email_service,
-                    config=self.config
-                )
-                logger.info("[SLACK] ContactResolverRole initialized with Slack client")
-            except Exception as e:
-                logger.warning(f"Could not initialize ContactResolverRole: {e}")
+
         
         # Initialize event handler
         self.event_handler = SlackEventHandler(

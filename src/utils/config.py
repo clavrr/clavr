@@ -33,7 +33,7 @@ class ConfigDefaults:
     
     # AI/LLM defaults
     AI_PROVIDER_GEMINI = "gemini"
-    AI_MODEL_DEFAULT = "gemini-2.5-flash"
+    AI_MODEL_DEFAULT = "gemini-3-flash-preview"
     AI_TEMPERATURE_DEFAULT = 0.7
     AI_MAX_TOKENS_DEFAULT = 1000
     AI_SYSTEM_PROMPT_DEFAULT = "You are a helpful email assistant."
@@ -68,6 +68,8 @@ class ConfigDefaults:
     RAG_RERANK_RECENCY_WEIGHT = 0.2
     RAG_MAX_QUERY_VARIANTS_DEFAULT = 3
     RAG_MIN_CONFIDENCE_DEFAULT = 0.3
+    RAG_CIRCUIT_BREAKER_THRESHOLD_DEFAULT = 5
+    RAG_CIRCUIT_BREAKER_TIMEOUT_DEFAULT = 60
     
     # Logging defaults
     LOGGING_LEVEL_INFO = "INFO"
@@ -96,6 +98,105 @@ class ConfigDefaults:
     TIMEZONE_CDT = "America/Chicago"
     TIMEZONE_MST = "America/Denver"
     TIMEZONE_MDT = "America/Denver"
+    TIMEZONE_UTC = "UTC"
+    TIMEZONE_GMT = "GMT"
+    
+    # Resilience defaults
+    CIRCUIT_BREAKER_FAILURE_THRESHOLD = 5
+    CIRCUIT_BREAKER_RECOVERY_TIMEOUT = 30.0
+    CIRCUIT_BREAKER_HALF_OPEN_MAX_CALLS = 3
+    
+    # Retry defaults
+    RETRY_MAX_RETRIES = 3
+    RETRY_BASE_DELAY = 1.0
+    RETRY_MAX_DELAY = 60.0
+    RETRY_EXPONENTIAL_BASE = 2.0
+    
+    # Middleware defaults
+    AUTH_SESSION_TTL_MINUTES = 60
+    AUTH_CACHE_TTL_SECONDS = 60
+    AUTH_CACHE_MAX_SIZE = 1000
+    CSRF_TOKEN_EXPIRES_SECONDS = 3600
+    CSRF_EXCLUDED_PATHS = [
+        "/health",
+        "/",
+        "/docs",
+        "/openapi.json",
+        "/redoc",
+        "/metrics",
+        "/auth/google",
+        "/auth/google/login",
+        "/auth/google/callback",
+    ]
+    
+    # Rate limit defaults
+    RATE_LIMIT_PER_MINUTE = 60
+    RATE_LIMIT_PER_HOUR = 1000
+    RATE_LIMIT_EXCLUDED_PATHS = [
+        "/health", "/docs", "/openapi.json", "/redoc", "/metrics",
+        "/auth/google/login", "/auth/google/callback",
+        "/api/auth/google/login", "/api/auth/google/callback",
+        "/integrations/status", "/api/integrations/status",
+        "/auth/session/status", "/api/auth/session/status",
+        "/auth/me", "/api/auth/me", "/api/conversations"
+    ]
+    
+    # Security headers defaults
+    SECURITY_SENSITIVE_PATHS = [
+        "/auth", "/api/auth", "/api/chat", "/api/emails",
+        "/api/calendar", "/api/tasks", "/api/profile",
+        "/api/admin", "/api/export"
+    ]
+    
+    # OAuth Scopes
+    OAUTH_SCOPE_GMAIL = "https://www.googleapis.com/auth/gmail.readonly"
+    OAUTH_SCOPE_CALENDAR = "https://www.googleapis.com/auth/calendar"
+    OAUTH_SCOPE_TASKS = "https://www.googleapis.com/auth/tasks.readonly"
+    OAUTH_SCOPE_DRIVE = "https://www.googleapis.com/auth/drive.readonly"
+    # NOTE: Keep scope requires Google Workspace Enterprise and is not included
+    # OAUTH_SCOPE_KEEP = "https://www.googleapis.com/auth/keep"
+    
+    # Combined Google Scope (All services - excluding Keep which requires Enterprise)
+    OAUTH_SCOPE_GOOGLE_ALL = f"{OAUTH_SCOPE_GMAIL} {OAUTH_SCOPE_CALENDAR} {OAUTH_SCOPE_TASKS} {OAUTH_SCOPE_DRIVE}"
+    
+    OAUTH_SCOPE_SLACK = "channels:read,chat:write,files:read,files:write,users:read,users:read.email"
+    OAUTH_SCOPE_ASANA = "default"
+    
+    # OAuth URLs
+    OAUTH_URL_GOOGLE_AUTH = "https://accounts.google.com/o/oauth2/v2/auth"
+    OAUTH_URL_GOOGLE_TOKEN = "https://oauth2.googleapis.com/token"
+    OAUTH_URL_SLACK_AUTH = "https://slack.com/oauth/v2/authorize"
+    OAUTH_URL_SLACK_TOKEN = "https://slack.com/api/oauth.v2.access"
+    OAUTH_URL_NOTION_AUTH = "https://api.notion.com/v1/oauth/authorize"
+    OAUTH_URL_NOTION_TOKEN = "https://api.notion.com/v1/oauth/token"
+    OAUTH_URL_ASANA_AUTH = "https://app.asana.com/-/oauth_authorize"
+    OAUTH_URL_ASANA_TOKEN = "https://app.asana.com/-/oauth_token"
+
+    # Default OAuth Redirect URIs
+    OAUTH_REDIRECT_GOOGLE = "${API_BASE_URL}/auth/google/callback"
+    OAUTH_REDIRECT_SLACK = "${API_BASE_URL}/integrations/slack/callback"
+    OAUTH_REDIRECT_NOTION = "${API_BASE_URL}/integrations/notion/callback"
+    OAUTH_REDIRECT_ASANA = "${API_BASE_URL}/integrations/asana/callback"
+    
+    # Calendar Tool Defaults
+    CALENDAR_SEARCH_DAYS_BACK = 7
+    CALENDAR_SEARCH_DAYS_AHEAD = 90
+    CALENDAR_DEFAULT_DURATION = 60
+    CALENDAR_NLP_FILLER_WORDS = ['my', 'meeting', 'scheduled', 'for', 'the', 'event', 'appointment']
+    CALENDAR_DATE_CLEANUP_PATTERNS = [
+        r'tomorrow', r'today', r'yesterday', 
+        r'at\s+\d{1,2}(?::\d{2})?\s*(?:am|pm|a\.m\.|p\.m\.)', 
+        r'\d{1,2}(?::\d{2})?\s*(?:am|pm|a\.m\.|p\.m\.)',
+        r'next\s+(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday)',
+        r'this\s+(?:week|month|afternoon|morning|evening)',
+        r'in\s+the\s+(?:morning|afternoon|evening)',
+        r'just\s+for\s+me'
+    ]
+    CALENDAR_MOVE_PATTERNS = [
+        r"(?:move|reschedule|change)\s+(.*?)\s+(?:to|to be at|at|for|till)\s+(.*)"
+    ]
+    CALENDAR_SUGGESTIONS_MAX = 3
+    CALENDAR_SUGGESTIONS_DAYS_AHEAD = 2
 
 
 # ============================================
@@ -169,7 +270,7 @@ class RAGConfig(BaseModel):
     embedding_dimension: int = ConfigDefaults.RAG_EMBEDDING_DIMENSION_DEFAULT  # 768 for Gemini/all-mpnet-base-v2, 384 for all-MiniLM-L6-v2
     
     # Vector store configuration
-    vector_store_backend: str = ConfigDefaults.RAG_VECTOR_STORE_BACKEND_AUTO  # "auto", "pinecone", or "postgres" only
+    vector_store_backend: str = ConfigDefaults.RAG_VECTOR_STORE_BACKEND_AUTO  # "auto", "qdrant", or "postgres"
     collection_name: str = ConfigDefaults.RAG_COLLECTION_NAME_DEFAULT
     
     # Chunking configuration
@@ -216,6 +317,10 @@ class RAGConfig(BaseModel):
     
     # Confidence filtering
     min_confidence: float = ConfigDefaults.RAG_MIN_CONFIDENCE_DEFAULT  # Minimum confidence threshold (0-1)
+    
+    # Circuit Breaker
+    circuit_breaker_threshold: int = ConfigDefaults.RAG_CIRCUIT_BREAKER_THRESHOLD_DEFAULT
+    circuit_breaker_timeout: int = ConfigDefaults.RAG_CIRCUIT_BREAKER_TIMEOUT_DEFAULT
 
 
 class LoggingConfig(BaseModel):
@@ -232,14 +337,31 @@ class SecurityConfig(BaseModel):
     secret_key: str
     encryption_key: str
     encrypt_stored_emails: bool = True
+    
+    # Session settings
+    session_ttl_minutes: int = ConfigDefaults.AUTH_SESSION_TTL_MINUTES
+    session_cache_ttl_seconds: int = ConfigDefaults.AUTH_CACHE_TTL_SECONDS
+    session_cache_max_size: int = ConfigDefaults.AUTH_CACHE_MAX_SIZE
+    
+    # CSRF settings
+    csrf_token_expires: int = ConfigDefaults.CSRF_TOKEN_EXPIRES_SECONDS
+    csrf_excluded_paths: List[str] = ConfigDefaults.CSRF_EXCLUDED_PATHS
+    
+    # Security Headers settings
+    sensitive_paths: List[str] = ConfigDefaults.SECURITY_SENSITIVE_PATHS
 
 
 class ServerConfig(BaseModel):
     """Server configuration"""
     host: str = ConfigDefaults.SERVER_HOST_DEFAULT
     port: int = ConfigDefaults.SERVER_PORT_DEFAULT
-    api_base_url: str = "${API_BASE_URL}"  # Defaults to http://localhost:8000 if not set
-    frontend_url: str = "${FRONTEND_URL}"  # Defaults to http://localhost:3000 if not set
+    api_base_url: str = "${API_BASE_URL}"
+    frontend_url: str = "${FRONTEND_URL}"
+    
+    # Rate limiting
+    rate_limit_per_minute: int = ConfigDefaults.RATE_LIMIT_PER_MINUTE
+    rate_limit_per_hour: int = ConfigDefaults.RATE_LIMIT_PER_HOUR
+    rate_limit_excluded_paths: List[str] = ConfigDefaults.RATE_LIMIT_EXCLUDED_PATHS
 
 
 class FilterConfig(BaseModel):
@@ -251,17 +373,59 @@ class FilterConfig(BaseModel):
     action: Optional[str] = None
 
 
+class STTConfig(BaseModel):
+    """Speech-to-Text configuration"""
+    provider: str = "google"  # "google" or other providers
+    language: str = "en-US"  # Language code (e.g., "en-US", "en-GB")
+    sample_rate: int = 24000  # Audio sample rate in Hz (24000 for webm/opus)
+
+
+class TTSConfig(BaseModel):
+    """Text-to-Speech configuration"""
+    provider: str = "gemini"  # "gemini" (recommended) or "google" (cloud)
+    voice: str = "en-US-Neural2-D"  # Voice name (e.g., "en-US-Neural2-D", "en-US-Neural2-F")
+    language: str = "en-US"  # Language code
+    speaking_rate: float = 1.0  # Speaking rate (0.25 to 4.0, 1.0 = normal)
+    pitch: float = 0.0  # Pitch adjustment (-20.0 to 20.0 semitones, 0.0 = normal)
+
+
+class VoiceConfig(BaseModel):
+    """Voice interface configuration"""
+    stt: STTConfig = STTConfig()
+    tts: TTSConfig = TTSConfig()
+    enabled: bool = True  # Enable/disable voice features
+
+
+class OAuthConfig(BaseModel):
+    """ OAuth provider configuration """
+    client_id: Optional[str] = None
+    client_secret: Optional[str] = None
+    auth_url: str
+    token_url: str
+    scopes: Optional[str] = None
+    redirect_uri: str
+    owner: Optional[str] = None
+
+
+class OAuthConfigs(BaseModel):
+    """ Collection of OAuth configurations """
+    providers: Dict[str, OAuthConfig]
+
+
 class Config(BaseModel):
     """Main configuration"""
     agent: AgentConfig
     email: EmailConfig
     ai: AIConfig
+    google_maps_api_key: Optional[str] = None
     database: DatabaseConfig = DatabaseConfig()
     logging: LoggingConfig = LoggingConfig()
     security: Optional[SecurityConfig] = None
     server: Optional[ServerConfig] = None
     filters: List[FilterConfig] = []
     rag: Optional[RAGConfig] = None  # RAG configuration (optional, uses defaults if not provided)
+    voice: Optional[VoiceConfig] = None  # Voice configuration (optional, uses defaults if not provided)
+    oauth: Optional[OAuthConfigs] = None # OAuth configurations (optional)
 
 
 def load_config(config_path: str = ConfigDefaults.CONFIG_PATH_DEFAULT) -> Config:
@@ -278,20 +442,88 @@ def load_config(config_path: str = ConfigDefaults.CONFIG_PATH_DEFAULT) -> Config
     # Replace environment variable placeholders
     config_dict = _replace_env_vars(config_dict)
     
+    # Load Google Maps API key from environment if not in YAML
+    if not config_dict.get('google_maps_api_key'):
+        config_dict['google_maps_api_key'] = os.getenv('GOOGLE_MAPS_API_KEY')
+    
+    # Initialize OAuth providers if missing
+    if 'oauth' not in config_dict:
+        config_dict['oauth'] = {'providers': {}}
+    
+    _ensure_oauth_defaults(config_dict['oauth']['providers'])
+    
     # Create and validate config
     return Config(**config_dict)
+
+def _ensure_oauth_defaults(providers: Dict[str, Any]):
+    """Ensure default OAuth providers are present and configured from env vars."""
+    api_url = os.getenv("API_BASE_URL", ConfigDefaults.API_BASE_URL_DEFAULT).rstrip('/')
+    
+    defaults = {
+        "google": {
+            "client_id": os.getenv("GOOGLE_CLIENT_ID"),
+            "client_secret": os.getenv("GOOGLE_CLIENT_SECRET"),
+            "auth_url": ConfigDefaults.OAUTH_URL_GOOGLE_AUTH,
+            "token_url": ConfigDefaults.OAUTH_URL_GOOGLE_TOKEN,
+            "scopes": ConfigDefaults.OAUTH_SCOPE_GOOGLE_ALL,
+            "redirect_uri": f"{api_url}/auth/google/callback"
+        },
+        "slack": {
+            "client_id": os.getenv("SLACK_CLIENT_ID"),
+            "client_secret": os.getenv("SLACK_CLIENT_SECRET"),
+            "auth_url": ConfigDefaults.OAUTH_URL_SLACK_AUTH,
+            "token_url": ConfigDefaults.OAUTH_URL_SLACK_TOKEN,
+            "scopes": ConfigDefaults.OAUTH_SCOPE_SLACK,
+            "redirect_uri": f"{api_url}/integrations/slack/callback"
+        },
+        "notion": {
+            "client_id": os.getenv("NOTION_CLIENT_ID"),
+            "client_secret": os.getenv("NOTION_CLIENT_SECRET"),
+            "auth_url": ConfigDefaults.OAUTH_URL_NOTION_AUTH,
+            "token_url": ConfigDefaults.OAUTH_URL_NOTION_TOKEN,
+            "redirect_uri": f"{api_url}/integrations/notion/callback",
+            "owner": "user"
+        },
+        "asana": {
+            "client_id": os.getenv("ASANA_CLIENT_ID"),
+            "client_secret": os.getenv("ASANA_CLIENT_SECRET"),
+            "auth_url": ConfigDefaults.OAUTH_URL_ASANA_AUTH,
+            "token_url": ConfigDefaults.OAUTH_URL_ASANA_TOKEN,
+            "scopes": ConfigDefaults.OAUTH_SCOPE_ASANA,
+            "redirect_uri": f"{api_url}/integrations/asana/callback"
+        }
+    }
+    
+    for provider, default_config in defaults.items():
+        if provider not in providers:
+            providers[provider] = default_config
+        else:
+            # Update missing fields from env/defaults
+            for key, val in default_config.items():
+                if providers[provider].get(key) is None:
+                    providers[provider][key] = val
 
 
 def _replace_env_vars(obj: Any) -> Any:
     """
-    Recursively replace ${VAR} placeholders with environment variables.
+    Recursively replace ${VAR} and ${VAR:-default} placeholders with environment variables.
+    Supports bash-style default values with ${VAR:-default_value} syntax.
     """
     if isinstance(obj, dict):
         return {k: _replace_env_vars(v) for k, v in obj.items()}
     elif isinstance(obj, list):
         return [_replace_env_vars(item) for item in obj]
     elif isinstance(obj, str) and obj.startswith("${") and obj.endswith("}"):
-        var_name = obj[2:-1]
+        inner = obj[2:-1]  # Extract content between ${ and }
+        
+        # Handle ${VAR:-default} syntax
+        if ":-" in inner:
+            var_name, default_value = inner.split(":-", 1)
+            env_value = os.getenv(var_name)
+            return env_value if env_value else default_value
+        
+        # Handle simple ${VAR} syntax
+        var_name = inner
         env_value = os.getenv(var_name)
         if env_value:
             return env_value
@@ -352,16 +584,26 @@ def get_timezone(config: Optional[Config] = None) -> str:
                     'CDT': ConfigDefaults.TIMEZONE_CDT,
                     'MST': ConfigDefaults.TIMEZONE_MST,
                     'MDT': ConfigDefaults.TIMEZONE_MDT,
+                    'UTC': ConfigDefaults.TIMEZONE_UTC,
+                    'GMT': ConfigDefaults.TIMEZONE_GMT,
                 }
                 if tz_name in tz_map:
                     return tz_map[tz_name]
+                
+                # Check for lowercase as well
+                if tz_name.upper() in tz_map:
+                    return tz_map[tz_name.upper()]
+
                 # Default to system timezone if available
                 import datetime
                 local_tz = datetime.datetime.now().astimezone().tzinfo
                 if hasattr(local_tz, 'key'):
                     return local_tz.key
-            except Exception:
-                pass
+                if hasattr(local_tz, 'zone'): # For pytz
+                    return local_tz.zone
+            except Exception as e:
+                import logging
+                logging.getLogger(__name__).debug(f"Timezone detection failed: {e}")
             # Fallback to default
             return ConfigDefaults.TIMEZONE_DEFAULT
         return tz

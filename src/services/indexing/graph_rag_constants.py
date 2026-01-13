@@ -31,7 +31,7 @@ ENABLE_CONSISTENCY_CHECKING = True
 CONSISTENCY_CHECK_INTERVAL_SECONDS = 3600  # 1 hour
 
 # Vector Store Requirements
-# System only supports RAGEngine (which uses Pinecone or PostgreSQL)
+# System only supports RAGEngine (which uses Qdrant or PostgreSQL)
 SUPPORTED_VECTOR_BACKEND = "RAGEngine" 
-PRIMARY_VECTOR_STORE = "pinecone"
+PRIMARY_VECTOR_STORE = "qdrant"
 FALLBACK_VECTOR_STORE = "postgres"
