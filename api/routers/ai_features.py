@@ -8,8 +8,12 @@ from pydantic import BaseModel
 from typing import Optional, List, Dict, Any
 from datetime import datetime
 
-from src.database import get_async_db
-from src.utils.config import load_config
+from api.dependencies import get_async_db, get_current_user
+from src.database.models import User, UserWritingProfile
+from src.features.auto_responder import EmailAutoResponder
+from src.features.email_analyzer import EmailAnalyzer
+from src.features.document_summarizer import DocumentSummarizer
+from src.features.meeting_notes import MeetingNotesGenerator
 from src.utils.logger import setup_logger
 
 logger = setup_logger(__name__)
@@ -58,7 +62,7 @@ class MeetingPrepRequest(BaseModel):
 @router.post("/auto-reply")
 async def generate_auto_reply(
     request: EmailAutoReplyRequest,
-    http_request: Request,
+    user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_async_db)
 ) -> Dict[str, Any]:
     """
@@ -79,13 +83,7 @@ async def generate_auto_reply(
         Dictionary with success status and reply options
     """
     try:
-        from src.features.auto_responder import EmailAutoResponder
-        from src.database.models import UserWritingProfile
         from sqlalchemy import select
-        from ..auth import get_current_user_required
-        
-        # Get authenticated user
-        user = get_current_user_required(http_request)
         
         # Fetch user's writing profile if available
         user_style = None
@@ -101,6 +99,7 @@ async def generate_auto_reply(
         else:
             logger.info(f"No writing profile found for user {user.id} - using generic responses")
         
+        from src.utils.config import load_config
         config = load_config()
         responder = EmailAutoResponder(config)
         
@@ -130,7 +129,7 @@ async def generate_auto_reply(
 @router.post("/analyze-email")
 async def analyze_email(
     request: EmailAnalysisRequest,
-    http_request: Request,
+    user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_async_db)
 ) -> Dict[str, Any]:
     """
@@ -150,12 +149,7 @@ async def analyze_email(
         Dictionary with analysis results
     """
     try:
-        from src.features.email_analyzer import EmailAnalyzer
-        from ..auth import get_current_user_required
-        
-        # Get authenticated user
-        user = get_current_user_required(http_request)
-        
+        from src.utils.config import load_config
         config = load_config()
         analyzer = EmailAnalyzer(config)
         
@@ -195,7 +189,7 @@ async def analyze_email(
 @router.post("/summarize")
 async def summarize_document(
     request: DocumentSummaryRequest,
-    http_request: Request,
+    user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_async_db)
 ) -> Dict[str, Any]:
     """
@@ -215,12 +209,7 @@ async def summarize_document(
         Dictionary with summary and extracted information
     """
     try:
-        from src.features.document_summarizer import DocumentSummarizer
-        from ..auth import get_current_user_required
-        
-        # Get authenticated user
-        user = get_current_user_required(http_request)
-        
+        from src.utils.config import load_config
         config = load_config()
         summarizer = DocumentSummarizer(config)
         
@@ -256,7 +245,7 @@ async def summarize_document(
 @router.post("/meeting-prep")
 async def prepare_meeting_brief(
     request: MeetingPrepRequest,
-    http_request: Request,
+    user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_async_db)
 ) -> Dict[str, Any]:
     """
@@ -276,12 +265,7 @@ async def prepare_meeting_brief(
         Dictionary with meeting brief
     """
     try:
-        from src.features.meeting_notes import MeetingNotesGenerator
-        from ..auth import get_current_user_required
-        
-        # Get authenticated user
-        user = get_current_user_required(http_request)
-        
+        from src.utils.config import load_config
         config = load_config()
         generator = MeetingNotesGenerator(config)
         

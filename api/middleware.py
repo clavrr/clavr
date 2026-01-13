@@ -3,7 +3,7 @@ API Middleware
 Custom middleware for session management, error handling, logging, and CSRF protection
 """
 from typing import Callable, Optional
-from datetime import datetime
+from datetime import datetime, timedelta
 from fastapi import Request, Response, HTTPException
 from fastapi.responses import JSONResponse
 from starlette.middleware.base import BaseHTTPMiddleware
@@ -33,20 +33,7 @@ class CSRFMiddleware(BaseHTTPMiddleware):
     # Safe methods that don't need CSRF protection
     SAFE_METHODS = {"GET", "HEAD", "OPTIONS", "TRACE"}
     
-    # Endpoints to exclude from CSRF protection (public endpoints)
-    EXCLUDED_PATHS = {
-        "/health",
-        "/",
-        "/docs",
-        "/openapi.json",
-        "/redoc",
-        "/metrics",
-        "/auth/google",  # OAuth initiation endpoint (GET request)
-        "/auth/google/login",
-        "/auth/google/callback",
-    }
-    
-    def __init__(self, app, secret_key: str, token_expires: int = 3600):
+    def __init__(self, app, secret_key: str, token_expires: int = 3600, excluded_paths: Optional[list] = None):
         """
         Initialize CSRF middleware
         
@@ -54,25 +41,27 @@ class CSRFMiddleware(BaseHTTPMiddleware):
             app: FastAPI application
             secret_key: Secret key for signing tokens
             token_expires: Token expiration time in seconds (default: 1 hour)
+            excluded_paths: List of paths to exclude from CSRF protection
         """
         super().__init__(app)
         self.serializer = URLSafeTimedSerializer(secret_key, salt="csrf-protection")
         self.token_expires = token_expires
+        self.excluded_paths = set(excluded_paths) if excluded_paths else {
+            "/health", "/", "/docs", "/openapi.json", "/redoc", "/metrics",
+            "/auth/google", "/auth/google/login", "/auth/google/callback"
+        }
         logger.info("[OK] CSRF protection middleware initialized")
     
     def _should_protect(self, request: Request) -> bool:
         """Check if request should be CSRF protected"""
-        # Skip safe methods
         if request.method in self.SAFE_METHODS:
             return False
         
-        # Skip excluded paths
         path = request.url.path
-        if path in self.EXCLUDED_PATHS:
+        if path in self.excluded_paths:
             return False
         
-        # Skip paths starting with excluded prefixes
-        for excluded in self.EXCLUDED_PATHS:
+        for excluded in self.excluded_paths:
             if path.startswith(excluded):
                 return False
         
@@ -206,11 +195,24 @@ class CSRFMiddleware(BaseHTTPMiddleware):
 
 class SessionMiddleware(BaseHTTPMiddleware):
     """
-    Middleware for automatic session management
+    Middleware for automatic session management (ASYNC VERSION)
     
     Attaches user and session to request.state for easy access
     Eliminates manual session queries in every endpoint
+    
+    Performance optimizations:
+    - Uses async database operations (non-blocking)
+    - In-memory LRU cache with 60-second TTL to reduce DB queries
     """
+    
+    # Session cache: {hashed_token: (session_data, user_data, timestamp)}
+    _session_cache: dict = {}
+    
+    def __init__(self, app, ttl_minutes: int = 60, cache_ttl_seconds: int = 60, cache_max_size: int = 1000):
+        super().__init__(app)
+        self.ttl_minutes = ttl_minutes
+        self.cache_ttl_seconds = cache_ttl_seconds
+        self.cache_max_size = cache_max_size
     
     def _extract_bearer_token(self, request: Request) -> Optional[str]:
         """Extract Bearer token from Authorization header"""
@@ -219,46 +221,170 @@ class SessionMiddleware(BaseHTTPMiddleware):
             return auth_header[7:]  # Remove 'Bearer ' prefix
         return None
     
+    def _get_cached_session(self, hashed_token: str):
+        """Get session from cache if valid"""
+        if hashed_token in self._session_cache:
+            session_data, user_data, cached_at = self._session_cache[hashed_token]
+            if (datetime.now() - cached_at).total_seconds() < self.cache_ttl_seconds:
+                return session_data, user_data
+            else:
+                del self._session_cache[hashed_token]
+        return None, None
+    
+    def _cache_session(self, hashed_token: str, session_data, user_data):
+        """Store session in cache with eviction if needed"""
+        if len(self._session_cache) >= self.cache_max_size:
+            sorted_entries = sorted(
+                self._session_cache.items(),
+                key=lambda x: x[1][2]
+            )
+            for key, _ in sorted_entries[:self.cache_max_size // 10]:
+                del self._session_cache[key]
+        
+        self._session_cache[hashed_token] = (session_data, user_data, datetime.now())
+    
+    def _invalidate_cache(self, hashed_token: str):
+        """Remove session from cache"""
+        if hashed_token in self._session_cache:
+            del self._session_cache[hashed_token]
+    
     async def dispatch(self, request: Request, call_next: Callable) -> Response:
-        """Process request and attach session if available (with secure token hashing)"""
+        """Process request and attach session if available (ASYNC with caching)"""
+        from sqlalchemy import select
+        from src.database.async_database import get_async_session_local
         
         # Get session token from multiple sources (header, cookie, or Authorization Bearer)
-        raw_session_token = (
-            request.headers.get('X-Session-Token') or 
-            request.cookies.get('session_token') or
-            self._extract_bearer_token(request)
-        )
+        raw_session_token = None
+        token_source = "unknown"
+        
+        if request.query_params.get('token'):
+            raw_session_token = request.query_params.get('token')
+            token_source = "query_param"
+        elif request.headers.get('X-Session-Token'):
+            raw_session_token = request.headers.get('X-Session-Token')
+            token_source = "header_x_session_token"
+        elif request.cookies.get('session_token'):
+            raw_session_token = request.cookies.get('session_token')
+            token_source = "cookie"
+        else:
+            bearer_token = self._extract_bearer_token(request)
+            if bearer_token:
+                raw_session_token = bearer_token
+                token_source = "header_bearer"
         
         if raw_session_token:
-            # Get database session
-            db = next(get_db())
-            try:
-                # Hash the raw token to match stored hash
-                hashed_token = hash_token(raw_session_token)
-                
-                # Query for session using hashed token
-                db_session = db.query(DBSession).filter(
-                    DBSession.session_token == hashed_token,
-                    DBSession.expires_at > datetime.utcnow()
-                ).first()
-                
-                if db_session:
-                    # Attach to request state
-                    request.state.session = db_session
-                    request.state.user = db_session.user
-                    request.state.user_id = db_session.user_id
-                    request.state.session_id = raw_session_token  # Store raw token for CSRF binding
-                    logger.debug(f"Session attached: user_id={db_session.user_id}")
-                else:
-                    # No valid session
+            hashed_token = hash_token(raw_session_token)
+            
+            # DEBUG: Log raw token details to identify mystery values
+            token_preview = raw_session_token
+            if len(token_preview) > 20:
+                token_preview = f"{token_preview[:10]}...{token_preview[-10:]}"
+            logger.info(f"Middleware received RAW token from [{token_source}]: '{token_preview}' (len={len(raw_session_token)}) -> Hash: {hashed_token[:10]}...")
+            
+            # Check cache first (fast path)
+            cached_session, cached_user = self._get_cached_session(hashed_token)
+            
+            if cached_session and cached_user:
+                # Use cached data
+                request.state.session = cached_session
+                request.state.user = cached_user
+                request.state.user_id = cached_user.id
+                request.state.session_id = raw_session_token
+                logger.debug(f"Session cache HIT: user_id={cached_user.id}")
+            else:
+                # Cache miss - query database asynchronously
+                try:
+                    AsyncSessionLocal = get_async_session_local()
+                    async with AsyncSessionLocal() as db:
+                        # Query for session using hashed token
+                        stmt = select(DBSession).where(
+                            DBSession.session_token == hashed_token,
+                            DBSession.expires_at > datetime.utcnow()
+                        )
+                        result = await db.execute(stmt)
+                        db_session = result.scalar_one_or_none()
+                        
+                        if db_session:
+                            # CHECK INACTIVITY TIMEOUT (60 MINUTES)
+                            now = datetime.utcnow()
+                            last_active = db_session.last_active_at or db_session.created_at
+                            
+                            if (now - last_active) > timedelta(minutes=self.ttl_minutes):
+                                # Session expired due to inactivity
+                                logger.warning(f"Session expired due to inactivity (>{self.ttl_minutes}m): user_id={db_session.user_id}")
+                                await db.delete(db_session)
+                                await db.commit()
+                                self._invalidate_cache(hashed_token)
+                                
+                                # Detach session
+                                request.state.session = None
+                                request.state.user = None
+                                request.state.user_id = None
+                                request.state.session_id = None
+                            else:
+                                # Session is valid - get user
+                                user_stmt = select(User).where(User.id == db_session.user_id)
+                                user_result = await db.execute(user_stmt)
+                                user = user_result.scalar_one_or_none()
+                                
+                                if user:
+                                    # Update last_active_at if more than 30 seconds have passed
+                                    if (now - last_active) > timedelta(seconds=30):
+                                        db_session.last_active_at = now
+                                        await db.commit()
+                                    
+                                    # Cache the session and user for future requests
+                                    self._cache_session(hashed_token, db_session, user)
+                                    
+                                    # Attach to request state
+                                    request.state.session = db_session
+                                    request.state.user = user
+                                    request.state.user_id = db_session.user_id
+                                    request.state.session_id = raw_session_token
+                                    logger.debug(f"Session cache MISS, loaded from DB: user_id={db_session.user_id}")
+                                else:
+                                    logger.warning(f"Session found but user not found: {db_session.user_id}")
+                                    request.state.session = None
+                                    request.state.user = None
+                                    request.state.user_id = None
+                                    request.state.session_id = None
+                        else:
+                            # No valid session
+                            logger.info(f"Invalid session token found: {hashed_token[:10]}")
+                            request.state.session = None
+                            request.state.user = None
+                            request.state.user_id = None
+                            request.state.session_id = None
+                            
+                            # Process request but mark/clear cookie on response
+                            response = await call_next(request)
+                            
+                            # NUCLEAR COOKIE DELETION - Kill it everywhere
+                            # But SKIP if we are on the callback route (which sets a new cookie)
+                            is_callback = "/auth/google/callback" in request.url.path
+                            
+                            if token_source == "cookie" and not is_callback and "session_token" not in response.headers.get("set-cookie", "").lower():
+                                logger.info(f"🔥 Nuke invalid cookie at multiple paths/domains (Path: {request.url.path})")
+                                # Standard delete
+                                response.delete_cookie("session_token")
+                                response.delete_cookie("session_token", path="/")
+                                response.delete_cookie("session_token", path="/api")
+                                # Domain specific deletes (fixes localhost vs 127.0.0.1 issues)
+                                response.delete_cookie("session_token", domain="localhost")
+                                response.delete_cookie("session_token", domain="localhost", path="/")
+                                response.delete_cookie("session_token", domain="127.0.0.1")
+                                response.delete_cookie("session_token", domain="127.0.0.1", path="/")
+                            return response
+                            
+                except Exception as e:
+                    logger.error(f"Error in async session lookup: {e}", exc_info=True)
                     request.state.session = None
                     request.state.user = None
                     request.state.user_id = None
                     request.state.session_id = None
-            finally:
-                db.close()
         else:
             # No session token provided
+            logger.debug(f"No authentication token provided in request to {request.url.path}")
             request.state.session = None
             request.state.user = None
             request.state.user_id = None
