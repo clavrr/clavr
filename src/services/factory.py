@@ -146,6 +146,120 @@ class ServiceFactory:
             logger.error(f"[SERVICE_FACTORY] Failed to get credentials: {e}")
             return None
     
+    def _create_credentialed_service(
+        self,
+        service_type: str,
+        service_class: type,
+        user_id: Optional[int] = None,
+        db_session: Optional[Session] = None,
+        token_path: Optional[str] = None,
+        require_credentials: bool = False,
+        **service_kwargs
+    ) -> Any:
+        """
+        Generic method to create services that require credentials.
+        Eliminates duplication across create_email_service, create_calendar_service, etc.
+        
+        Args:
+            service_type: Service type name (e.g., "email", "calendar", "task")
+            service_class: Service class to instantiate
+            user_id: User ID for database credentials
+            db_session: Database session
+            token_path: Path to token file
+            require_credentials: Whether credentials are required (raises exception if missing)
+            **service_kwargs: Additional keyword arguments to pass to service constructor
+            
+        Returns:
+            Service instance
+            
+        Raises:
+            AuthenticationException: If require_credentials=True and credentials not provided
+            ServiceException: If service creation fails
+        """
+        cache_key = self._get_cache_key(service_type, user_id, token_path)
+        
+        # Check cache
+        cached_service = self._get_cached_service(cache_key)
+        if cached_service:
+            return cached_service
+        
+        try:
+            # Get credentials
+            credentials = self._get_credentials(user_id, db_session, token_path)
+            
+            if require_credentials and not credentials:
+                raise AuthenticationException(
+                    f"Google {service_type.title()} credentials required. "
+                    "Please provide user_id + db_session or token_path.",
+                    service_name=f"{service_type}_factory"
+                )
+            
+            # Create service with common parameters
+            service_kwargs['config'] = self.config
+            service_kwargs['credentials'] = credentials
+            
+            service = service_class(**service_kwargs)
+            
+            # Cache if enabled
+            self._cache_service(cache_key, service)
+            
+            logger.info(f"[SERVICE_FACTORY] Created {service_class.__name__} for {cache_key}")
+            return service
+            
+        except AuthenticationException:
+            raise
+        except Exception as e:
+            logger.error(f"[SERVICE_FACTORY] Failed to create {service_class.__name__}: {e}")
+            raise ServiceException(
+                f"Failed to create {service_class.__name__}: {str(e)}",
+                service_name=f"{service_type}_factory"
+            )
+    
+    def _create_uncredentialed_service(
+        self,
+        service_type: str,
+        service_class: type,
+        **service_kwargs
+    ) -> Any:
+        """
+        Generic method to create services that don't require credentials.
+        
+        Args:
+            service_type: Service type name (e.g., "rag")
+            service_class: Service class to instantiate
+            **service_kwargs: Keyword arguments to pass to service constructor
+            
+        Returns:
+            Service instance
+            
+        Raises:
+            ServiceException: If service creation fails
+        """
+        cache_key = self._get_cache_key(service_type)
+        
+        # Check cache
+        cached_service = self._get_cached_service(cache_key)
+        if cached_service:
+            return cached_service
+        
+        try:
+            # Create service with common parameters
+            service_kwargs['config'] = self.config
+            service = service_class(**service_kwargs)
+            
+            # Cache if enabled
+            self._cache_service(cache_key, service)
+            
+            logger.info(f"[SERVICE_FACTORY] Created {service_class.__name__}")
+            return service
+            
+        except Exception as e:
+            logger.error(f"[SERVICE_FACTORY] Failed to create {service_class.__name__}: {e}")
+            raise ServiceException(
+                f"Failed to create {service_class.__name__}: {str(e)}",
+                service_name=f"{service_type}_factory"
+            )
+    
     # ===================================================================
     # EMAIL SERVICE
     # ===================================================================
@@ -169,36 +283,15 @@ class ServiceFactory:
         Returns:
             Configured EmailService instance
         """
-        cache_key = self._get_cache_key("email", user_id, token_path)
-        
-        # Check cache
-        cached_service = self._get_cached_service(cache_key)
-        if cached_service:
-            return cached_service
-        
-        try:
-            # Get credentials
-            credentials = self._get_credentials(user_id, db_session, token_path)
-            
-            # Create service
-            service = EmailService(
-                config=self.config,
-                credentials=credentials,
-                rag_engine=rag_engine
-            )
-            
-            # Cache if enabled
-            self._cache_service(cache_key, service)
-            
-            logger.info(f"[SERVICE_FACTORY] Created EmailService for {cache_key}")
-            return service
-            
-        except Exception as e:
-            logger.error(f"[SERVICE_FACTORY] Failed to create EmailService: {e}")
-            raise ServiceException(
-                f"Failed to create EmailService: {str(e)}",
-                service_name="email_factory"
-            )
+        return self._create_credentialed_service(
+            service_type="email",
+            service_class=EmailService,
+            user_id=user_id,
+            db_session=db_session,
+            token_path=token_path,
+            require_credentials=False,
+            rag_engine=rag_engine
+        )
     
     # ===================================================================
     # CALENDAR SERVICE
@@ -221,35 +314,14 @@ class ServiceFactory:
         Returns:
             Configured CalendarService instance
         """
-        cache_key = self._get_cache_key("calendar", user_id, token_path)
-        
-        # Check cache
-        cached_service = self._get_cached_service(cache_key)
-        if cached_service:
-            return cached_service
-        
-        try:
-            # Get credentials
-            credentials = self._get_credentials(user_id, db_session, token_path)
-            
-            # Create service
-            service = CalendarService(
-                config=self.config,
-                credentials=credentials
-            )
-            
-            # Cache if enabled
-            self._cache_service(cache_key, service)
-            
-            logger.info(f"[SERVICE_FACTORY] Created CalendarService for {cache_key}")
-            return service
-            
-        except Exception as e:
-            logger.error(f"[SERVICE_FACTORY] Failed to create CalendarService: {e}")
-            raise ServiceException(
-                f"Failed to create CalendarService: {str(e)}",
-                service_name="calendar_factory"
-            )
+        return self._create_credentialed_service(
+            service_type="calendar",
+            service_class=CalendarService,
+            user_id=user_id,
+            db_session=db_session,
+            token_path=token_path,
+            require_credentials=False
+        )
     
     # ===================================================================
     # TASK SERVICE
@@ -275,44 +347,14 @@ class ServiceFactory:
         Raises:
             AuthenticationException: If credentials not provided
         """
-        cache_key = self._get_cache_key("task", user_id, token_path)
-        
-        # Check cache
-        cached_service = self._get_cached_service(cache_key)
-        if cached_service:
-            return cached_service
-        
-        try:
-            # Get credentials (required for TaskService)
-            credentials = self._get_credentials(user_id, db_session, token_path)
-            
-            if not credentials:
-                raise AuthenticationException(
-                    "Google Tasks credentials required. "
-                    "Please provide user_id + db_session or token_path.",
-                    service_name="task_factory"
-                )
-            
-            # Create service
-            service = TaskService(
-                config=self.config,
-                credentials=credentials
-            )
-            
-            # Cache if enabled
-            self._cache_service(cache_key, service)
-            
-            logger.info(f"[SERVICE_FACTORY] Created TaskService for {cache_key}")
-            return service
-            
-        except AuthenticationException:
-            raise
-        except Exception as e:
-            logger.error(f"[SERVICE_FACTORY] Failed to create TaskService: {e}")
-            raise ServiceException(
-                f"Failed to create TaskService: {str(e)}",
-                service_name="task_factory"
-            )
+        return self._create_credentialed_service(
+            service_type="task",
+            service_class=TaskService,
+            user_id=user_id,
+            db_session=db_session,
+            token_path=token_path,
+            require_credentials=True
+        )
     
     # ===================================================================
     # RAG SERVICE
@@ -331,32 +373,11 @@ class ServiceFactory:
         Returns:
             Configured RAGService instance
         """
-        cache_key = self._get_cache_key("rag")
-        
-        # Check cache
-        cached_service = self._get_cached_service(cache_key)
-        if cached_service:
-            return cached_service
-        
-        try:
-            # Create service (no credentials needed)
-            service = RAGService(
-                config=self.config,
-                collection_name=collection_name
-            )
-            
-            # Cache if enabled
-            self._cache_service(cache_key, service)
-            
-            logger.info(f"[SERVICE_FACTORY] Created RAGService for {collection_name}")
-            return service
-            
-        except Exception as e:
-            logger.error(f"[SERVICE_FACTORY] Failed to create RAGService: {e}")
-            raise ServiceException(
-                f"Failed to create RAGService: {str(e)}",
-                service_name="rag_factory"
-            )
+        return self._create_uncredentialed_service(
+            service_type="rag",
+            service_class=RAGService,
+            collection_name=collection_name
+        )
     
     # ===================================================================
     # UTILITY METHODS

@@ -2,63 +2,46 @@
 Gmail-specific exceptions
 
 Provides structured error handling for Gmail API operations.
+Uses unified base exceptions from src.integrations.base_exceptions.
 """
 from typing import Optional, Dict, Any
-import traceback
+
+from src.integrations.base_exceptions import (
+    EmailServiceException,
+    ServiceUnavailableException as BaseServiceUnavailable,
+    AuthenticationException as BaseAuthException,
+    ConfigurationException as BaseConfigException,
+    ResourceNotFoundException,
+    wrap_external_exception as base_wrap_exception,
+)
 
 
 def wrap_external_exception(
     exc: Exception,
-    service_name: str,
-    operation: str,
+    service_name: str = "Gmail",
+    operation: str = "",
     details: Optional[Dict[str, Any]] = None
 ) -> 'EmailServiceException':
     """
     Wrap an external exception into an EmailServiceException with context.
     
-    Args:
-        exc: The original exception to wrap
-        service_name: Name of the service where error occurred
-        operation: The operation that failed
-        details: Optional additional details
-        
-    Returns:
-        EmailServiceException with full context
+    This is a thin wrapper around the base wrap_external_exception that
+    returns an EmailServiceException for backward compatibility.
     """
-    error_details = details or {}
-    error_details.update({
-        'operation': operation,
-        'original_error': str(exc),
-        'error_type': type(exc).__name__,
-        'traceback': traceback.format_exc()
-    })
-    
+    base_exc = base_wrap_exception(exc, service_name, operation, details)
     return EmailServiceException(
-        message=f"{service_name} operation '{operation}' failed: {str(exc)}",
-        service_name=service_name,
-        details=error_details,
-        cause=exc
+        message=base_exc.message,
+        service_name=base_exc.service_name,
+        details=base_exc.details,
+        cause=base_exc.cause
     )
 
 
-class EmailServiceException(Exception):
-    """Exception for email service operations"""
-    
-    def __init__(
-        self, 
-        message: str, 
-        service_name: str = "Gmail",
-        details: Optional[Dict[str, Any]] = None,
-        cause: Optional[Exception] = None
-    ):
-        self.message = message
-        self.service_name = service_name
-        self.details = details or {}
-        self.cause = cause
-        super().__init__(self.message)
+# Re-export EmailServiceException from base for imports
+# (already imported above, just documenting)
 
 
-class EmailNotFoundException(EmailServiceException):
+class EmailNotFoundException(EmailServiceException, ResourceNotFoundException):
     """Exception raised when email is not found"""
     pass
 
@@ -78,16 +61,16 @@ class EmailIntegrationException(EmailServiceException):
     pass
 
 
-class ServiceUnavailableException(EmailServiceException):
+class ServiceUnavailableException(EmailServiceException, BaseServiceUnavailable):
     """Exception raised when Gmail service is unavailable"""
     pass
 
 
-class AuthenticationException(EmailServiceException):
+class AuthenticationException(EmailServiceException, BaseAuthException):
     """Exception raised for Gmail authentication failures"""
     pass
 
 
-class ConfigurationException(EmailServiceException):
+class ConfigurationException(EmailServiceException, BaseConfigException):
     """Exception raised for Gmail configuration issues"""
     pass

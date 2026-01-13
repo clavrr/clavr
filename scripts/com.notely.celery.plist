@@ -1,0 +1,51 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.notely.celery</string>
+    
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/maniko/Documents/notely-agent/email_agent/bin/celery</string>
+        <string>-A</string>
+        <string>src.workers.celery_app</string>
+        <string>worker</string>
+        <string>--pool=solo</string>
+        <string>--loglevel=info</string>
+        <string>--logfile=/Users/maniko/Documents/notely-agent/logs/celery.log</string>
+        <string>--pidfile=/Users/maniko/Documents/notely-agent/logs/celery.pid</string>
+    </array>
+    
+    <key>WorkingDirectory</key>
+    <string>/Users/maniko/Documents/notely-agent</string>
+    
+    <key>RunAtLoad</key>
+    <true/>
+    
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+        <key>Crashed</key>
+        <true/>
+    </dict>
+    
+    <key>StandardOutPath</key>
+    <string>/Users/maniko/Documents/notely-agent/logs/celery.stdout.log</string>
+    
+    <key>StandardErrorPath</key>
+    <string>/Users/maniko/Documents/notely-agent/logs/celery.stderr.log</string>
+    
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/Users/maniko/Documents/notely-agent/email_agent/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <key>PYTHONPATH</key>
+        <string>/Users/maniko/Documents/notely-agent</string>
+    </dict>
+    
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+</dict>
+</plist>

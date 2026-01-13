@@ -8,7 +8,9 @@ Core interfaces and implementations for RAG operations:
 """
 
 from .rag_engine import RAGEngine
+from .semantic_cache import SemanticCache
 from .embedding_provider import (
+
     EmbeddingProvider,
     GeminiEmbeddingProvider,
     SentenceTransformerEmbeddingProvider,
@@ -17,7 +19,7 @@ from .embedding_provider import (
 from .vector_store import (
     VectorStore,
     PostgresVectorStore,
-    PineconeVectorStore,
+    QdrantVectorStore,
     create_vector_store
 )
 
@@ -29,7 +31,7 @@ __all__ = [
     "create_embedding_provider",
     "VectorStore",
     "PostgresVectorStore",
-    "PineconeVectorStore",
+    "QdrantVectorStore",
     "create_vector_store",
 ]
 

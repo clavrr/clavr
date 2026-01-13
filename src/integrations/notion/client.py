@@ -34,22 +34,24 @@ class NotionClient:
     - Error handling and retries
     """
     
-    def __init__(self, api_key: Optional[str] = None):
+    def __init__(self, api_key: Optional[str] = None, access_token: Optional[str] = None):
         """
         Initialize Notion client.
         
         Args:
-            api_key: Notion API key - defaults to NOTION_API_KEY env var
+            api_key: Notion API key (internal integration token) - defaults to NOTION_API_KEY env var
+            access_token: OAuth access token (from public integration) - takes precedence over api_key
         """
         if not NOTION_SDK_AVAILABLE:
             raise ImportError(
                 "notion-client is not installed. Install it with: pip install notion-client"
             )
         
-        self.api_key = api_key or NotionConfig.NOTION_API_KEY
+        # OAuth token takes precedence over API key for multi-user support
+        self.api_key = access_token or api_key or NotionConfig.NOTION_API_KEY
         
         if not self.api_key:
-            raise ValueError("NOTION_API_KEY is required (set environment variable or pass as parameter)")
+            raise ValueError("Notion access token or API key is required")
         
         # Initialize Notion client
         self.client = Client(auth=self.api_key)  # type: ignore

@@ -2,73 +2,50 @@
 Google Calendar-specific exceptions
 
 Provides structured error handling for Google Calendar API operations.
+Uses unified base exceptions from src.integrations.base_exceptions.
 """
 from typing import Optional, Dict, Any
-import traceback
+
+from src.integrations.base_exceptions import (
+    CalendarServiceException,
+    ServiceUnavailableException as BaseServiceUnavailable,
+    AuthenticationException as BaseAuthException,
+    ConfigurationException as BaseConfigException,
+    ResourceNotFoundException,
+    ValidationException,
+    wrap_external_exception as base_wrap_exception,
+)
 
 
 def wrap_external_exception(
     exc: Exception,
-    service_name: str,
-    operation: str,
+    service_name: str = "GoogleCalendar",
+    operation: str = "",
     details: Optional[Dict[str, Any]] = None
 ) -> 'CalendarServiceException':
     """
     Wrap an external exception into a CalendarServiceException with context.
-    
-    Args:
-        exc: The original exception to wrap
-        service_name: Name of the service where error occurred
-        operation: The operation that failed
-        details: Optional additional details
-        
-    Returns:
-        CalendarServiceException with full context
     """
-    error_details = details or {}
-    error_details.update({
-        'operation': operation,
-        'original_error': str(exc),
-        'error_type': type(exc).__name__,
-        'traceback': traceback.format_exc()
-    })
-    
+    base_exc = base_wrap_exception(exc, service_name, operation, details)
     return CalendarServiceException(
-        message=f"{service_name} operation '{operation}' failed: {str(exc)}",
-        service_name=service_name,
-        details=error_details,
-        cause=exc
+        message=base_exc.message,
+        service_name=base_exc.service_name,
+        details=base_exc.details,
+        cause=base_exc.cause
     )
 
 
-class CalendarServiceException(Exception):
-    """Exception for calendar service operations"""
-    
-    def __init__(
-        self, 
-        message: str, 
-        service_name: str = "GoogleCalendar",
-        details: Optional[Dict[str, Any]] = None,
-        cause: Optional[Exception] = None
-    ):
-        self.message = message
-        self.service_name = service_name
-        self.details = details or {}
-        self.cause = cause
-        super().__init__(self.message)
-
-
-class EventNotFoundException(CalendarServiceException):
+class EventNotFoundException(CalendarServiceException, ResourceNotFoundException):
     """Exception raised when calendar event is not found"""
     pass
 
 
-class SchedulingConflictException(CalendarServiceException):
+class SchedulingConflictException(CalendarServiceException, ValidationException):
     """Exception raised when there's a scheduling conflict"""
     pass
 
 
-class InvalidTimeRangeException(CalendarServiceException):
+class InvalidTimeRangeException(CalendarServiceException, ValidationException):
     """Exception raised for invalid time ranges"""
     pass
 
@@ -78,16 +55,16 @@ class CalendarIntegrationException(CalendarServiceException):
     pass
 
 
-class ServiceUnavailableException(CalendarServiceException):
+class ServiceUnavailableException(CalendarServiceException, BaseServiceUnavailable):
     """Exception raised when Calendar service is unavailable"""
     pass
 
 
-class AuthenticationException(CalendarServiceException):
+class AuthenticationException(CalendarServiceException, BaseAuthException):
     """Exception raised for Calendar authentication failures"""
     pass
 
 
-class ConfigurationException(CalendarServiceException):
+class ConfigurationException(CalendarServiceException, BaseConfigException):
     """Exception raised for Calendar configuration issues"""
     pass

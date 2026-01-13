@@ -11,6 +11,7 @@ from datetime import datetime
 
 from ..utils.logger import setup_logger
 from ..utils.config import Config
+from .llm_constants import MODEL_GEMINI_3_FLASH, DEFAULT_TEMPERATURE
 
 logger = setup_logger(__name__)
 
@@ -46,7 +47,11 @@ class ProfileBuilder:
             from .llm_factory import LLMFactory
             
             self.classifier = QueryClassifier(self.config)
-            self.llm_client = LLMFactory.get_llm_for_provider(self.config, temperature=0.2)
+            # Use specific model and lower temperature for analysis consistency
+            self.llm_client = LLMFactory.get_llm_for_provider(
+                self.config, 
+                temperature=0.1
+            )
             logger.info("NLP capabilities initialized for ProfileBuilder")
         except Exception as e:
             logger.warning(f"NLP initialization failed: {e}")
@@ -76,10 +81,11 @@ class ProfileBuilder:
         
         logger.info(f"Using {len(valid_emails)} valid emails out of {len(sent_emails)} total")
         
-        # Run LLM analysis asynchronously if available
+        # Run consolidated LLM analysis asynchronously if available
         if self.llm_client:
-            writing_style = await self._analyze_style_with_llm(valid_emails)
-            common_phrases = await self._extract_phrases_with_llm(valid_emails)
+            llm_analysis = await self._run_comprehensive_llm_analysis(valid_emails)
+            writing_style = llm_analysis.get('writing_style', self._analyze_style(valid_emails))
+            common_phrases = llm_analysis.get('common_phrases', self._extract_common_phrases(valid_emails))
         else:
             writing_style = self._analyze_style(valid_emails)
             common_phrases = self._extract_common_phrases(valid_emails)
@@ -144,7 +150,6 @@ class ProfileBuilder:
         
         for email in sent_emails:
             content = email.get('content', '')
-            metadata = email.get('metadata', {})
             
             # Word count
             words = content.split()
@@ -215,6 +220,7 @@ class ProfileBuilder:
                 'avg_length': self._avg_word_count(colleague_emails),
                 'typical_response': self._extract_typical_pattern(colleague_emails),
             },
+            'categories': self._categorize_styles(sent_emails)
         }
     
     def _extract_preferences(self, sent_emails: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -234,8 +240,9 @@ class ProfileBuilder:
         scheduling_phrases = []
         for email in sent_emails:
             content = email.get('content', '')
-            # Look for time suggestions
-            time_mentions = re.findall(r'(\d{1,2}(?::\d{2})?\s*(?:am|pm|AM|PM))', content)
+            # Look for time suggestions:
+            # Matches: 10am, 10:00am, 10:30 am, 5 PM
+            time_mentions = re.findall(r'\b((?:1[0-2]|0?[1-9])(?::\d{2})?\s*[aApP][mM])\b', content)
             day_mentions = re.findall(r'(Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday)', content, re.IGNORECASE)
             scheduling_phrases.extend(time_mentions)
             scheduling_phrases.extend(day_mentions)
@@ -276,113 +283,94 @@ class ProfileBuilder:
         phrase_counter = Counter(phrases)
         return [phrase for phrase, count in phrase_counter.most_common(10)]
     
-    async def _analyze_style_with_llm(self, sent_emails: List[Dict[str, Any]]) -> Dict[str, Any]:
+    async def _run_comprehensive_llm_analysis(self, sent_emails: List[Dict[str, Any]]) -> Dict[str, Any]:
         """
-        Analyze writing style using LLM for intelligent extraction
-        
-        Args:
-            sent_emails: List of email dictionaries
+        Runs a single comprehensive LLM analysis to extract all style components.
+        Reduces latency and API costs by combining tone, phrases, and patterns.
+        """
+        if not self.llm_client or not sent_emails:
+            return {}
             
-        Returns:
-            Dictionary with enhanced style analysis
-        """
-        if not self.llm_client or len(sent_emails) == 0:
-            return self._analyze_style(sent_emails)
-        
         try:
-            # Sample a subset of emails for LLM analysis
-            sample_size = min(len(sent_emails), 10)
+            # Sample 10 diverse emails
+            sample_size = min(len(sent_emails), 12)
             sample_emails = sent_emails[:sample_size]
             
-            # Prepare email sample for LLM
-            email_samples = []
-            for email in sample_emails:
-                content = email.get('content', '')
-                email_samples.append(content[:500] if len(content) > 500 else content)
+            email_text = "\n---\n".join([
+                f"Subject: {e.get('metadata', {}).get('original_subject', 'None')}\n"
+                f"Body: {e.get('content', '')[:300]}"
+                for e in sample_emails
+            ])
             
-            prompt = f"""Analyze the writing style from the following email samples and extract:
+            prompt = f"""You are a master of linguistic analysis. Analyze these email samples to build a writing "Persona".
 
-1. Tone: (formal/professional/casual)
-2. Formality score: (0-10)
-3. Common greetings: (top 3)
-4. Common closings: (top 3)
-5. Writing patterns: (brief/moderate/detailed)
+EMAI SAMPLES:
+{email_text}
 
-Email samples:
-{chr(10).join(f"Email {i+1}: {email}" for i, email in enumerate(email_samples[:5]))}
+EXTRACT THE FOLLOWING INTO A JSON OBJECT:
+1. writing_style:
+   - tone: overall tone (e.g., "Warm & Direct", "Formal & Precise")
+   - formality_score: 0 to 10 scale
+   - common_greetings: top 3
+   - common_closings: top 3
+   - sentence_structure: (e.g., "Short & Punchy", "Long & Academic")
+2. common_phrases: Extract the top 10 unique phrases this person uses (idiosyncrasies).
+3. behavioral_patterns: 
+   - uses_emojis: boolean
+   - uses_exclamations: boolean
+   - response_speed_hint: (e.g., "Brief for quick replies", "Detailed for project updates")
 
-Return as JSON with keys: tone, formality_score, greetings, closings, patterns"""
-            
-            # Run LLM call in thread pool to avoid blocking
+RETURN ONLY VALID JSON."""
+
+            # Execute consolidated call
             response = await asyncio.to_thread(self.llm_client.invoke, prompt)
             llm_result = self._parse_llm_response(response)
             
-            # Merge with regex-based analysis
-            regex_style = self._analyze_style(sent_emails)
-            
-            # Prefer LLM results where available
-            if llm_result:
-                for key in ['tone', 'formality_score', 'common_greetings', 'common_closings']:
-                    if key in llm_result and llm_result[key]:
-                        regex_style[key] = llm_result[key]
-            
-            return regex_style
+            if not llm_result:
+                return {}
+                
+            return {
+                'writing_style': llm_result.get('writing_style', {}),
+                'common_phrases': llm_result.get('common_phrases', []),
+                'behavioral_patterns': llm_result.get('behavioral_patterns', {})
+            }
             
         except Exception as e:
-            logger.warning(f"LLM style analysis failed: {e}")
-            return self._analyze_style(sent_emails)
-    
-    async def _extract_phrases_with_llm(self, sent_emails: List[Dict[str, Any]]) -> List[str]:
-        """
-        Extract unique user phrases using LLM
+            logger.error(f"Comprehensive LLM analysis failed: {e}")
+            return {}
+
+    def _categorize_styles(self, sent_emails: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """Categorizes writing style into Internal vs External."""
+        internal_emails = []
+        external_emails = []
         
-        Args:
-            sent_emails: List of email dictionaries
+        # Simple domain-based or metadata-based heuristic
+        # In a real app, we'd check if recipient domain matches user domain
+        for email in sent_emails:
+            recipients = email.get('metadata', {}).get('to', [])
+            is_internal = False
+            # Mock logic for internal vs external
+            if any('@clavr.ai' in str(r).lower() for r in recipients):
+                is_internal = True
             
-        Returns:
-            List of common phrases
-        """
-        if not self.llm_client or len(sent_emails) == 0:
-            return self._extract_common_phrases(sent_emails)
-        
-        try:
-            # Sample emails
-            sample_size = min(len(sent_emails), 10)
-            sample_emails = sent_emails[:sample_size]
-            
-            email_samples = []
-            for email in sample_emails:
-                content = email.get('content', '')
-                email_samples.append(content[:500])
-            
-            prompt = f"""Extract 10 unique phrases commonly used by this person in their emails.
+            if is_internal:
+                internal_emails.append(email)
+            else:
+                external_emails.append(email)
+                
+        return {
+            'internal': {
+                'count': len(internal_emails),
+                'tone': self._determine_tone([self._calculate_formality(e.get('content', '')) for e in internal_emails]) if internal_emails else "professional",
+                'avg_length': self._avg_word_count(internal_emails)
+            },
+            'external': {
+                'count': len(external_emails),
+                'tone': self._determine_tone([self._calculate_formality(e.get('content', '')) for e in external_emails]) if external_emails else "formal",
+                'avg_length': self._avg_word_count(external_emails)
+            }
+        }
 
-Look for:
-- Personalized greetings and closings
-- Signature phrases
-- Expressions of gratitude
-- Unique ways of saying common things
-
-Email samples:
-{chr(10).join(f"Email {i+1}: {email}" for i, email in enumerate(email_samples[:5]))}
-
-Return as JSON array of top 10 phrases: ["phrase1", "phrase2", ...]"""
-            
-            # Run LLM call in thread pool to avoid blocking
-            response = await asyncio.to_thread(self.llm_client.invoke, prompt)
-            llm_phrases = self._parse_llm_response(response)
-            
-            if isinstance(llm_phrases, list):
-                return llm_phrases
-            elif isinstance(llm_phrases, dict) and 'phrases' in llm_phrases:
-                return llm_phrases['phrases']
-            
-            return self._extract_common_phrases(sent_emails)
-            
-        except Exception as e:
-            logger.warning(f"LLM phrase extraction failed: {e}")
-            return self._extract_common_phrases(sent_emails)
-    
     def _parse_llm_response(self, response) -> Any:
         """
         Parse LLM JSON response with robust error handling.
@@ -481,20 +469,40 @@ Return as JSON array of top 10 phrases: ["phrase1", "phrase2", ...]"""
         return [c for c, _ in closing_counter.most_common(5)]
     
     def _extract_signature(self, sent_emails: List[Dict[str, Any]]) -> str:
-        """Extract user's email signature."""
+        """Extract user's email signature with noise filtering."""
         signatures = []
+        
+        # Phrases to exclude (mobile signatures, etc.)
+        noise_phrases = [
+            'sent from my', 
+            'sent from my iphone', 
+            'sent from my android',
+            'get outlook for',
+            'sent via'
+        ]
         
         for email in sent_emails:
             content = email.get('content', '').strip()
             if not content:
                 continue
             
-            # Signature is typically last 1-3 lines
+            # Get non-empty lines
             lines = [line.strip() for line in content.split('\n') if line.strip()]
-            if len(lines) >= 2:
-                # Get last 2 lines (common for "Closing,\nName")
-                potential_sig = '\n'.join(lines[-2:])
-                signatures.append(potential_sig)
+            
+            # Filter noise lines
+            clean_lines = [
+                line for line in lines 
+                if not any(noise in line.lower() for noise in noise_phrases)
+            ]
+            
+            if len(clean_lines) >= 1:
+                # Potential signature is the last line remaining
+                # Sometimes it is 2 lines (Closing + Name), but Name is most important
+                potential_sig = clean_lines[-1]
+                
+                # Verify it's not too long (signatures are usually short)
+                if len(potential_sig) < 50:
+                    signatures.append(potential_sig)
         
         # Return most common signature
         if signatures:
@@ -613,10 +621,7 @@ Return as JSON array of top 10 phrases: ["phrase1", "phrase2", ...]"""
     
     def get_style_prompt_additions(self) -> str:
         """
-        Generate prompt additions based on the profile for LLM guidance.
-        
-        Returns:
-            String to add to the LLM prompt for style matching
+        Generate a structured Persona block based on the profile for LLM guidance.
         """
         if not self.profile:
             return ""
@@ -624,44 +629,40 @@ Return as JSON array of top 10 phrases: ["phrase1", "phrase2", ...]"""
         style = self.profile.get('writing_style', {})
         prefs = self.profile.get('preferences', {})
         phrases = self.profile.get('common_phrases', [])
+        patterns = self.profile.get('response_patterns', {})
         
-        prompt_parts = []
+        persona = []
+        persona.append("### 🎭 User Personality & Writing Style")
         
-        # Tone and formality
+        # Tone & Structure
         tone = style.get('tone', 'professional')
-        formality = style.get('formality_score', 5.0)
-        prompt_parts.append(f"Write in a {tone} tone (formality: {formality}/10).")
+        structure = style.get('sentence_structure', 'natural')
+        persona.append(f"- **Tone**: {tone}")
+        persona.append(f"- **Structure**: {structure}")
         
-        # Length
-        avg_words = style.get('avg_word_count', 100)
-        prompt_parts.append(f"Target length: around {avg_words} words.")
-        
-        # Greeting
+        # Categorization (Internal vs External)
+        categories = patterns.get('categories', {})
+        if categories:
+            int_style = categories.get('internal', {})
+            ext_style = categories.get('external', {})
+            if int_style.get('count', 0) > 0:
+                persona.append(f"- **Internal Style**: {int_style.get('tone')} ({int_style.get('avg_length')} words)")
+            if ext_style.get('count', 0) > 0:
+                persona.append(f"- **External Style**: {ext_style.get('tone')} ({ext_style.get('avg_length')} words)")
+
+        # Idiosyncrasies
+        if phrases:
+            phrases_joined = '", "'.join(phrases[:5])
+            persona.append(f'- **Preferred Phrases**: "{phrases_joined}"')
+            
+        # Greetings & Closings
         greetings = style.get('common_greetings', [])
-        if greetings:
-            prompt_parts.append(f"Typical greeting: '{greetings[0]}'")
-        
-        # Closing
         closings = style.get('common_closings', [])
-        if closings:
-            prompt_parts.append(f"Typical closing: '{closings[0]}'")
+        if greetings: persona.append(f"- **Standard Greetings**: {', '.join([f'\"{g}\"' for g in greetings[:2]])}")
+        if closings: persona.append(f"- **Standard Closings**: {', '.join([f'\"{c}\"' for c in closings[:2]])}")
         
         # Signature
-        signature = prefs.get('signature', '')
-        if signature:
-            prompt_parts.append(f"Sign off with: {signature}")
+        sig = prefs.get('signature', '')
+        if sig: persona.append(f"- **Signature**: {sig}")
         
-        # Common phrases
-        if phrases:
-            phrases_str = "', '".join(phrases[:3])
-            prompt_parts.append(f"Consider using phrases like: '{phrases_str}'")
-        
-        # Exclamations and emojis
-        if style.get('uses_exclamations'):
-            prompt_parts.append("Feel free to use exclamation marks for enthusiasm.")
-        
-        if style.get('uses_emojis'):
-            prompt_parts.append("You may use emojis when appropriate.")
-        
-        return " ".join(prompt_parts)
-
+        return "\n".join(persona)

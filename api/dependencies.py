@@ -3,13 +3,17 @@ API Dependencies
 Provides shared dependencies for FastAPI routers using proper dependency injection
 """
 from typing import Optional, Generator, Any
-from fastapi import Depends, Request
+from sqlalchemy.ext.asyncio import AsyncSession
+from fastapi import Depends, Request, HTTPException, status
 
 from src.utils.config import load_config, Config
-from src.ai.rag import RAGEngine
-from src.ai.llm_factory import LLMFactory
+# Defer imports to avoid circular dependencies
+# from src.ai.rag import RAGEngine
+# from src.ai.llm_factory import LLMFactory
+from src.database import get_db, get_async_db, User
 from src.utils.logger import setup_logger
-from src.tools import EmailTool, CalendarTool, TaskTool, SummarizeTool, NotionTool
+from src.tools import EmailTool, CalendarTool, TaskTool, SummarizeTool, NotionTool, KeepTool, FinanceTool
+from src.tools.weather.tool import WeatherTool
 
 logger = setup_logger(__name__)
 
@@ -21,12 +25,15 @@ logger = setup_logger(__name__)
 class AppState:
     """Application state holder for singleton instances"""
     _config: Optional[Config] = None
-    _rag_engine: Optional[RAGEngine] = None
+    _rag_engine: Optional['RAGEngine'] = None
     _email_tool: Optional[EmailTool] = None
     _calendar_tool: Optional[CalendarTool] = None
     _task_tool: Optional[TaskTool] = None
     _summarize_tool: Optional[SummarizeTool] = None
     _notion_tool: Optional[NotionTool] = None
+    _keep_tool: Optional[KeepTool] = None
+    _weather_tool: Optional[WeatherTool] = None
+    _finance_tool: Optional[FinanceTool] = None
     _orchestrator: Optional[Any] = None
     
     @classmethod
@@ -36,153 +43,186 @@ class AppState:
             cls._config = load_config()
             logger.info("[OK] Configuration loaded")
         return cls._config
+
+    @classmethod
+    def _get_credentials(cls, user_id: int, provider: str, request: Optional[Any] = None) -> Optional[Any]:
+        """
+        Consolidated helper to get credentials.
+        Prioritizes integration-specific credentials from UserIntegration table.
+        """
+        from src.core.credential_provider import CredentialProvider
+        from src.auth.oauth import GMAIL_SCOPES, CALENDAR_SCOPES, TASKS_SCOPES, DRIVE_SCOPES, LOGIN_SCOPES
+        
+        # Map provider to specific scopes
+        scopes_map = {
+            'gmail': GMAIL_SCOPES,
+            'google_calendar': CALENDAR_SCOPES,
+            'google_tasks': TASKS_SCOPES,
+            'google_drive': DRIVE_SCOPES,
+        }
+        target_scopes = scopes_map.get(provider)
+
+        # Priority 1: CredentialProvider (specific integration tokens with correct scopes)
+        try:
+            creds = CredentialProvider.get_integration_credentials(
+                user_id=user_id,
+                provider=provider,
+                auto_refresh=True
+            )
+            if creds:
+                return creds
+        except Exception as e:
+            logger.warning(f"Failed to get integration credentials for {provider}: {e}")
+
+        # Priority 2: Request session (fallback for Gmail/backward compatibility)
+        if provider == 'gmail' and request and hasattr(request.state, 'session') and request.state.session:
+            try:
+                from src.database import get_db_context
+                from src.auth.token_refresh import get_valid_credentials
+                
+                session = request.state.session
+                if session.gmail_access_token:
+                    with get_db_context() as db:
+                        # Pass GMAIL_SCOPES to ensure we don't request too much on refresh
+                        return get_valid_credentials(db, session, scopes=GMAIL_SCOPES, auto_refresh=True)
+            except Exception as e:
+                logger.warning(f"Failed to get credentials from request session: {e}")
+        
+        return None
+        
+    @classmethod
+    def get_knowledge_graph_manager(cls):
+        """Get or create KnowledgeGraphManager singleton"""
+        if not hasattr(cls, '_graph_manager') or cls._graph_manager is None:
+            config = cls.get_config()
+            try:
+                from src.services.indexing.graph.manager import KnowledgeGraphManager
+                cls._graph_manager = KnowledgeGraphManager(config=config)
+                logger.info("[OK] KnowledgeGraphManager initialized")
+            except Exception as e:
+                logger.warning(f"Failed to initialize KnowledgeGraphManager: {e}")
+                cls._graph_manager = None
+        return cls._graph_manager
     
     @classmethod
-    def get_rag_engine(cls) -> RAGEngine:
+    def get_rag_engine(cls) -> 'RAGEngine':
         """Get or create RAG engine singleton"""
         if cls._rag_engine is None:
+            from src.ai.rag import RAGEngine
             config = cls.get_config()
             cls._rag_engine = RAGEngine(config, collection_name="email-knowledge")
             logger.info("[OK] RAG engine initialized")
         return cls._rag_engine
     
     @classmethod
-    def get_rag_tool(cls) -> RAGEngine:
+    def get_conversation_rag_engine(cls) -> 'RAGEngine':
+        """Get RAG engine for conversation messages (separate from email-knowledge).
+        
+        This prevents conversation_messages from polluting the email search index.
+        """
+        if not hasattr(cls, '_conversation_rag_engine'):
+            cls._conversation_rag_engine = None
+        
+        if cls._conversation_rag_engine is None:
+            from src.ai.rag import RAGEngine
+            config = cls.get_config()
+            cls._conversation_rag_engine = RAGEngine(config, collection_name="conversations")
+            logger.info("[OK] Conversation RAG engine initialized (collection: conversations)")
+        
+        return cls._conversation_rag_engine
+    
+    @classmethod
+    def get_hybrid_coordinator(cls) -> Optional[Any]:
+        """Get or create HybridIndexCoordinator singleton for Graph+Vector search"""
+        if not hasattr(cls, '_hybrid_coordinator'):
+            cls._hybrid_coordinator = None
+        
+        if cls._hybrid_coordinator is None:
+            try:
+                from src.services.indexing.hybrid_index import HybridIndexCoordinator
+                
+                config = cls.get_config()
+                graph_manager = cls.get_knowledge_graph_manager()
+                rag_engine = cls.get_rag_engine()
+                
+                if graph_manager and rag_engine:
+                    cls._hybrid_coordinator = HybridIndexCoordinator(
+                        graph_manager=graph_manager,
+                        rag_engine=rag_engine,
+                        enable_graph=True,
+                        enable_vector=True
+                    )
+                    logger.info("[OK] HybridIndexCoordinator initialized")
+                else:
+                    logger.warning("HybridIndexCoordinator skipped: missing graph_manager or rag_engine")
+            except Exception as e:
+                logger.warning(f"Failed to initialize HybridIndexCoordinator: {e}")
+                cls._hybrid_coordinator = None
+        
+        return cls._hybrid_coordinator
+    
+    @classmethod
+    def get_rag_tool(cls) -> 'RAGEngine':
         """Get or create RAG tool singleton (deprecated - use get_rag_engine instead)"""
         logger.warning("get_rag_tool is deprecated. Use get_rag_engine instead.")
         return cls.get_rag_engine()
     
     @classmethod
     def get_email_tool(cls, user_id: int = 1, request: Optional[Any] = None, user_first_name: Optional[str] = None) -> EmailTool:
-        """
-        Get or create EmailTool with user credentials.
-        
-        Creates a new instance each time to ensure fresh credentials from the session.
-        This is important because tokens can be refreshed between requests.
-        
-        Args:
-            user_id: User ID
-            request: Optional FastAPI Request object to get session credentials
-            user_first_name: Optional user's first name for personalization
-        """
+        """Get EmailTool with consolidated credentials."""
         config = cls.get_config()
         rag_engine = cls.get_rag_engine()
+        hybrid_coordinator = cls.get_hybrid_coordinator()
+        credentials = cls._get_credentials(user_id, 'gmail', request)
         
-        # Get credentials from request session if available
-        credentials = None
-        if request and hasattr(request.state, 'session') and request.state.session:
-            try:
-                from src.database import get_db_context
-                from src.auth.token_refresh import get_valid_credentials
-                
-                session = request.state.session
-                if session.gmail_access_token:
-                    with get_db_context() as db:
-                        credentials_obj = get_valid_credentials(db, session, auto_refresh=True)
-                        if credentials_obj:
-                            credentials = credentials_obj
-                            logger.debug(f"EmailTool using credentials from session (user_id={user_id})")
-            except Exception as e:
-                logger.warning(f"Failed to get credentials from request: {e}")
-        
-        email_tool = EmailTool(config=config, rag_engine=rag_engine, user_id=user_id, credentials=credentials, user_first_name=user_first_name)
-        return email_tool
+        return EmailTool(
+            config=config, 
+            rag_engine=rag_engine, 
+            user_id=user_id, 
+            credentials=credentials, 
+            user_first_name=user_first_name,
+            hybrid_coordinator=hybrid_coordinator
+        )
     
     @classmethod
     def get_calendar_tool(cls, user_id: Optional[int] = None, request: Optional[Any] = None) -> CalendarTool:
-        """
-        Get or create CalendarTool with user credentials.
-        
-        Creates a new instance each time to ensure fresh credentials from the session.
-        
-        Args:
-            user_id: Optional user ID for session-based credential retrieval
-            request: Optional FastAPI Request object to get session credentials
-        """
+        """Get CalendarTool with consolidated credentials."""
         config = cls.get_config()
-        rag_engine = cls.get_rag_engine()  # Get RAG engine for email indexing and contact resolution
+        rag_engine = cls.get_rag_engine()
         
-        # Get credentials from request session if available
-        # Use same method as get_email_tool to ensure token refresh
-        credentials = None
-        if request and hasattr(request.state, 'session') and request.state.session:
-            try:
-                from src.database import get_db_context
-                from src.auth.token_refresh import get_valid_credentials
-                
-                session = request.state.session
-                if session.gmail_access_token:
-                    with get_db_context() as db:
-                        credentials_obj = get_valid_credentials(db, session, auto_refresh=True)
-                        if credentials_obj:
-                            credentials = credentials_obj
-                            logger.debug(f"CalendarTool using credentials from session (user_id={user_id})")
-            except Exception as e:
-                logger.warning(f"Failed to get credentials from request: {e}")
+        if not user_id and request and hasattr(request.state, 'user') and request.state.user:
+            user_id = request.state.user.id
         
-        calendar_tool = CalendarTool(config=config, user_id=user_id, credentials=credentials, rag_engine=rag_engine)
-        return calendar_tool
+        credentials = cls._get_credentials(user_id or 1, 'google_calendar', request)
+        return CalendarTool(config=config, user_id=user_id or 1, credentials=credentials, rag_engine=rag_engine)
+
+    @classmethod
+    def get_drive_service(cls, user_id: int = 1, request: Optional[Any] = None) -> Any:
+        """Get GoogleDriveService with consolidated credentials."""
+        config = cls.get_config()
+        credentials = cls._get_credentials(user_id, 'google_drive', request)
+        
+        from src.integrations.google_drive.service import GoogleDriveService
+        return GoogleDriveService(config=config, credentials=credentials)
     
     @classmethod
-    def get_task_tool(cls, user_id: int = 1, request: Optional[Any] = None, user_first_name: Optional[str] = None) -> TaskTool:
-        """
-        Get or create TaskTool (cached per user_id) with user credentials.
-        
-        Caches instances per user_id since TaskTool manages local storage files.
-        Updates credentials if a new request is provided.
-        
-        Args:
-            user_id: User ID
-            request: Optional FastAPI Request object to get session credentials
-            user_first_name: Optional user's first name for personalization
-        """
-        cache_key = f"task_tool_{user_id}"
-        if not hasattr(cls, '_task_tool_cache'):
-            cls._task_tool_cache = {}
-        
+    def get_task_tool(cls, user_id: int = 1, request: Optional[Any] = None, user_first_name: Optional[str] = None, db: Optional[Any] = None) -> TaskTool:
+        """Get TaskTool with consolidated credentials."""
         config = cls.get_config()
         storage_path = f"./data/tasks_{user_id}.json"
         
-        # Get credentials from request session if available
-        credentials = None
-        if request and hasattr(request.state, 'session') and request.state.session:
-            try:
-                from src.database import get_db_context
-                from src.auth.token_refresh import get_valid_credentials
-                
-                session = request.state.session
-                if session.gmail_access_token:
-                    with get_db_context() as db:
-                        credentials_obj = get_valid_credentials(db, session, auto_refresh=True)
-                        if credentials_obj:
-                            credentials = credentials_obj
-                            logger.debug(f"TaskTool using credentials from session (user_id={user_id})")
-            except Exception as e:
-                logger.warning(f"Failed to get credentials from request: {e}")
+        if request and hasattr(request.state, 'user') and request.state.user:
+            user_id = request.state.user.id
+            
+        credentials = cls._get_credentials(user_id, 'google_tasks', request)
         
-        # Create new instance if not cached
-        if cache_key not in cls._task_tool_cache:
-            cls._task_tool_cache[cache_key] = TaskTool(
-                storage_path=storage_path, 
-                config=config,
-                user_id=user_id,
-                credentials=credentials,
-                user_first_name=user_first_name
-            )
-        else:
-            # Update credentials and user_first_name if provided (for token refresh scenarios)
-            tool = cls._task_tool_cache[cache_key]
-            if credentials:
-                object.__setattr__(tool, '_credentials', credentials)
-                # Reset google_client to force re-initialization with new credentials
-                tool._google_client = None
-            if user_first_name:
-                object.__setattr__(tool, 'user_first_name', user_first_name)
-                # Update parser's user_first_name if it exists
-                if hasattr(tool, '_parser') and tool._parser:
-                    tool._parser.user_first_name = user_first_name
-        
-        return cls._task_tool_cache[cache_key]
+        return TaskTool(
+            storage_path=storage_path, 
+            config=config,
+            user_id=user_id,
+            credentials=credentials,
+            user_first_name=user_first_name
+        )
     
     @classmethod
     def get_summarize_tool(cls) -> SummarizeTool:
@@ -217,6 +257,91 @@ class AppState:
         return cls._notion_tool
     
     @classmethod
+    def get_keep_tool(cls, user_id: int = 1, request: Optional[Any] = None) -> KeepTool:
+        """Get KeepTool with consolidated credentials."""
+        config = cls.get_config()
+        credentials = cls._get_credentials(user_id, 'gmail', request) # Keep uses Gmail scopes
+        return KeepTool(config=config, user_id=user_id, credentials=credentials)
+    
+    @classmethod
+    def get_weather_tool(cls) -> WeatherTool:
+        """
+        Get or create WeatherTool singleton.
+        
+        Weather tool doesn't require user-specific credentials - it uses 
+        the Google Maps API key from config.
+        """
+        if cls._weather_tool is None:
+            config = cls.get_config()
+            cls._weather_tool = WeatherTool(config=config)
+            logger.info("[OK] WeatherTool initialized")
+        return cls._weather_tool
+    
+    @classmethod
+    def get_drive_tool(cls, user_id: int = 1, request: Optional[Any] = None):
+        """Get DriveTool with consolidated credentials."""
+        from src.tools.drive import DriveTool
+        config = cls.get_config()
+        credentials = cls._get_credentials(user_id, 'google_drive', request)
+        
+        try:
+            return DriveTool(config=config, user_id=user_id, credentials=credentials)
+        except Exception as e:
+            logger.error(f"Failed to initialize DriveTool: {e}")
+            return DriveTool(config=config, user_id=user_id, credentials=None)
+    
+    @classmethod
+    def get_brief_service(cls, user_id: int = 1, request: Optional[Any] = None) -> Any:
+        """Get BriefService with aggregated services."""
+        from src.services.dashboard.brief_service import BriefService
+        from src.integrations.google_calendar.service import CalendarService
+        config = cls.get_config()
+        
+        try:
+            email_tool = cls.get_email_tool(user_id=user_id, request=request)
+            email_tool._initialize_service()
+            email_svc = email_tool._service
+        except Exception:
+            email_svc = None
+            
+        try:
+            task_tool = cls.get_task_tool(user_id=user_id, request=request)
+            task_svc = task_tool.task_service
+        except Exception:
+            task_svc = None
+            
+        try:
+            cal_tool = cls.get_calendar_tool(user_id=user_id, request=request)
+            cal_svc = CalendarService(config=config, credentials=cal_tool.credentials)
+        except Exception:
+            cal_svc = None
+            
+        return BriefService(
+            config=config,
+            email_service=email_svc,
+            task_service=task_svc,
+            calendar_service=cal_svc
+        )
+
+    @classmethod
+    def get_brief_tool(cls, user_id: int = 1, request: Optional[Any] = None, user_first_name: Optional[str] = None) -> Any:
+        """Get BriefTool with aggregated services."""
+        from src.tools.brief.tool import BriefTool
+        from src.ai.autonomy.briefing import BriefingGenerator
+        
+        config = cls.get_config()
+        brief_service = cls.get_brief_service(user_id=user_id, request=request)
+        brief_gen = BriefingGenerator(config=config)
+        
+        return BriefTool(
+            config=config,
+            user_id=user_id,
+            user_first_name=user_first_name,
+            brief_service=brief_service,
+            brief_generator=brief_gen
+        )
+    
+    @classmethod
     def get_orchestrator(cls, db: Optional[Any] = None, user_id: Optional[int] = None, request: Optional[Any] = None) -> Any:
         """
         Get or create orchestrator singleton.
@@ -234,7 +359,9 @@ class AppState:
         """
         if cls._orchestrator is None:
             try:
-                from src.agent.orchestration import create_orchestrator
+                # from src.agent.orchestration import create_orchestrator
+                logger.warning("Legacy orchestration module is deprecated/removed.")
+                return None
                 
                 config = cls.get_config()
                 
@@ -271,6 +398,67 @@ class AppState:
         return cls._orchestrator
     
     @classmethod
+    def get_finance_tool(cls, user_id: int = 1) -> FinanceTool:
+        """Get or create FinanceTool singleton"""
+        if cls._finance_tool is None:
+            config = cls.get_config()
+            graph_manager = cls.get_knowledge_graph_manager()
+            cls._finance_tool = FinanceTool(config=config, graph_manager=graph_manager, user_id=user_id)
+            logger.info("[OK] FinanceTool initialized")
+        return cls._finance_tool
+
+    @classmethod
+    def get_all_tools(cls, user_id: int, request: Optional[Any] = None, user_first_name: Optional[str] = None) -> list:
+        """
+        Get all available tools for a user, properly initialized with credentials.
+        Used primarily by voice and chat interfaces.
+        """
+        from src.tools.maps.tool import MapsTool
+        from src.tools.timezone.tool import TimezoneTool
+        from src.tools.slack.tool import SlackTool
+        from src.tools.asana.tool import AsanaTool
+        
+        config = cls.get_config()
+        
+        return [
+            cls.get_task_tool(user_id=user_id, request=request, user_first_name=user_first_name),
+            cls.get_calendar_tool(user_id=user_id, request=request),
+            cls.get_email_tool(user_id=user_id, request=request, user_first_name=user_first_name),
+            cls.get_brief_tool(user_id=user_id, request=request, user_first_name=user_first_name),
+            cls.get_summarize_tool(),
+            cls.get_keep_tool(user_id=user_id, request=request),
+            cls.get_weather_tool(),
+            cls.get_drive_tool(user_id=user_id, request=request),
+            MapsTool(config=config),
+            TimezoneTool(config=config),
+            # Slack/Asana might need more user-specific setup if they have their own OAuth
+            SlackTool(config=config, user_id=user_id),
+            cls.get_notion_tool(),
+            AsanaTool(config=config, user_id=user_id)
+        ]
+
+    @classmethod
+    def get_auth_service(cls, db: AsyncSession) -> Any:
+        """Get the Auth service."""
+        from src.services.auth_service import AuthService
+        config = cls.get_config()
+        return AuthService(db=db, config=config)
+
+    @classmethod
+    def get_integration_service(cls, db: AsyncSession) -> Any:
+        """Get the Integration service."""
+        from src.services.integration_service import IntegrationService
+        config = cls.get_config()
+        return IntegrationService(db=db, config=config)
+
+    @classmethod
+    def get_chat_service(cls, db: AsyncSession) -> Any:
+        """Get the Chat service."""
+        from src.services.chat_service import ChatService
+        config = cls.get_config()
+        return ChatService(db=db, config=config)
+
+    @classmethod
     def reset(cls):
         """Reset all singletons (useful for testing)"""
         cls._config = None
@@ -306,13 +494,13 @@ def get_config() -> Config:
     return AppState.get_config()
 
 
-def get_rag_engine() -> RAGEngine:
+def get_rag_engine() -> 'RAGEngine':
     """
     FastAPI dependency for RAG engine
     
     Usage:
         @app.get("/search")
-        def search(rag: RAGEngine = Depends(get_rag_engine)):
+        def search(rag: 'RAGEngine' = Depends(get_rag_engine)):
             ...
     
     Returns:
@@ -320,13 +508,13 @@ def get_rag_engine() -> RAGEngine:
     """
     return AppState.get_rag_engine()
 
-def get_rag_tool() -> RAGEngine:
+def get_rag_tool() -> 'RAGEngine':
     """
     FastAPI dependency for RAG tool (deprecated - use get_rag_engine instead)
     
     Usage:
         @app.get("/search")
-        def search(rag: RAGEngine = Depends(get_rag_tool)):
+        def search(rag: 'RAGEngine' = Depends(get_rag_tool)):
             ...
     
     Returns:
@@ -348,6 +536,7 @@ def get_llm(config: Config = Depends(get_config)):
     Returns:
         LLM client instance (Google Gemini by default)
     """
+    from src.ai.llm_factory import LLMFactory
     return LLMFactory.get_llm_for_provider(config, temperature=0.0)
 
 
@@ -390,6 +579,18 @@ def get_calendar_tool(user_id: Optional[int] = None, request: Optional[Request] 
     return AppState.get_calendar_tool(user_id=user_id, request=request)
 
 
+def get_drive_service(user_id: Optional[int] = None, request: Optional[Request] = None, config: Config = Depends(get_config)) -> Any:
+    """FastAPI dependency for DriveService"""
+    # Extract user_id from request if not provided
+    if not user_id and request:
+        try:
+            if hasattr(request.state, 'user') and request.state.user:
+                user_id = request.state.user.id
+        except:
+            pass
+    return AppState.get_drive_service(user_id=user_id or 1, request=request)
+
+
 def get_task_tool(user_id: int = 1, config: Config = Depends(get_config)) -> TaskTool:
     """FastAPI dependency for TaskTool (cached singleton per user)"""
     return AppState.get_task_tool(user_id=user_id)
@@ -430,3 +631,40 @@ def get_orchestrator(
         Orchestrator instance or None if orchestration module not available
     """
     return AppState.get_orchestrator(db=db, user_id=user_id, request=request)
+
+
+def get_auth_service(db: AsyncSession = Depends(get_async_db)) -> Any:
+    """FastAPI dependency for AuthService."""
+    return AppState.get_auth_service(db=db)
+
+
+def get_integration_service(db: AsyncSession = Depends(get_async_db)) -> Any:
+    """FastAPI dependency for IntegrationService."""
+    return AppState.get_integration_service(db=db)
+
+
+def get_chat_service(db: AsyncSession = Depends(get_async_db)) -> Any:
+    """FastAPI dependency for ChatService."""
+    return AppState.get_chat_service(db=db)
+
+
+def get_current_user(request: Request) -> User:
+    """
+    Dependency to get the currently authenticated user.
+    Raises 401 if not authenticated.
+    """
+    user = getattr(request.state, 'user', None)
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Not authenticated"
+        )
+    return user
+
+
+def get_optional_user(request: Request) -> Optional[User]:
+    """
+    Dependency to get the currently authenticated user if available.
+    Returns None if not authenticated.
+    """
+    return getattr(request.state, 'user', None)

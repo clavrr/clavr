@@ -42,6 +42,11 @@ class User(Base):
     # Relationships
     sessions = relationship("Session", back_populates="user", cascade="all, delete-orphan")
     settings = relationship("UserSettings", back_populates="user", uselist=False, cascade="all, delete-orphan")
+    meeting_templates = relationship("MeetingTemplate", back_populates="user", cascade="all, delete-orphan")
+    task_templates = relationship("TaskTemplate", back_populates="user", cascade="all, delete-orphan")
+    email_templates = relationship("EmailTemplate", back_populates="user", cascade="all, delete-orphan")
+    integrations = relationship("UserIntegration", back_populates="user", cascade="all, delete-orphan")
+
     
     def __repr__(self):
         return f"<User(id={self.id}, email='{self.email}')>"
@@ -62,7 +67,9 @@ class Session(Base):
     session_token = Column(String(255), unique=True, nullable=False, index=True)  # Stores SHA-256 hash (64 chars)
     gmail_access_token = Column(Text)
     gmail_refresh_token = Column(Text)
+    granted_scopes = Column(Text, nullable=True)  # Comma-separated list of OAuth scopes granted by user
     token_expiry = Column(DateTime)
+    last_active_at = Column(DateTime, default=datetime.utcnow, index=True)  # Track inactivity
     created_at = Column(DateTime, default=datetime.utcnow, index=True)  # Indexed for session history
     expires_at = Column(DateTime, default=lambda: datetime.utcnow() + timedelta(days=7), index=True)  # Indexed for cleanup
     
@@ -80,6 +87,105 @@ class Session(Base):
     
     def __repr__(self):
         return f"<Session(id={self.id}, user_id={self.user_id})>"
+
+
+class InteractionSession(Base):
+    """
+    Stores Gemini Interactions API session IDs for stateful conversations.
+    
+    Persists the previous_interaction_id for each user so that multi-turn
+    conversations survive server restarts and work across multiple workers.
+    
+    Enhanced with context tracking for richer conversation awareness.
+    """
+    __tablename__ = 'interaction_sessions'
+    
+    user_id = Column(Integer, ForeignKey('users.id'), primary_key=True, index=True)
+    interaction_id = Column(String(255), nullable=False)  # Gemini Interactions API ID
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False, index=True)
+    
+    # Context tracking (NEW)
+    session_context = Column(JSON, default={})  # Current conversation context (entities, preferences)
+    active_topics = Column(JSON, default=[])    # Topics discussed in this session
+    last_intent = Column(String(100))           # Last detected intent (e.g., "schedule_meeting")
+    turn_count = Column(Integer, default=0)     # Number of conversation turns
+    started_at = Column(DateTime, default=datetime.utcnow, nullable=False)  # Session start time
+    
+    # Session quality metrics
+    avg_response_satisfaction = Column(Float, default=None)  # Average user satisfaction (0-1)
+    escalation_count = Column(Integer, default=0)            # Times user escalated or expressed frustration
+    
+    # Relationship
+    user = relationship("User")
+    
+    def __repr__(self):
+        return f"<InteractionSession(user_id={self.user_id}, turns={self.turn_count}, interaction_id='{self.interaction_id[:20]}...')>"
+    
+    def record_turn(self, intent: str = None, topic: str = None):
+        """Record a new conversation turn with optional intent and topic."""
+        self.turn_count = (self.turn_count or 0) + 1
+        self.updated_at = datetime.utcnow()
+        
+        if intent:
+            self.last_intent = intent
+            
+        if topic and topic not in (self.active_topics or []):
+            topics = self.active_topics or []
+            topics.append(topic)
+            self.active_topics = topics[-10:]  # Keep last 10 topics
+            
+    def update_context(self, key: str, value):
+        """Update a key in the session context."""
+        context = self.session_context or {}
+        context[key] = value
+        self.session_context = context
+        
+    def get_session_duration_minutes(self) -> int:
+        """Get session duration in minutes."""
+        if not self.started_at:
+            return 0
+        delta = datetime.utcnow() - self.started_at
+        return int(delta.total_seconds() / 60)
+
+class UserIntegration(Base):
+    """
+    Store per-user integration tokens (Slack, Notion, Asana, etc.)
+    """
+    __tablename__ = 'user_integrations'
+    
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey('users.id'), nullable=False, index=True)
+    provider = Column(String(50), nullable=False)  # 'slack', 'notion', 'asana'
+    
+    # Auth data
+    access_token = Column(Text, nullable=False)
+    refresh_token = Column(Text, nullable=True)
+    expires_at = Column(DateTime, nullable=True)
+    token_type = Column(String(50), default='Bearer')
+    
+    # Metadata (e.g., bot_user_id, workspace_id, scopes)
+    # Note: 'metadata' is a reserved attribute in SQLAlchemy models (Base.metadata)
+    # so we use 'meta_data' or 'integration_metadata'
+    integration_metadata = Column(JSON, default={})
+    
+    # Active status (for soft disconnect/pause)
+    is_active = Column(Boolean, default=True, nullable=False, index=True)
+    
+    # Timestamps
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    
+    # Relationship
+    user = relationship("User", back_populates="integrations")
+    
+    # Constraints & Indexes
+    __table_args__ = (
+        Index('idx_user_provider', 'user_id', 'provider', unique=True),
+    )
+    
+    def __repr__(self):
+        return f"<UserIntegration(user_id={self.user_id}, provider='{self.provider}')>"
+
 
 
 class AuditLog(Base):
@@ -130,6 +236,11 @@ class ConversationMessage(Base):
     intent = Column(String(100))
     entities = Column(JSON)  # Extracted entities
     confidence = Column(String(20))  # confidence score as string
+    
+    # Multi-Agent State (NEW)
+    agent_plan = Column(JSON)  # Supervisor's execution plan
+    execution_metadata = Column(JSON)  # Agent-specific metadata (tool calls, reasoning)
+    active_agent = Column(String(50))  # Agent that handled the message
     
     timestamp = Column(DateTime, default=datetime.utcnow, nullable=False, index=True)
     
@@ -255,6 +366,68 @@ class UserWritingProfile(Base):
         return f"<UserWritingProfile(user_id={self.user_id}, sample_size={self.sample_size}, confidence={self.confidence_score})>"
 
 
+class AgentFact(Base):
+    """
+    Semantic Memory for agents (Fact Store).
+    
+    Stores discrete facts and preferences learned by agents about the user.
+    Distinct from conversation logs, this is for structured, long-term knowledge.
+    """
+    __tablename__ = 'agent_facts'
+    
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey('users.id'), nullable=False, index=True)
+    
+    content = Column(Text, nullable=False)  # The fact string (e.g. "Likes aisle seats")
+    category = Column(String(50), index=True)  # preference, personal_detail, work_context, etc.
+    source = Column(String(50))  # which agent or tool learned this
+    confidence = Column(Float, default=1.0)
+    
+    # Vector embedding ID (if using external vector DB link)
+    embedding_id = Column(String(255))
+    
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False, index=True)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+    
+    # Relationship
+    # Relationship
+    user = relationship("User", backref="facts")
+    
+    def __repr__(self):
+        return f"<AgentFact(id={self.id}, content='{self.content[:50]}...')>"
+
+class AgentGoal(Base):
+    """
+    Goal model for Autonomous Agent Planning.
+    Stores high-level user goals that the agent should proactively work towards.
+    """
+    __tablename__ = 'agent_goals'
+    
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey('users.id'), nullable=False, index=True)
+    
+    title = Column(String(255), nullable=False)
+    description = Column(Text)
+    status = Column(String(50), default='pending', index=True) # pending, active, completed, archived
+    deadline = Column(DateTime, nullable=True)
+    
+    # Context tags (e.g. project name, key contact) to help Perception/Planner
+    context_tags = Column(JSON, default=[]) # ["Project X", "Deep Work"]
+    
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    
+    user = relationship("User", backref="goals")
+    
+    # Index for common queries
+    __table_args__ = (
+        Index('idx_agent_goals_user_status', 'user_id', 'status'),
+    )
+    
+    def __repr__(self):
+        return f"<AgentGoal(id={self.id}, title='{self.title}', status='{self.status}')>"
+
+
 class OAuthState(Base):
     """
     OAuth state tracking for CSRF protection
@@ -277,4 +450,202 @@ class OAuthState(Base):
     
     def __repr__(self):
         return f"<OAuthState(state='{self.state[:10]}...', used={self.used}, expires_at='{self.expires_at}')>"
+
+
+class MeetingTemplate(Base):
+    """
+    Meeting template model for calendar events
+    
+    Stores reusable meeting templates that users can quickly apply when creating calendar events.
+    """
+    __tablename__ = 'meeting_templates'
+    
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey('users.id'), nullable=False, index=True)
+    name = Column(String(255), nullable=False)
+    title = Column(String(500))
+    duration_minutes = Column(Integer, default=60)
+    description = Column(Text)
+    location = Column(String(500))
+    default_attendees = Column(JSON)  # List of email addresses
+    recurrence = Column(String(100))  # e.g., "DAILY", "WEEKLY", "MONTHLY", "YEARLY"
+    
+    # Metadata
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False, index=True)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+    is_active = Column(Boolean, default=True, nullable=False, index=True)
+    
+    # Relationships
+    user = relationship("User", back_populates="meeting_templates")
+    
+    # Unique constraint: user can't have duplicate template names
+    __table_args__ = (
+        Index('idx_template_user_name', 'user_id', 'name', unique=True),
+        Index('idx_template_user_active', 'user_id', 'is_active'),
+    )
+    
+    def __repr__(self):
+        return f"<MeetingTemplate(id={self.id}, user_id={self.user_id}, name='{self.name}')>"
+    
+    def to_dict(self) -> dict:
+        """Convert template to dictionary"""
+        return {
+            'id': self.id,
+            'name': self.name,
+            'title': self.title,
+            'duration_minutes': self.duration_minutes,
+            'description': self.description,
+            'location': self.location,
+            'default_attendees': self.default_attendees or [],
+            'recurrence': self.recurrence,
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+            'updated_at': self.updated_at.isoformat() if self.updated_at else None,
+            'is_active': self.is_active
+        }
+
+
+class TaskTemplate(Base):
+    """
+    Task template model for reusable task templates
+    
+    Stores reusable task templates that support variable substitution.
+    """
+    __tablename__ = 'task_templates'
+    
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey('users.id'), nullable=False, index=True)
+    name = Column(String(255), nullable=False)
+    description = Column(String(500))  # Template display name
+    task_description = Column(Text, nullable=False)  # Task description (supports {variables})
+    priority = Column(String(20), default='medium')  # 'low', 'medium', 'high'
+    category = Column(String(100))  # e.g., 'work', 'personal', 'project'
+    tags = Column(JSON)  # List of tags
+    subtasks = Column(JSON)  # List of subtask descriptions
+    recurrence = Column(String(100))  # e.g., 'daily', 'weekly', 'monthly'
+    
+    # Metadata
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False, index=True)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+    is_active = Column(Boolean, default=True, nullable=False, index=True)
+    
+    # Relationships
+    user = relationship("User", back_populates="task_templates")
+    
+    # Unique constraint: user can't have duplicate template names
+    __table_args__ = (
+        Index('idx_task_template_user_name', 'user_id', 'name', unique=True),
+        Index('idx_task_template_user_active', 'user_id', 'is_active'),
+    )
+    
+    def __repr__(self):
+        return f"<TaskTemplate(id={self.id}, user_id={self.user_id}, name='{self.name}')>"
+    
+    def to_dict(self) -> dict:
+        """Convert template to dictionary"""
+        return {
+            'id': self.id,
+            'name': self.name,
+            'description': self.description,
+            'task_description': self.task_description,
+            'priority': self.priority,
+            'category': self.category,
+            'tags': self.tags or [],
+            'subtasks': self.subtasks or [],
+            'recurrence': self.recurrence,
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+            'updated_at': self.updated_at.isoformat() if self.updated_at else None,
+            'is_active': self.is_active
+        }
+
+
+class EmailTemplate(Base):
+    """
+    Email template model for reusable email presets
+    
+    Stores reusable email templates that support variable substitution.
+    """
+    __tablename__ = 'email_templates'
+    
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey('users.id'), nullable=False, index=True)
+    name = Column(String(255), nullable=False)
+    subject = Column(String(500))  # Email subject (supports {variables})
+    body = Column(Text, nullable=False)  # Email body (supports {variables})
+    to_recipients = Column(JSON)  # Default recipients (list of email addresses)
+    cc_recipients = Column(JSON)  # Default CC recipients
+    bcc_recipients = Column(JSON)  # Default BCC recipients
+    tone = Column(String(50), default='professional')  # 'professional', 'casual', 'friendly', 'formal'
+    category = Column(String(100))  # e.g., 'followup', 'thankyou', 'meeting_request', 'introduction'
+    
+    # Metadata
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False, index=True)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+    is_active = Column(Boolean, default=True, nullable=False, index=True)
+    
+    # Relationships
+    user = relationship("User", back_populates="email_templates")
+    
+    # Unique constraint: user can't have duplicate template names
+    __table_args__ = (
+        Index('idx_email_template_user_name', 'user_id', 'name', unique=True),
+        Index('idx_email_template_user_active', 'user_id', 'is_active'),
+    )
+    
+    def __repr__(self):
+        return f"<EmailTemplate(id={self.id}, user_id={self.user_id}, name='{self.name}')>"
+    
+    def to_dict(self) -> dict:
+        """Convert template to dictionary"""
+        return {
+            'id': self.id,
+            'name': self.name,
+            'subject': self.subject,
+            'body': self.body,
+            'to_recipients': self.to_recipients or [],
+            'cc_recipients': self.cc_recipients or [],
+            'bcc_recipients': self.bcc_recipients or [],
+            'tone': self.tone,
+            'category': self.category,
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+            'updated_at': self.updated_at.isoformat() if self.updated_at else None,
+            'is_active': self.is_active
+        }
+
+
+class ActionableItem(Base):
+    """
+    Extracted actionable items for proactive reminders.
+    
+    Stores bills, appointments, deadlines, and other time-sensitive items
+    extracted from unstructured sources like emails.
+    """
+    __tablename__ = 'actionable_items'
+    
+    id = Column(String, primary_key=True)
+    user_id = Column(Integer, ForeignKey('users.id'), index=True)
+    
+    title = Column(String(500), nullable=False)
+    item_type = Column(String(50))  # bill, appointment, deadline, task
+    due_date = Column(DateTime, nullable=False, index=True)
+    amount = Column(Float, nullable=True)
+    source_type = Column(String(50))  # email, calendar, asana, notion, extracted
+    source_id = Column(String(255))   # original item ID
+    
+    status = Column(String(50), default='pending', index=True)  # pending, reminded, completed, dismissed
+    urgency = Column(String(20))     # high, medium, low
+    suggested_action = Column(String(100)) # Pay, RSVP, Sign, Book
+    
+    extracted_at = Column(DateTime, default=datetime.utcnow)
+    reminder_sent_at = Column(DateTime, nullable=True)
+    
+    # Relationship
+    user = relationship("User", backref="actionable_items")
+    
+    __table_args__ = (
+        Index('idx_actionable_user_status_due', 'user_id', 'status', 'due_date'),
+    )
+    
+    def __repr__(self):
+        return f"<ActionableItem(id={self.id}, title='{self.title[:30]}...', type={self.item_type})>"
+
 

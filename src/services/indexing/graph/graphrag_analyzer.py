@@ -23,18 +23,21 @@ from enum import Enum
 
 from .manager import KnowledgeGraphManager
 from .schema import NodeType, RelationType
-from ....utils.logger import setup_logger
-from ....utils.config import Config
+from src.utils.logger import setup_logger
+from src.utils.config import Config
 
 logger = setup_logger(__name__)
 
 
 # Analysis Configuration Constants
 DEFAULT_SPENDING_THRESHOLD = 100.0
-DEFAULT_TIME_RANGE_DAYS = 30
 DEFAULT_TOP_VENDORS = 5
 MAX_SAMPLE_RESULTS = 5
 LLM_ADVICE_MAX_LENGTH = 500
+
+# Use centralized time range constant
+from src.services.service_constants import ServiceConstants
+DEFAULT_TIME_RANGE_DAYS = ServiceConstants.GRAPH_DEFAULT_TIME_RANGE_DAYS
 
 
 class AnalysisType(str, Enum):
@@ -290,7 +293,7 @@ class GraphRAGAnalyzer:
            RETURN SUM(r.total)"
         
         Args:
-            query: Graph query string (Cypher-like syntax)
+            query: Graph query string (legacy-style syntax)
             params: Query parameters
             generate_insights: Whether to generate LLM insights from results
             
@@ -323,14 +326,19 @@ class GraphRAGAnalyzer:
     
     async def _find_user_node(self, user_id: str) -> Optional[Dict[str, Any]]:
         """Find user node by email/ID"""
-        # Try to get by node ID first
+        # Try to get by node ID first (if it follows convention)
         node = await self.graph.get_node(f"user_{user_id}")
         if node:
             return node
         
-        # Fallback: Search through all User nodes
-        query = f"MATCH (u:User) WHERE u.email = '{user_id}' RETURN u"
-        results = await self.graph.query(query)
+        # Fallback: Search through all User nodes using AQL
+        # Replaced legacy "MATCH (u:User) WHERE u.email = @user_id RETURN u"
+        query = """
+        FOR u IN User
+            FILTER u.email == @user_id
+            RETURN u
+        """
+        results = await self.graph.query(query, {'user_id': user_id})
         
         return results[0] if results else None
     
@@ -351,32 +359,36 @@ class GraphRAGAnalyzer:
         start_date = end_date - timedelta(days=time_range_days)
         start_date_str = start_date.strftime('%Y-%m-%d')
         
-        # Build query with filters
-        query = f"""
-        MATCH (u:User)-[:RECEIVED]->(e:Email)-[:HAS_RECEIPT]->(r:Receipt)
-        WHERE u.email = '{user_id}' AND r.date >= '{start_date_str}'
-        """
+        # Build AQL query
+        # We perform explicit 2-hop traversal: User -> Email -> Receipt
+        # This avoids multi-hop legacy query limitations and ensures we use correct edge collections
+        
+        query_parts = [
+            "FOR u IN User FILTER u.email == @user_id",
+            "FOR e IN 1..1 OUTBOUND u RECEIVED",  # User -> Email
+            "FOR r IN 1..1 OUTBOUND e HAS_RECEIPT", # Email -> Receipt
+            "FILTER r.date >= @start_date"
+        ]
+        
+        params = {'user_id': user_id, 'start_date': start_date_str}
         
         if category:
-            query += f" AND r.category = '{category}'"
+            query_parts.append("FILTER r.category == @category")
+            params['category'] = category
         
         if vendor:
-            query += f" AND r.merchant CONTAINS '{vendor}'"
+            # Case-insensitive contains check using AQL function
+            query_parts.append("FILTER CONTAINS(LOWER(r.merchant), LOWER(@vendor))")
+            params['vendor'] = vendor
         
-        query += " RETURN r"
+        query_parts.append("RETURN r")
+        query = "\n".join(query_parts)
         
         # Execute query
-        results = await self.graph.query(query)
+        results = await self.graph.query(query, params)
         
-        # Extract receipt data
-        receipts = []
-        for result in results:
-            if 'r' in result:
-                receipts.append(result['r'])
-            elif isinstance(result, dict):
-                receipts.append(result)
-        
-        return receipts
+        # Extract receipt data (manager returns list of dicts)
+        return results
     
     async def _generate_spending_advice(self, analysis_result: Dict[str, Any]) -> str:
         """
@@ -395,7 +407,7 @@ class GraphRAGAnalyzer:
         threshold_exceeded = analysis_result.get('threshold_exceeded', False)
         
         # Import and use SPENDING_ANALYSIS_PROMPT
-        from ....ai.prompts import SPENDING_ANALYSIS_PROMPT
+        from src.ai.prompts import SPENDING_ANALYSIS_PROMPT
         
         prompt = SPENDING_ANALYSIS_PROMPT.format(
             total_spent=total_spent,
@@ -439,7 +451,7 @@ class GraphRAGAnalyzer:
         ])
         
         # Import and use VENDOR_ANALYSIS_PROMPT
-        from ....ai.prompts import VENDOR_ANALYSIS_PROMPT
+        from src.ai.prompts import VENDOR_ANALYSIS_PROMPT
         
         prompt = VENDOR_ANALYSIS_PROMPT.format(
             time_range_days=time_range_days,

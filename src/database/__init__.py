@@ -24,7 +24,7 @@ from .models import (
 )
 from .webhook_models import WebhookSubscription, WebhookDelivery, WebhookEventType, WebhookDeliveryStatus
 from .database import get_db, get_db_session, init_db
-from .async_database import get_async_db, get_async_db_context, init_async_db, AsyncSession
+from .async_database import get_async_db, get_async_db_context, init_async_db, AsyncSession, get_async_session_local
 from .utils import get_db_context, get_db_session_safe, get_or_create, safe_query, transaction
 
 __all__ = [

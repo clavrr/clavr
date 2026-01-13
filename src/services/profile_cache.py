@@ -50,7 +50,7 @@ class ProfileCache:
         metrics: Cache performance metrics
     """
     
-    def __init__(self, max_size: int = 1000, ttl_seconds: int = 3600):
+    def __init__(self, max_size: Optional[int] = None, ttl_seconds: Optional[int] = None):
         """
         Initialize profile cache
         
@@ -58,8 +58,10 @@ class ProfileCache:
             max_size: Maximum number of profiles to cache (default: 1000)
             ttl_seconds: Cache entry TTL in seconds (default: 3600 = 1 hour)
         """
-        self.max_size = max_size
-        self.ttl_seconds = ttl_seconds
+        from .service_constants import SERVICE_CONSTANTS
+        
+        self.max_size = max_size or SERVICE_CONSTANTS.PROFILE_CACHE_MAX_SIZE
+        self.ttl_seconds = ttl_seconds or SERVICE_CONSTANTS.PROFILE_CACHE_TTL_SECONDS
         self.cache: OrderedDict[int, CacheEntry] = OrderedDict()
         self.lock = threading.Lock()
         
@@ -74,8 +76,8 @@ class ProfileCache:
         }
         
         logger.info(
-            f"ProfileCache initialized with max_size={max_size}, "
-            f"ttl_seconds={ttl_seconds}"
+            f"ProfileCache initialized with max_size={self.max_size}, "
+            f"ttl_seconds={self.ttl_seconds}"
         )
     
     async def get(self, user_id: int) -> Optional[Dict[str, Any]]:
@@ -252,7 +254,11 @@ def get_profile_cache() -> ProfileCache:
     """
     global _profile_cache
     if _profile_cache is None:
-        _profile_cache = ProfileCache(max_size=1000, ttl_seconds=3600)
+        from .service_constants import SERVICE_CONSTANTS
+        _profile_cache = ProfileCache(
+            max_size=SERVICE_CONSTANTS.PROFILE_CACHE_MAX_SIZE,
+            ttl_seconds=SERVICE_CONSTANTS.PROFILE_CACHE_TTL_SECONDS
+        )
     return _profile_cache
 
 
@@ -264,9 +270,11 @@ async def start_cache_cleanup_task():
     """
     cache = get_profile_cache()
     
+    from .service_constants import SERVICE_CONSTANTS
+    
     while True:
         try:
-            await asyncio.sleep(300)  # 5 minutes
+            await asyncio.sleep(SERVICE_CONSTANTS.PROFILE_CACHE_CLEANUP_INTERVAL)
             removed = await cache.cleanup_expired()
             if removed > 0:
                 logger.info(f"Cache cleanup removed {removed} expired entries")

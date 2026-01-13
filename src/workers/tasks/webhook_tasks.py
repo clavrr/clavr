@@ -10,9 +10,9 @@ from typing import Dict, Any, Optional
 
 from ..celery_app import celery_app
 from ..base_task import BaseTask, IdempotentTask
-from ...database import get_db_context
-from ...database.webhook_models import WebhookEventType
-from...features.webhook_service import WebhookService
+from src.database import get_db_context
+from src.database.webhook_models import WebhookEventType
+from src.features.webhook_service import WebhookService
 
 logger = logging.getLogger(__name__)
 

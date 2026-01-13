@@ -6,8 +6,85 @@ No hardcoded values - all configuration in one place.
 """
 
 # Schema Version
-SCHEMA_VERSION = "1.0.0"
-SCHEMA_LAST_UPDATED = "2025-11-18"
+SCHEMA_VERSION = "2.0.0"  # Major version bump for new node/relationship types
+SCHEMA_LAST_UPDATED = "2025-12-15"
+
+# =============================================================================
+# RELATIONSHIP STRENGTH & DECAY CONSTANTS
+# =============================================================================
+
+# Default strength for new relationships (0.0 - 1.0)
+DEFAULT_RELATIONSHIP_STRENGTH = 0.5
+
+# Maximum relationship strength
+MAX_RELATIONSHIP_STRENGTH = 1.0
+
+# Minimum relationship strength before pruning
+MIN_RELATIONSHIP_STRENGTH = 0.05
+
+# Strength increment per interaction (logarithmic growth)
+STRENGTH_INCREMENT_BASE = 0.1
+
+# Decay rate per day of inactivity (strength *= (1 - decay_rate))
+DEFAULT_DECAY_RATE = 0.02  # 2% decay per day
+
+# Days without interaction before decay starts
+DECAY_GRACE_PERIOD_DAYS = 7
+
+# =============================================================================
+# RELATIONSHIP CONTEXT CONSTANTS
+# =============================================================================
+
+# Valid relationship context types (describes WHY entities are connected)
+RELATIONSHIP_CONTEXT_TYPES = {
+    "collaboration",    # Working together on projects/tasks
+    "communication",    # Email/Slack exchanges
+    "mentioned",        # One entity mentioned in context of another
+    "scheduled",        # Calendar/meeting relationship
+    "delegation",       # Task assignment/delegation
+    "reference",        # Document/content reference
+    "ownership",        # Owns/manages relationship
+    "membership",       # Part of team/project/group
+    "hierarchy",        # Reports to/manages
+    "social",           # Personal/social connection
+}
+
+# Sentiment score range for relationships (-1.0 to 1.0)
+MIN_RELATIONSHIP_SENTIMENT = -1.0
+MAX_RELATIONSHIP_SENTIMENT = 1.0
+NEUTRAL_SENTIMENT = 0.0
+
+# Cross-app entity linking thresholds
+CROSS_APP_LINKING_TITLE_SIMILARITY_THRESHOLD = 0.75
+CROSS_APP_LINKING_ENTITY_OVERLAP_THRESHOLD = 0.5
+CROSS_APP_LINKING_TIME_PROXIMITY_HOURS = 24  # Events within 24h may be related
+
+# =============================================================================
+# TEMPORAL CONSTANTS
+# =============================================================================
+
+# Granularity levels for TimeBlock nodes
+TIME_GRANULARITIES = {"hour", "day", "week", "month", "quarter", "year"}
+DEFAULT_TIME_GRANULARITY = "day"
+
+# TimeBlock ID format: "timeblock:{granularity}:{iso_date}"
+TIMEBLOCK_ID_PREFIX = "timeblock"
+
+# Maximum timeblocks to create in a single batch
+MAX_TIMEBLOCKS_PER_BATCH = 365
+
+# =============================================================================
+# CONFIDENCE THRESHOLDS
+# =============================================================================
+
+# Minimum confidence for entity resolution matches
+MIN_ENTITY_RESOLUTION_CONFIDENCE = 0.6
+
+# High confidence threshold (auto-merge entities)
+HIGH_CONFIDENCE_THRESHOLD = 0.9
+
+# Low confidence threshold (require user confirmation)
+LOW_CONFIDENCE_THRESHOLD = 0.5
 
 # Query Defaults
 DEFAULT_QUERY_LIMIT = 100

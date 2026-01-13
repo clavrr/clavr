@@ -1,0 +1,77 @@
+# Cross-domain context enrichment rules
+# Defines patterns and mappings for enriching context when transitioning between domains
+
+enrichment_rules:
+  email_to_calendar:
+    extract_patterns:
+      - meeting
+      - schedule
+      - appointment
+    context_mappings:
+      participants: attendees
+      email_subject: meeting_title
+  
+  calendar_to_task:
+    extract_patterns:
+      - action item
+      - follow up
+      - todo
+    context_mappings:
+      meeting_title: task_context
+      attendees: task_stakeholders
+  
+  email_to_task:
+    extract_patterns:
+      - action required
+      - please
+      - need to
+    context_mappings:
+      email_sender: task_requester
+      email_subject: task_description
+  
+  email_to_notion:
+    extract_patterns:
+      - document
+      - note
+      - page
+      - database
+    context_mappings:
+      email_subject: page_title
+      email_body: page_content
+  
+  calendar_to_notion:
+    extract_patterns:
+      - notes
+      - document
+      - agenda
+    context_mappings:
+      meeting_title: page_title
+      meeting_notes: page_content
+  
+  task_to_notion:
+    extract_patterns:
+      - document
+      - track
+      - log
+    context_mappings:
+      task_title: page_title
+      task_description: page_content
+  
+  notion_to_task:
+    extract_patterns:
+      - action item
+      - todo
+      - follow up
+    context_mappings:
+      page_title: task_title
+      page_content: task_description
+  
+  notion_to_calendar:
+    extract_patterns:
+      - meeting
+      - event
+      - schedule
+    context_mappings:
+      page_title: meeting_title
+      page_content: meeting_description
+

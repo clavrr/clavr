@@ -36,7 +36,8 @@ def get_db_context() -> Generator[Session, None, None]:
     try:
         yield db
         db.commit()
-    except Exception:
+    except Exception as e:
+        logger.debug(f"Transaction rolled back due to error: {e}")
         db.rollback()
         raise
     finally:
@@ -148,7 +149,8 @@ def transaction(db: Session):
     try:
         yield db
         db.commit()
-    except Exception:
+    except Exception as e:
+        logger.debug(f"Transaction rolled back: {e}")
         db.rollback()
         raise
 

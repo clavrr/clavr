@@ -139,11 +139,16 @@ class RecursiveTextChunker:
         # Initialize tokenizer
         if HAS_TIKTOKEN:
             try:
-                self.tokenizer = tiktoken.encoding_for_model(model)
+                # Handle Gemini models explicitly (use cl100k_base as approximation)
+                if model and "gemini" in model.lower():
+                    self.tokenizer = tiktoken.get_encoding("cl100k_base")
+                    logger.debug(f"Using cl100k_base encoding approximation for {model}")
+                else:
+                    self.tokenizer = tiktoken.encoding_for_model(model)
+                    
                 self.token_counter = self._count_tokens_tiktoken
-                logger.info(f"Using tiktoken with {model} encoding")
             except Exception as e:
-                logger.warning(f"Failed to load tiktoken for {model_name}: {e}. Using approximation.")
+                logger.debug(f"Failed to load tiktoken for {model_name}: {e}. Using approximation.")
                 self.tokenizer = None
                 self.token_counter = self._count_tokens_approximation
         else:

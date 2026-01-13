@@ -325,6 +325,34 @@ async def _apply_async_migrations(engine: AsyncEngine):
                     await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_user_writing_profiles_user_id ON user_writing_profiles(user_id)"))
                     await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_user_writing_profiles_needs_refresh ON user_writing_profiles(needs_refresh)"))
                 logger.info("[OK] Migration applied: created user_writing_profiles table")
+
+            # Check conversation_messages columns
+            if 'conversation_messages' in inspector:
+                existing_columns = await conn.run_sync(
+                    lambda sync_conn: [col['name'] for col in inspect(sync_conn).get_columns('conversation_messages')]
+                )
+                
+                # Add agent_plan
+                if 'agent_plan' not in existing_columns:
+                    logger.info("Adding missing column: conversation_messages.agent_plan")
+                    column_type = "TEXT" if is_sqlite else "JSONB" 
+                    # Note: SQLite JSON is just TEXT, PG is JSONB
+                    await conn.execute(text(f"ALTER TABLE conversation_messages ADD COLUMN agent_plan {column_type}"))
+                    logger.info("[OK] Migration applied: added agent_plan column")
+
+                # Add execution_metadata
+                if 'execution_metadata' not in existing_columns:
+                     logger.info("Adding missing column: conversation_messages.execution_metadata")
+                     column_type = "TEXT" if is_sqlite else "JSONB"
+                     await conn.execute(text(f"ALTER TABLE conversation_messages ADD COLUMN execution_metadata {column_type}"))
+                     logger.info("[OK] Migration applied: added execution_metadata column")
+
+                # Add active_agent
+                if 'active_agent' not in existing_columns:
+                     logger.info("Adding missing column: conversation_messages.active_agent")
+                     column_type = "VARCHAR(50)"
+                     await conn.execute(text(f"ALTER TABLE conversation_messages ADD COLUMN active_agent {column_type}"))
+                     logger.info("[OK] Migration applied: added active_agent column")
     
     except Exception as e:
         logger.warning(f"Async migration check failed (non-critical): {e}")

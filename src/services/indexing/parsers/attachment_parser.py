@@ -26,45 +26,39 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from .base import BaseParser, ParsedNode, Relationship, Entity
-from ....utils.logger import setup_logger
+from src.utils.logger import setup_logger
 
 logger = setup_logger(__name__)
 
-# Import Docling components (required)
-from docling.document_converter import DocumentConverter
-from docling.datamodel.base_models import InputFormat
-from docling.datamodel.document import ConversionResult
+# Import Docling components (optional)
+try:
+    from docling.document_converter import DocumentConverter
+    from docling.datamodel.base_models import InputFormat
+    from docling.datamodel.document import ConversionResult
+    DOCLING_AVAILABLE = True
+except ImportError:
+    DOCLING_AVAILABLE = False
 
 
 class AttachmentParser(BaseParser):
     """
     Parse general attachments into structured Document nodes using IBM Docling
-    
-    Features:
-    - Multi-format document parsing (PDF, DOCX, PPTX, XLSX, etc.)
-    - Layout-aware text extraction
-    - Table extraction
-    - Heading/section detection
-    - LLM-based content summarization
-    - Entity extraction (dates, companies, people)
-    - Relationship building to Email nodes
-    
-    Output: Document node with structured content and metadata
     """
     
     def __init__(self, llm_client=None):
         """
         Initialize attachment parser
-        
-        Args:
-            llm_client: Optional LLM for summarization and entity extraction
         """
         self.llm_client = llm_client
         self.use_llm = llm_client is not None
         
-        # Initialize Docling converter (required)
-        self.converter = DocumentConverter()
-        logger.info("Docling converter initialized for document parsing")
+        # Initialize Docling converter if available
+        if DOCLING_AVAILABLE:
+            self.converter = DocumentConverter()
+            logger.info("Docling converter initialized for document parsing")
+        else:
+            self.converter = None
+            logger.warning("Docling not available. Document parsing will be limited to text-only fallbacks.")
     
     async def parse(
         self, 
@@ -489,18 +483,8 @@ Respond ONLY with valid JSON, no other text."""
     def _parse_llm_structure_response(self, response) -> Dict[str, Any]:
         """Parse LLM JSON response into structured data"""
         try:
-            # Extract JSON from response
-            if hasattr(response, 'content'):
-                text = response.content
-            else:
-                text = str(response)
-            
-            # Clean markdown code blocks
-            json_match = re.search(r'```json\n(.*?)\n```', text, re.DOTALL)
-            if json_match:
-                text = json_match.group(1)
-            
-            data = json.loads(text)
+            # Use base class helper
+            data = self._parse_json_response(response)
             
             return {
                 'summary': data.get('summary', ''),
@@ -666,7 +650,7 @@ Respond ONLY with valid JSON, no other text."""
         # Document ATTACHED_TO Email
         if email_id:
             relationships.append(Relationship(
-                from_node=email_id,
+                from_node=self.generate_node_id('Email', email_id),
                 to_node=node_id,
                 rel_type='ATTACHED_TO',
                 properties={'filename': filename}
@@ -796,7 +780,7 @@ Respond ONLY with valid JSON, no other text."""
         
         if email_id:
             relationships.append(Relationship(
-                from_node=email_id,
+                from_node=self.generate_node_id('Email', email_id),
                 to_node=self.generate_node_id('Document', filename),
                 rel_type='ATTACHED_TO',
                 properties={'filename': filename}

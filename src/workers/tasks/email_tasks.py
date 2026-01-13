@@ -105,7 +105,7 @@ def sync_all_users_emails(self) -> Dict[str, Any]:
         with get_db_context() as db:
             # Get all active users
             users = db.query(User).filter(
-                User.indexing_status == 'active'
+                User.indexing_status.in_(['active', 'completed'])
             ).all()
             
             total_users = len(users)

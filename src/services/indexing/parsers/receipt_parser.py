@@ -18,43 +18,39 @@ import tempfile
 import os
 
 from .base import BaseParser, ParsedNode, Relationship, Entity
-from ....utils.logger import setup_logger
+from src.utils.logger import setup_logger
 
 logger = setup_logger(__name__)
 
-# Import Docling components (required)
-from docling.document_converter import DocumentConverter
-from docling.datamodel.base_models import InputFormat
-from docling.datamodel.document import ConversionResult
+# Import Docling components (optional)
+try:
+    from docling.document_converter import DocumentConverter
+    from docling.datamodel.base_models import InputFormat
+    from docling.datamodel.document import ConversionResult
+    DOCLING_AVAILABLE = True
+except ImportError:
+    DOCLING_AVAILABLE = False
 
 
 class ReceiptParser(BaseParser):
     """
     Parse receipts and invoices into structured data using IBM Docling
-    
-    Features:
-    - OCR for image receipts (JPEG, PNG)
-    - PDF text extraction with layout awareness
-    - LLM-based structured extraction
-    - Table detection for itemized receipts
-    - Merchant/company identification
-    
-    Output: Receipt node with structured financial data
     """
     
     def __init__(self, llm_client=None):
         """
         Initialize receipt parser
-        
-        Args:
-            llm_client: LLM for structured data extraction
         """
         self.llm_client = llm_client
         self.use_llm = llm_client is not None
         
-        # Initialize Docling converter (required)
-        self.converter = DocumentConverter()
-        logger.info("Docling converter initialized for receipt parsing")
+        # Initialize Docling converter if available
+        if DOCLING_AVAILABLE:
+            self.converter = DocumentConverter()
+            logger.info("Docling converter initialized for receipt parsing")
+        else:
+            self.converter = None
+            logger.warning("Docling not available. Receipt parsing will use limited regex fallback.")
     
     async def parse(self, attachment_data: bytes, filename: str, email_date: Optional[str] = None) -> ParsedNode:
         """
@@ -78,6 +74,10 @@ class ReceiptParser(BaseParser):
             
             # Step 2: Extract structured data using LLM
             receipt_data = await self._extract_receipt_structure(extracted_text, tables, filename)
+            
+            # Normalize date if present (fix malformed dates)
+            if receipt_data.get('date'):
+                receipt_data['date'] = self._normalize_date(receipt_data['date'])
             
             # Ensure date is set (use email_date as fallback if receipt parsing didn't extract date)
             if not receipt_data.get('date') and email_date:
@@ -217,7 +217,13 @@ class ReceiptParser(BaseParser):
         
         try:
             prompt = self._build_receipt_extraction_prompt(text, tables, filename)
-            response = await self.llm_client.ainvoke(prompt)
+            try:
+                # Use invoke in thread to avoid blocking loop if sync
+                import asyncio
+                response = await asyncio.to_thread(self.llm_client.invoke, prompt)
+            except AttributeError:
+                # Fallback if invoke missing (e.g. raw client)
+                response = await self.llm_client.generate_content_async(prompt)
             
             # Parse LLM response
             structured_data = self._parse_llm_response(response)
@@ -282,21 +288,12 @@ If you can't find a field with confidence, omit it or set to null.
 
 Respond ONLY with valid JSON, no other text."""
     
+    
     def _parse_llm_response(self, response) -> Dict[str, Any]:
         """Parse LLM JSON response into structured data"""
         try:
-            # Extract JSON from response
-            if hasattr(response, 'content'):
-                text = response.content
-            else:
-                text = str(response)
-            
-            # Clean markdown code blocks
-            json_match = re.search(r'```json\n(.*?)\n```', text, re.DOTALL)
-            if json_match:
-                text = json_match.group(1)
-            
-            data = json.loads(text)
+            # Use base class helper
+            data = self._parse_json_response(response)
             
             # Validate and clean data
             return {
@@ -328,6 +325,11 @@ Respond ONLY with valid JSON, no other text."""
             r'total[:\s]+\$?(\d+\.\d{2})',
             r'amount due[:\s]+\$?(\d+\.\d{2})',
             r'balance[:\s]+\$?(\d+\.\d{2})',
+            r'total cost[:\s]+\$?(\d+\.\d{2})',
+            r'amount paid[:\s]+\$?(\d+\.\d{2})',
+            r'total amount paid[:\s]+\$?(\d+\.\d{2})',
+            r'grand total[:\s]+\$?(\d+\.\d{2})',
+            r'charged[:\s]+\$?(\d+\.\d{2})',
         ]
         for pattern in total_patterns:
             match = re.search(pattern, text, re.IGNORECASE)
@@ -429,27 +431,17 @@ Respond ONLY with valid JSON, no other text."""
     def _create_empty_receipt_node(self, filename: str, email_date: Optional[str] = None) -> ParsedNode:
         """
         Create minimal receipt node when parsing fails
-        
-        Args:
-            filename: Receipt filename
-            email_date: Optional email date to use as fallback for receipt date
         """
         # Extract date from email_date if available, otherwise use today
         receipt_date = None
         if email_date:
             try:
-                # Try to parse email date format (e.g., "Sun, 3 Aug 2025 02:44:52 +0000")
+                # Try to parse email date format
                 from email.utils import parsedate_to_datetime
                 dt = parsedate_to_datetime(email_date)
                 receipt_date = dt.strftime('%Y-%m-%d')
             except Exception:
-                # Fallback: try to extract date from string or use today
-                try:
-                    # Try common date formats
-                    dt = datetime.strptime(email_date.split(',')[1].strip()[:11], '%d %b %Y')
-                    receipt_date = dt.strftime('%Y-%m-%d')
-                except Exception:
-                    receipt_date = datetime.now().strftime('%Y-%m-%d')
+                receipt_date = datetime.now().strftime('%Y-%m-%d')
         else:
             receipt_date = datetime.now().strftime('%Y-%m-%d')
         
@@ -484,6 +476,8 @@ Respond ONLY with valid JSON, no other text."""
             'location': None,
             'confidence': 0.0
         }
+    
+    # _normalize_date removed - using base class implementation
     
     def _is_image(self, filename: str) -> bool:
         """Check if file is an image"""

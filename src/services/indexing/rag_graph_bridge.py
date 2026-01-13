@@ -6,18 +6,18 @@ Knowledge Graph system (services/indexing/graph).
 
 This bridge:
 1. Adapts RAGEngine API to work with HybridIndexCoordinator
-2. Ensures proper data flow between vector (Pinecone/PostgreSQL) and graph stores
+2. Ensures proper data flow between vector (Qdrant/PostgreSQL) and graph stores
 3. Provides unified search interface combining both systems
 4. Maintains consistency between structured (graph) and unstructured (vector) data
 
-Vector Store: RAGEngine 
-Graph Store: Neo4j or NetworkX
+Vector Store: RAGEngine (Qdrant/PostgreSQL)
+Graph Store: ArangoDB or NetworkX
 """
 from typing import Dict, Any, List, Optional
 import asyncio
 
-from ...ai.rag import RAGEngine
-from ...utils.logger import setup_logger
+from src.ai.rag import RAGEngine
+from src.utils.logger import setup_logger
 from .graph.manager import KnowledgeGraphManager
 from .graph.schema import NodeType, RelationType
 from .parsers.base import ParsedNode
@@ -34,7 +34,7 @@ class RAGVectorAdapter:
     """
     Adapter to make RAGEngine compatible with HybridIndexCoordinator's async interface.
     
-    This adapter only supports RAGEngine (Pinecone/PostgreSQL backends).
+    This adapter only supports RAGEngine (Qdrant/PostgreSQL backends).
     No ChromaDB, no other vector stores.
     """
     
@@ -136,10 +136,10 @@ class RAGVectorAdapter:
         docs = []
         for i, doc in enumerate(documents):
             metadata = doc.get('metadata', {})
-            # Ensure neo4j_node_id exists (THE BRIDGE)
-            node_id = metadata.get('neo4j_node_id') or metadata.get('node_id', f"doc_{i}")
-            if 'neo4j_node_id' not in metadata and 'node_id' in metadata:
-                metadata['neo4j_node_id'] = metadata['node_id']  # Add bridge field if missing
+            # Ensure graph_node_id exists (THE BRIDGE)
+            node_id = metadata.get('graph_node_id') or metadata.get('node_id', f"doc_{i}")
+            if 'graph_node_id' not in metadata and 'node_id' in metadata:
+                metadata['graph_node_id'] = metadata['node_id']  # Add bridge field if missing
             
             docs.append({
                 'id': node_id,  # Use node_id as vector ID (or generate if missing)
@@ -217,43 +217,8 @@ class GraphRAGIntegrationService:
                     # Other validation errors - re-raise
                     raise
             except Exception as e:
-                # Check if it's a Neo4j connection error (including BrokenPipeError)
-                error_str = str(e)
-                error_type = type(e).__name__
-                
-                # Handle various connection errors (including DNS resolution failures)
-                is_connection_error = (
-                    "Connection refused" in error_str or 
-                    "ServiceUnavailable" in error_str or 
-                    "Couldn't connect" in error_str or
-                    "Cannot resolve address" in error_str or
-                    "nodename nor servname provided" in error_str.lower() or
-                    "gaierror" in error_type.lower() or
-                    "Broken pipe" in error_str.lower() or
-                    "BrokenPipeError" in error_type or
-                    "defunct connection" in error_str.lower() or
-                    "Failed to write" in error_str or
-                    "Failed to read" in error_str or
-                    "DNS" in error_str
-                )
-                
-                if is_connection_error:
-                    # Neo4j connection issue - gracefully fall back to vector-only
-                    # Use a shorter, less alarming message for DNS/connection errors
-                    if "Cannot resolve address" in error_str or "nodename nor servname" in error_str.lower():
-                        logger.warning(
-                            f"Neo4j database unavailable (DNS resolution failed). "
-                            f"Falling back to vector-only indexing for {node.node_id}. "
-                            f"Check NEO4J_URI environment variable or disable graph indexing if Neo4j is not needed."
-                        )
-                    else:
-                        logger.warning(
-                            f"Neo4j connection error for {node.node_id}: {error_type}. "
-                            f"Falling back to vector-only indexing."
-                        )
-                else:
-                    # Other graph errors - log but continue to vector indexing
-                    logger.error(f"Failed to index node {node.node_id} in graph: {e}")
+                # Log general graph error but continue to vector indexing
+                logger.error(f"Failed to index node {node.node_id} in graph: {e}")
                 graph_indexed = False
         
         # Index in vector store (for semantic search) - always try even if graph failed
@@ -292,7 +257,7 @@ class GraphRAGIntegrationService:
         Search with automatic context enrichment from graph.
         
         IMPROVED: Uses batch querying for better performance (Priority 1)
-        Matches architecture pattern: WHERE e.id IN $list_of_pinecone_ids
+        Matches architecture pattern: WHERE e.id IN $list_of_qdrant_ids
         
         Args:
             query: Natural language query
@@ -304,7 +269,7 @@ class GraphRAGIntegrationService:
         Returns:
             Search results with optional graph context
         """
-        # Step 1: Vector search for semantic matches (Pinecone)
+        # Step 1: Vector search for semantic matches (Qdrant)
         vector_results = await asyncio.to_thread(
             self.rag.search,
             query,
@@ -312,17 +277,17 @@ class GraphRAGIntegrationService:
             filters=filters
         )
         
-        # Step 2: Extract node_ids from Pinecone results (architecture pattern)
-        # Architecture: Extract neo4j_node_id from Pinecone metadata (THE BRIDGE)
+        # Step 2: Extract node_ids from Vector results (architecture pattern)
+        # Architecture: Extract graph_node_id from Vector metadata (THE BRIDGE)
         node_ids = []
         for result in vector_results:
             metadata = result.get('metadata', {})
-            # Extract neo4j_node_id (THE BRIDGE) or fallback to node_id
-            node_id = metadata.get('neo4j_node_id') or metadata.get('node_id')
+            # Extract graph_node_id (THE BRIDGE) or fallback to node_id
+            node_id = metadata.get('graph_node_id') or metadata.get('node_id')
             if node_id:
                 node_ids.append(node_id)
         
-        # Step 3: Batch query Neo4j for nodes and neighbors (IMPROVED: Priority 1)
+        # Step 3: Batch query Graph for nodes and neighbors (IMPROVED: Priority 1)
         nodes_map = {}
         neighbors_map = {}
         
@@ -332,8 +297,8 @@ class GraphRAGIntegrationService:
                 node_types_map = {}
                 for result in vector_results:
                     metadata = result.get('metadata', {})
-                    # Extract neo4j_node_id (THE BRIDGE) or fallback to node_id
-                    node_id = metadata.get('neo4j_node_id') or metadata.get('node_id')
+                    # Extract graph_node_id (THE BRIDGE) or fallback to node_id
+                    node_id = metadata.get('graph_node_id') or metadata.get('node_id')
                     node_type_str = metadata.get('node_type')
                     if node_id and node_type_str:
                         try:
@@ -410,9 +375,9 @@ class GraphRAGIntegrationService:
             }
             
             # Get graph node ID from metadata (architecture pattern)
-            # Architecture: Extract neo4j_node_id from Pinecone metadata (THE BRIDGE)
+            # Architecture: Extract graph_node_id from Qdrant metadata (THE BRIDGE)
             metadata = result.get('metadata', {})
-            node_id = metadata.get('neo4j_node_id') or metadata.get('node_id')
+            node_id = metadata.get('graph_node_id') or metadata.get('node_id')
             
             if include_graph_context and node_id:
                 # Use batch-queried data (Priority 1 improvement)
@@ -484,6 +449,252 @@ class GraphRAGIntegrationService:
         
         return related_content
     
+    async def search_with_multi_hop_context(
+        self,
+        query: str,
+        max_hops: int = 2,
+        max_results: int = DEFAULT_MAX_RESULTS,
+        filters: Optional[Dict[str, Any]] = None,
+        relationship_weights: Optional[Dict[str, float]] = None
+    ) -> Dict[str, Any]:
+        """
+        Multi-hop context retrieval combining vector search with graph traversal.
+        
+        Process:
+        1. Perform initial vector search for semantic matches
+        2. For each match, traverse graph relationships up to N hops
+        3. Collect context from related nodes
+        4. Re-rank results combining semantic similarity + graph proximity
+        
+        This enables queries like:
+        - "What were we discussing about Project X with Sarah?"
+        - "Show me all documents related to the budget meeting"
+        - "What action items came from conversations with the marketing team?"
+        
+        Args:
+            query: Natural language query
+            max_hops: Maximum graph traversal depth (default: 2)
+            max_results: Maximum final results
+            filters: Optional metadata filters for vector search
+            relationship_weights: Custom weights for relationship types in scoring
+            
+        Returns:
+            Enhanced results with multi-hop context and combined scoring
+        """
+        from .graph.schema import RelationType, NodeType
+        
+        # Default relationship weights for scoring (higher = more relevant)
+        default_weights = {
+            RelationType.SAME_AS.value: 1.0,  # Identity relations are strongest
+            RelationType.ABOUT.value: 0.9,
+            RelationType.CONTAINS.value: 0.8,
+            RelationType.PART_OF.value: 0.8,
+            RelationType.ASSIGNED_TO.value: 0.7,
+            RelationType.OCCURRED_DURING.value: 0.7,
+            RelationType.MENTIONS.value: 0.6,
+            RelationType.FROM.value: 0.5,
+            RelationType.TO.value: 0.5,
+        }
+        weights = relationship_weights or default_weights
+        
+        # Step 1: Initial vector search
+        vector_results = await asyncio.to_thread(
+            self.rag.search,
+            query,
+            k=max_results * 2,  # Get more initially for re-ranking
+            filters=filters
+        )
+        
+        # Step 2: Extract seed node IDs
+        seed_nodes = []
+        for result in vector_results:
+            metadata = result.get('metadata', {})
+            node_id = metadata.get('graph_node_id') or metadata.get('node_id')
+            if node_id:
+                seed_nodes.append({
+                    'id': node_id,
+                    'score': result.get('confidence', result.get('score', 0.5)),
+                    'content': result.get('content', ''),
+                    'metadata': metadata,
+                    'hop': 0  # Direct match
+                })
+        
+        # Step 3: Multi-hop graph expansion
+        discovered_nodes = {}  # node_id -> best path info
+        for seed in seed_nodes:
+            discovered_nodes[seed['id']] = {
+                **seed,
+                'path': [],
+                'graph_score': 1.0  # Direct matches get full score
+            }
+        
+        # BFS expansion for additional hops
+        current_frontier = [s['id'] for s in seed_nodes]
+        for hop in range(1, max_hops + 1):
+            next_frontier = []
+            
+            for node_id in current_frontier:
+                if node_id not in discovered_nodes:
+                    continue
+                    
+                parent_info = discovered_nodes[node_id]
+                
+                try:
+                    neighbors = await self.graph.get_neighbors(
+                        node_id,
+                        direction='both'
+                    )
+                    
+                    for neighbor_id, rel_data in neighbors:
+                        rel_type = rel_data.get('type', rel_data.get('rel_type', ''))
+                        rel_weight = weights.get(rel_type, 0.4)
+                        
+                        # Calculate graph proximity score (decays with hops)
+                        hop_decay = 0.7 ** hop  # 0.7^1 = 0.7, 0.7^2 = 0.49, etc.
+                        graph_score = rel_weight * hop_decay
+                        
+                        if neighbor_id not in discovered_nodes:
+                            # Get neighbor node data
+                            neighbor_node = await self.graph.get_node(neighbor_id)
+                            
+                            if neighbor_node:
+                                discovered_nodes[neighbor_id] = {
+                                    'id': neighbor_id,
+                                    'score': 0,  # No direct vector match
+                                    'content': self._extract_node_content(neighbor_node),
+                                    'metadata': neighbor_node,
+                                    'hop': hop,
+                                    'path': parent_info.get('path', []) + [{
+                                        'from': node_id,
+                                        'rel': rel_type,
+                                        'to': neighbor_id
+                                    }],
+                                    'graph_score': graph_score
+                                }
+                                next_frontier.append(neighbor_id)
+                        else:
+                            # Update if this path is better
+                            existing = discovered_nodes[neighbor_id]
+                            if graph_score > existing.get('graph_score', 0) and hop < existing.get('hop', max_hops):
+                                existing['graph_score'] = graph_score
+                                existing['hop'] = hop
+                                existing['path'] = parent_info.get('path', []) + [{
+                                    'from': node_id,
+                                    'rel': rel_type,
+                                    'to': neighbor_id
+                                }]
+                                
+                except Exception as e:
+                    logger.debug(f"Error getting neighbors for {node_id}: {e}")
+            
+            current_frontier = next_frontier
+        
+        # Step 4: Re-rank by combined score
+        all_results = list(discovered_nodes.values())
+        
+        for result in all_results:
+            # Combined score: semantic similarity + graph proximity
+            semantic_score = result.get('score', 0) * 0.6  # 60% weight to semantic
+            graph_score = result.get('graph_score', 0) * 0.4  # 40% weight to graph
+            result['combined_score'] = semantic_score + graph_score
+        
+        # Sort by combined score
+        all_results.sort(key=lambda x: x.get('combined_score', 0), reverse=True)
+        
+        # Step 5: Format final results
+        final_results = []
+        for result in all_results[:max_results]:
+            final_results.append({
+                'node_id': result['id'],
+                'content': result.get('content', ''),
+                'metadata': result.get('metadata', {}),
+                'scores': {
+                    'semantic': result.get('score', 0),
+                    'graph': result.get('graph_score', 0),
+                    'combined': result.get('combined_score', 0),
+                },
+                'hop_distance': result.get('hop', 0),
+                'path': result.get('path', []),
+            })
+        
+        return {
+            'results': final_results,
+            'total': len(final_results),
+            'query': query,
+            'max_hops': max_hops,
+            'seed_count': len(seed_nodes),
+            'expanded_count': len(discovered_nodes),
+        }
+    
+    async def search_for_agent(
+        self,
+        query: str,
+        task_type: str = "general",
+        user_id: Optional[int] = None,
+        limit: int = 5
+    ) -> Dict[str, Any]:
+        """
+        Optimized search interface for agents.
+        
+        Automatically tunes parameters based on task type:
+        - 'research': High depth (3 hops), explores CONNECTED concepts
+        - 'fact_check': Low depth (1 hop), focuses on EXACT matches
+        - 'planning': Med depth (2 hops), prioritizes TEMPORAL links
+        - 'general': Default (2 hops)
+        
+        Args:
+            query: The agent's query
+            task_type: The type of task (research, fact_check, planning, general)
+            user_id: User context
+            limit: Max results
+            
+        Returns:
+            Search results formatted for agent consumption
+        """
+        # Tune parameters based on task
+        if task_type == 'research':
+            max_hops = 3
+            # Boost topic/related links
+            rel_weights = {'RELATED_TO': 0.8, 'DISCUSSES': 0.9, 'MENTIONS': 0.6}
+            
+        elif task_type == 'fact_check':
+            max_hops = 1
+            # Focus on precision
+            rel_weights = {'SAME_AS': 1.0, 'HAS_ATTACHMENT': 0.9}
+            
+        elif task_type == 'planning':
+            max_hops = 2
+            # Boost temporal/dependency links
+            rel_weights = {
+                'PRECEDED': 0.9, 'FOLLOWS': 0.9, 'BLOCKED_BY': 0.9, 
+                'OCCURRED_DURING': 0.8, 'SCHEDULED_FOR': 0.8
+            }
+        else:
+            max_hops = 2
+            rel_weights = None
+            
+        filters = {'user_id': str(user_id)} if user_id else None
+        
+        return await self.search_with_multi_hop_context(
+            query=query,
+            max_hops=max_hops,
+            max_results=limit,
+            filters=filters,
+            relationship_weights=rel_weights
+        )
+    
+    def _extract_node_content(self, node: Dict[str, Any]) -> str:
+        """Extract human-readable content from a node for display."""
+        props = node.get('properties', node)
+        
+        # Try common content fields in order of preference
+        for field in ['content', 'body', 'text', 'description', 'subject', 'name', 'title']:
+            if field in props and props[field]:
+                content = str(props[field])
+                return content[:500] if len(content) > 500 else content
+        
+        return str(props.get('id', 'Unknown'))
+    
     async def ensure_consistency(self, node_id: str) -> bool:
         """
         Ensure a node is consistent between graph and vector stores.
@@ -513,7 +724,7 @@ class GraphRAGIntegrationService:
                     node_id,
                     searchable_text,
                     {
-                        'neo4j_node_id': node_id,  # ← THE BRIDGE : Links to graph 
+                        'graph_node_id': node_id,  # ← THE BRIDGE : Links to graph 
                         'node_id': node_id,  # Also keep for backward compatibility
                         'node_type': graph_node.get('type'),
                         **graph_node.get('properties', {})
@@ -582,18 +793,35 @@ class GraphRAGIntegrationService:
         """
         Index node's searchable text in vector store with chunking.
         
-        This PRECISELY matches the Pinecone GraphRAG architecture pattern:
-        Step 1: Create node in Neo4j → Get unique Node ID (node.node_id)
-        Step 2: Store in Pinecone → Include neo4j_node_id in metadata (THE BRIDGE)
+        This PRECISELY matches the Qdrant GraphRAG architecture pattern:
+        Step 1: Create node in Graph → Get unique Node ID (node.node_id)
+        Step 2: Store in Qdrant → Include graph_node_id in metadata (THE BRIDGE)
         
         Architecture Pattern:
-        - Raw Data → Chunking → Embedding → Pinecone
-        - Each chunk gets the neo4j_node_id (Neo4j Node ID) in metadata for linking back to Neo4j
+        - Raw Data → Chunking → Embedding → Qdrant
+        - Each chunk gets the graph_node_id (Graph Node ID) in metadata for linking back to Graph
+        
+        OPTIMIZATION: Skips indexing if document already exists in vector store.
+        This prevents duplicate writes and saves Qdrant write units.
         """
-        # CRITICAL: Include both node_id and neo4j_node_id for clarity and architecture alignment
-        # The architecture document shows 'neo4j_node_id' as the bridge field
+        # Check if already indexed (skip if first chunk exists)
+        first_chunk_id = f"{node.node_id}_chunk_0"
+        try:
+            already_exists = await asyncio.to_thread(
+                self.rag.vector_store.document_exists,
+                first_chunk_id
+            )
+            if already_exists:
+                logger.debug(f"Skipping vector indexing for {node.node_id} (already indexed)")
+                return
+        except Exception as e:
+            # If check fails, proceed with indexing (safer to index than miss)
+            logger.debug(f"Could not check if {node.node_id} exists, proceeding with indexing: {e}")
+        
+        # CRITICAL: Include both node_id and graph_node_id for clarity and architecture alignment
+        # The architecture document shows 'graph_node_id' as the bridge field
         metadata = {
-            'neo4j_node_id': node.node_id,  # ← THE BRIDGE: Neo4j Node ID (matches architecture exactly)
+            'graph_node_id': node.node_id,  # ← THE BRIDGE: Graph Node ID (matches architecture exactly)
             'node_id': node.node_id,  # ← Also keep node_id for backward compatibility
             'node_type': node.node_type,
             'doc_type': node.node_type.lower(),
@@ -602,26 +830,64 @@ class GraphRAGIntegrationService:
         }
         
         # Use chunked indexing 
-        # Each chunk will have the neo4j_node_id for Neo4j graph traversal
+        # Each chunk will have the graph_node_id for Graph traversal
         # Vector IDs are created as: {node_id}_chunk_{i} (matches pattern: vec-{node_id})
         await asyncio.to_thread(
             self.rag.index_document_chunked,  # WITH chunking
             node.node_id,  # Base doc_id (used to create chunk IDs: {node_id}_chunk_0, etc.)
             node.searchable_text,
-            metadata  # Propagated to ALL chunks - includes neo4j_node_id (THE BRIDGE)
+            metadata  # Propagated to ALL chunks - includes graph_node_id (THE BRIDGE)
         )
+        logger.info(f"Added {len(node.searchable_text.split()) // 100 + 1} documents to Qdrant")
     
     def _extract_searchable_metadata(self, node: ParsedNode) -> Dict[str, Any]:
-        """Extract relevant metadata for vector search."""
+        """Extract relevant metadata for vector search.
+        
+        CRITICAL: This metadata is used by EmailService.search_emails() to filter
+        index results. Missing fields cause filtering to fail, leading to fallback
+        to Gmail API (slower).
+        
+        Email-critical fields:
+        - email_id: Required for deduplication and lookup
+        - sender/from: Required for sender filtering
+        - subject: Required for subject filtering
+        - timestamp/date: Required for date range filtering
+        - is_unread: Required for unread filtering (most common issue!)
+        - labels: Required for folder/label filtering
+        - thread_id: Required for threading
+        - has_attachments: Required for attachment filtering
+        - folder: Required for folder filtering
+        """
         metadata = {}
         
-        # Common fields
-        for field in ['subject', 'sender', 'date', 'filename', 'merchant', 'total']:
+        # Email-specific fields (CRITICAL for filtering in EmailService)
+        email_fields = [
+            'subject', 'sender', 'from', 'sender_email', 'sender_name',
+            'date', 'timestamp', 'email_id', 'thread_id',
+            'is_unread', 'is_important', 'is_starred',
+            'has_attachments', 'folder', 'labels'
+        ]
+        
+        for field in email_fields:
+            if field in node.properties:
+                value = node.properties[field]
+                # Handle special cases
+                if field == 'labels' and isinstance(value, list):
+                    # Store as comma-separated for easier filtering
+                    metadata[field] = value  # Keep as list for proper filtering
+                elif value is not None:  # Include False values (e.g., is_unread=False)
+                    metadata[field] = value
+        
+        # Document/receipt fields (kept for backward compatibility)
+        document_fields = ['filename', 'merchant', 'total', 'amount', 'receipt_date']
+        for field in document_fields:
             if field in node.properties:
                 metadata[field] = node.properties[field]
         
-        # User ID for filtering
+        # User ID for filtering (always include)
         if 'user_id' in node.properties:
-            metadata['user_id'] = str(node.properties['user_id'])
+            metadata['user_id'] = node.properties['user_id']
+        else:
+            logger.warning(f"Node {node.node_id} MISSING user_id in properties! Keys: {list(node.properties.keys())}")
         
         return metadata

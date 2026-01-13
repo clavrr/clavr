@@ -38,7 +38,7 @@ async def rate_limit_exceeded_handler(request: Request, exc: RateLimitExceeded) 
     # Log to audit logs
     db = next(get_db())
     try:
-        log_auth_event(
+        await log_auth_event(
             db=db,
             event_type=AuditEventType.RATE_LIMIT_EXCEEDED,
             user_id=user_id,
@@ -47,7 +47,7 @@ async def rate_limit_exceeded_handler(request: Request, exc: RateLimitExceeded) 
             endpoint=request.url.path,
             limit=str(exc.detail)
         )
-        db.commit()
+        # Note: log_auth_event handles its own commit
     except Exception as e:
         logger.error(f"Failed to log rate limit event: {e}")
     finally:

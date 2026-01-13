@@ -176,141 +176,7 @@ def _create_index_safe(connection, index_sql: str, is_sqlite: bool):
         connection.execute(text(index_sql))
 
 
-def _apply_migrations(engine):
-    """
-    Apply database migrations for missing columns.
-    Handles schema updates when models are modified.
-    """
-    inspector = inspect(engine)
-    connection = engine.connect()
-    is_sqlite = DATABASE_URL.startswith('sqlite')
-    
-    try:
-        # Check if users table exists
-        if 'users' in inspector.get_table_names():
-            existing_columns = [col['name'] for col in inspector.get_columns('users')]
-            
-            # Check and add last_email_synced_at if missing
-            if 'last_email_synced_at' not in existing_columns:
-                logger.info("Adding missing column: users.last_email_synced_at")
-                column_type = "DATETIME" if is_sqlite else "TIMESTAMP"
-                connection.execute(text(f"ALTER TABLE users ADD COLUMN last_email_synced_at {column_type}"))
-                _create_index_safe(
-                    connection,
-                    "CREATE INDEX IF NOT EXISTS idx_users_last_sync ON users(last_email_synced_at)",
-                    is_sqlite
-                )
-                connection.commit()
-                logger.info("[OK] Migration applied: added last_email_synced_at column")
-                # Refresh columns list after adding column
-                existing_columns = [col['name'] for col in inspector.get_columns('users')]
-            
-            # Check and add is_admin if missing
-            if 'is_admin' not in existing_columns:
-                logger.info("Adding missing column: users.is_admin")
-                default_value = "0" if is_sqlite else "FALSE"
-                connection.execute(text(f"ALTER TABLE users ADD COLUMN is_admin BOOLEAN DEFAULT {default_value} NOT NULL"))
-                _create_index_safe(
-                    connection,
-                    "CREATE INDEX IF NOT EXISTS idx_users_is_admin ON users(is_admin)",
-                    is_sqlite
-                )
-                connection.commit()
-                logger.info("[OK] Migration applied: added is_admin column")
-            
-            # Check if user_settings table exists
-            if 'user_settings' not in inspector.get_table_names():
-                logger.info("Creating user_settings table")
-                if is_sqlite:
-                    create_table_sql = """
-                        CREATE TABLE user_settings (
-                            id INTEGER PRIMARY KEY AUTOINCREMENT,
-                            user_id INTEGER NOT NULL UNIQUE,
-                            email_notifications BOOLEAN NOT NULL DEFAULT 0,
-                            push_notifications BOOLEAN NOT NULL DEFAULT 0,
-                            dark_mode BOOLEAN NOT NULL DEFAULT 1,
-                            language VARCHAR(10) NOT NULL DEFAULT 'en',
-                            region VARCHAR(10) NOT NULL DEFAULT 'US',
-                            created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                            updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
-                        )
-                    """
-                else:
-                    create_table_sql = """
-                        CREATE TABLE user_settings (
-                            id SERIAL PRIMARY KEY,
-                            user_id INTEGER NOT NULL UNIQUE,
-                            email_notifications BOOLEAN NOT NULL DEFAULT FALSE,
-                            push_notifications BOOLEAN NOT NULL DEFAULT FALSE,
-                            dark_mode BOOLEAN NOT NULL DEFAULT TRUE,
-                            language VARCHAR(10) NOT NULL DEFAULT 'en',
-                            region VARCHAR(10) NOT NULL DEFAULT 'US',
-                            created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                            updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                            CONSTRAINT fk_user_settings_user FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
-                        )
-                    """
-                connection.execute(text(create_table_sql))
-                _create_index_safe(
-                    connection,
-                    "CREATE INDEX IF NOT EXISTS idx_user_settings_user_id ON user_settings(user_id)",
-                    is_sqlite
-                )
-                connection.commit()
-                logger.info("[OK] Migration applied: created user_settings table")
-            
-            # Check if user_writing_profiles table exists
-            if 'user_writing_profiles' not in inspector.get_table_names():
-                logger.info("Creating user_writing_profiles table")
-                if is_sqlite:
-                    create_table_sql = """
-                        CREATE TABLE user_writing_profiles (
-                            id INTEGER PRIMARY KEY AUTOINCREMENT,
-                            user_id INTEGER NOT NULL UNIQUE,
-                            profile_data TEXT NOT NULL,
-                            sample_size INTEGER DEFAULT 0,
-                            created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                            updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                            last_rebuilt_at TIMESTAMP,
-                            confidence_score REAL,
-                            needs_refresh BOOLEAN DEFAULT 0,
-                            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
-                        )
-                    """
-                else:
-                    create_table_sql = """
-                        CREATE TABLE user_writing_profiles (
-                            id SERIAL PRIMARY KEY,
-                            user_id INTEGER NOT NULL UNIQUE,
-                            profile_data JSONB NOT NULL,
-                            sample_size INTEGER DEFAULT 0,
-                            created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                            updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                            last_rebuilt_at TIMESTAMP,
-                            confidence_score DOUBLE PRECISION,
-                            needs_refresh BOOLEAN DEFAULT FALSE,
-                            CONSTRAINT fk_user_writing_profiles_user FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
-                        )
-                    """
-                connection.execute(text(create_table_sql))
-                _create_index_safe(
-                    connection,
-                    "CREATE INDEX IF NOT EXISTS idx_user_writing_profiles_user_id ON user_writing_profiles(user_id)",
-                    is_sqlite
-                )
-                _create_index_safe(
-                    connection,
-                    "CREATE INDEX IF NOT EXISTS idx_user_writing_profiles_needs_refresh ON user_writing_profiles(needs_refresh)",
-                    is_sqlite
-                )
-                connection.commit()
-                logger.info("[OK] Migration applied: created user_writing_profiles table")
-    except Exception as e:
-        logger.warning(f"Migration check failed (non-critical): {e}")
-        connection.rollback()
-    finally:
-        connection.close()
+
 
 
 def init_db():
@@ -329,8 +195,7 @@ def init_db():
         Base.metadata.create_all(bind=engine)
         logger.info("[OK] Database tables created successfully")
         
-        # Apply any pending migrations
-        _apply_migrations(engine)
+
     except Exception as e:
         logger.error(f"[ERROR] Failed to create database tables: {e}", exc_info=True)
         raise

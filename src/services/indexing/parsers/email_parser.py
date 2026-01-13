@@ -12,9 +12,10 @@ import json
 import re
 from typing import Dict, Any, List, Optional
 from datetime import datetime
+import base64
 
-from .base import BaseParser, ParsedNode, Relationship, Entity, ExtractedIntents
-from ....utils.logger import setup_logger
+from .base import BaseParser, ParsedNode, Relationship, Entity, ExtractedIntents, LeadInfo
+from src.utils.logger import setup_logger
 
 logger = setup_logger(__name__)
 
@@ -69,18 +70,24 @@ class EmailParser(BaseParser):
             intents_dict = intents.to_dict() if intents else {}
             intents_str = json.dumps(intents_dict) if intents_dict else "{}"
             
+
+            node_props = {
+                    **metadata,
+                    'attachment_info': attachment_info_str,  # JSON string
+                    'has_action_items': len(intents.action_items) > 0 if intents else False,
+                    'has_questions': len(intents.questions) > 0 if intents else False,
+                    'financial_info': json.dumps(intents.financial_info) if intents and intents.financial_info else None,
+                    'is_receipt': intents.financial_info.get('is_receipt', False) if intents and intents.financial_info else False,
+                    'total_amount': intents.financial_info.get('amount') if intents and intents.financial_info else None,
+            }
+            
             node = ParsedNode(
                 node_id=self.generate_node_id('Email', email_data.get('id', '')),
                 node_type='Email',
-                properties={
-                    **metadata,
-                    'attachment_info': attachment_info_str,  # JSON string
-                    'intents': intents_str,  # JSON string
-                    'has_action_items': len(intents.action_items) > 0 if intents else False,
-                    'has_questions': len(intents.questions) > 0 if intents else False,
-                },
+                properties=node_props,
                 relationships=relationships,
-                searchable_text=self._build_searchable_text(metadata, email_data)
+                # Pass financial info to _build_searchable_text via metadata or just build it here
+                searchable_text=self._build_searchable_text({**metadata, 'financial_info': node_props.get('financial_info')}, email_data)
             )
             
             logger.debug(f"Parsed email: {node.node_id} with {len(relationships)} relationships")
@@ -92,13 +99,44 @@ class EmailParser(BaseParser):
     
     def _extract_metadata(self, email_data: Dict[str, Any]) -> Dict[str, Any]:
         """Extract structured metadata from email"""
-        # Extract email address from sender string (handles "Name <email@domain.com>" format)
+        # Flatten headers if present (Handle raw Gmail API structure)
+        if 'payload' in email_data and 'headers' in email_data['payload']:
+            headers = {h['name'].lower(): h['value'] for h in email_data['payload']['headers']}
+            
+            # Map headers to top-level keys if missing
+            if not email_data.get('sender'):
+                email_data['sender'] = headers.get('from', '')
+            if not email_data.get('subject'):
+                email_data['subject'] = headers.get('subject', '')
+            if not email_data.get('date'):
+                email_data['date'] = headers.get('date', '')
+            if not email_data.get('to'):
+                email_data['to'] = headers.get('to', '')
+            if not email_data.get('cc'):
+                email_data['cc'] = headers.get('cc', '')
+            
+            # Handle Body extraction from payload
+            if 'body' not in email_data or not email_data['body']:
+                # Recursively extract body from parts
+                email_data['body'] = self._extract_body_from_payload(email_data['payload'])
+
+        # Extract both email and display name from sender string
+        # e.g., "Alvaro <santana@whitman.edu>" -> email: santana@whitman.edu, name: Alvaro
         sender_raw = email_data.get('sender', '')
         sender_email = self._extract_email_address(sender_raw)
+        sender_name = self._extract_sender_name(sender_raw)
         
         # Parse date - extract date only (YYYY-MM-DD format for schema validation)
         date_raw = email_data.get('date', '')
+        if not date_raw and email_data.get('internalDate'):
+            try:
+                ms = int(email_data.get('internalDate'))
+                date_raw = datetime.fromtimestamp(ms/1000.0).isoformat()
+            except: pass
+            
         parsed_date = self._parse_date_to_date_only(date_raw)
+        if not parsed_date:
+            parsed_date = datetime.now().strftime('%Y-%m-%d')
         
         # Extract body (required property) - truncate if too long, handle empty
         body = email_data.get('body', '') or ''
@@ -124,8 +162,12 @@ class EmailParser(BaseParser):
             logger.warning(f"Body still exceeded limit after truncation, hard-capped to {MAX_BODY_LENGTH}")
         
         return {
-            'subject': self.clean_text(email_data.get('subject', '')),
-            'sender': sender_email,  # Use extracted email, not full string
+            'subject': self.clean_text(email_data.get('subject', '')) or "[No Subject]",
+            # Store full sender string for search matching (e.g., "Alvaro <santana@whitman.edu>")
+            # This allows searching by name "Alvaro" to find emails from santana@whitman.edu
+            'sender': (sender_raw.strip() if sender_raw else sender_email) or "unknown@sender.com",
+            'sender_email': sender_email or "unknown@sender.com",  # Clean email for filtering
+            'sender_name': sender_name or "Unknown Sender",  # Display name for search
             'date': parsed_date,  # Use date-only format (YYYY-MM-DD) for schema
             'body': body_cleaned,  # Required property (truncated if needed)
             # Optional metadata (not in schema but useful)
@@ -148,15 +190,53 @@ class EmailParser(BaseParser):
         if not sender_string:
             return ''
         
-        # Pattern to match email address
+        try:
+            from email.utils import parseaddr
+            name, email = parseaddr(sender_string)
+            if email:
+                return email.lower().strip()
+        except ImportError:
+            # Fallback to simple clean if module missing (unlikely)
+            pass
+            
+        # Fallback to regex if parseaddr fails or returns empty
         email_pattern = r'([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})'
         match = re.search(email_pattern, sender_string)
         
         if match:
             return match.group(1).lower().strip()
         
-        # If no match, return original (might already be just an email)
         return sender_string.strip()
+    
+    def _extract_sender_name(self, sender_string: str) -> str:
+        """Extract display name from sender string like 'Alvaro <santana@whitman.edu>'
+        
+        Returns the name part, or empty string if not found.
+        """
+        if not sender_string:
+            return ''
+        
+        try:
+            from email.utils import parseaddr
+            name, email = parseaddr(sender_string)
+            if name:
+                return name.strip()
+        except ImportError:
+            pass
+        
+        # Fallback: extract name before < if present
+        if '<' in sender_string:
+            name_part = sender_string.split('<')[0].strip()
+            # Remove quotes if present
+            name_part = name_part.strip('"').strip("'").strip()
+            if name_part:
+                return name_part
+        
+        # If no angle brackets, check if it's just a name (no @ sign)
+        if '@' not in sender_string:
+            return sender_string.strip()
+        
+        return ''
     
     def _extract_emails_from_string(self, email_string: str) -> List[str]:
         """Extract email addresses from comma-separated string"""
@@ -228,8 +308,18 @@ class EmailParser(BaseParser):
         
         try:
             prompt = self._build_intent_extraction_prompt(body, subject)
-            response = await self.llm_client.ainvoke(prompt)
+            try:
+                # Use invoke in thread to avoid blocking loop if sync
+                import asyncio
+                response = await asyncio.to_thread(self.llm_client.invoke, prompt)
+            except AttributeError:
+                 # Fallback if invoke missing
+                response = await self.llm_client.generate_content_async(prompt)
             
+            # Log raw response for debugging
+            content = response.content if hasattr(response, 'content') else str(response)
+            logger.info(f"LLM Intent Extraction Response: {content[:500]}...")
+
             # Parse LLM response
             intents = self._parse_llm_response(response)
             return intents
@@ -254,7 +344,17 @@ Extract the following in JSON format:
         {{"entity_type": "person|date|company|topic|location", "value": "entity value", "confidence": 0.0-1.0}}
     ],
     "topics": ["main topics discussed"],
-    "questions": ["questions asked in the email"]
+    "questions": ["questions asked in the email"],
+    "leads": [
+        {{"name": "lead name/company", "interest_level": 0.0-1.0, "potential_value": 0.0, "topic": "area of interest", "notes": "context"}}
+    ],
+    "financial_info": {{
+        "is_receipt": true/false,
+        "amount": 0.0,
+        "currency": "USD",
+        "merchant": "merchant name",
+        "date": "YYYY-MM-DD"
+    }}
 }}
 
 Focus on:
@@ -263,6 +363,9 @@ Focus on:
 - Entities: Who, what, when, where mentioned
 - Topics: Key subjects (not generic words)
 - Questions: Actual questions asked
+- Leads: Identify if this represents a NEW business opportunity.
+- Financial Info: If this matches a receipt/invoice, extract the TOTAL amount (e.g. $12.00 -> 12.00), merchant, and date.
+  If multiple amounts, look for "Total", "Amount Paid", or "Grand Total".
 
 Respond ONLY with the JSON, no other text."""
     
@@ -292,12 +395,26 @@ Respond ONLY with the JSON, no other text."""
                 for e in data.get('entities', [])
             ]
             
+            # Convert leads to LeadInfo objects
+            leads = [
+                LeadInfo(
+                    name=l.get('name', ''),
+                    interest_level=l.get('interest_level', 0.5),
+                    potential_value=l.get('potential_value'),
+                    topic=l.get('topic'),
+                    notes=l.get('notes')
+                )
+                for l in data.get('leads', [])
+            ]
+            
             return ExtractedIntents(
                 action_items=data.get('action_items', []),
                 intents=data.get('intents', []),
                 entities=entities,
                 topics=data.get('topics', []),
-                questions=data.get('questions', [])
+                questions=data.get('questions', []),
+                leads=leads,
+                financial_info=data.get('financial_info')
             )
             
         except Exception as e:
@@ -345,12 +462,14 @@ Respond ONLY with the JSON, no other text."""
         """
         relationships = []
         
+        email_node_id = self.generate_node_id('Email', email_data.get('id', ''))
+
         # FROM relationship - extract email from sender string
         sender_raw = email_data.get('sender', '')
         sender_email = self._extract_email_address(sender_raw)
         if sender_email:
             relationships.append(Relationship(
-                from_node=self.generate_node_id('Email', email_data.get('id', '')),
+                from_node=email_node_id,
                 to_node=self.generate_node_id('Contact', sender_email),
                 rel_type='FROM'
             ))
@@ -361,7 +480,7 @@ Respond ONLY with the JSON, no other text."""
         for recipient_email in recipients:
             if recipient_email:
                 relationships.append(Relationship(
-                    from_node=self.generate_node_id('Email', email_data.get('id', '')),
+                    from_node=email_node_id,
                     to_node=self.generate_node_id('Contact', recipient_email),
                     rel_type='TO'
                 ))
@@ -381,11 +500,46 @@ Respond ONLY with the JSON, no other text."""
         if intents and intents.topics:
             for topic in intents.topics[:5]:  # Limit to top 5 topics
                 relationships.append(Relationship(
-                    from_node=self.generate_node_id('Email', email_data.get('id', '')),
+                    from_node=email_node_id,
                     to_node=self.generate_node_id('Topic', topic.lower()),
                     rel_type='DISCUSSES'
                 ))
         
+        # LEAD relationships
+        if intents and intents.leads:
+            for lead in intents.leads:
+                # Generate a unique ID for the lead (based on name/company or sender)
+                lead_key = f"{lead.name or sender_email}"
+                lead_node_id = self.generate_node_id('Lead', lead_key)
+                
+                # Email RELATED_TO Lead
+                relationships.append(Relationship(
+                    from_node=email_node_id,
+                    to_node=lead_node_id,
+                    rel_type='RELATED_TO',
+                    properties={
+                        'interest_level': lead.interest_level,
+                        'topic': lead.topic
+                    }
+                ))
+                
+                # Person(Sender) -> Lead
+                if sender_email:
+                    relationships.append(Relationship(
+                        from_node=self.generate_node_id('Contact', sender_email),
+                        to_node=lead_node_id,
+                        rel_type='RELATED_TO'
+                    ))
+                
+                # Lead INTERESTED_IN Topic
+                if lead.topic:
+                    topic_node_id = self.generate_node_id('Topic', lead.topic)
+                    relationships.append(Relationship(
+                        from_node=lead_node_id,
+                        to_node=topic_node_id,
+                        rel_type='INTERESTED_IN'
+                    ))
+
         return relationships
     
     def _build_searchable_text(self, metadata: Dict[str, Any], email_data: Dict[str, Any]) -> str:
@@ -397,10 +551,20 @@ Respond ONLY with the JSON, no other text."""
         
         if metadata.get('sender'):
             parts.append(f"From: {metadata['sender']}")
+            
+        # Add Financial Info to text if available
+        # This helps the RAG LLM see the amount immediately
+        if 'financial_info' in metadata and metadata['financial_info']:
+            try:
+                fin = json.loads(metadata['financial_info']) if isinstance(metadata['financial_info'], str) else metadata['financial_info']
+                if fin.get('amount'):
+                    parts.append(f"TOTAL AMOUNT: ${fin['amount']} ({fin.get('currency', 'USD')})")
+                    parts.append(f"MERCHANT: {fin.get('merchant', 'Unknown')}")
+            except: pass
         
         body = email_data.get('body', '')
         if body:
-            # Limit body length
+             # Limit body length
             body_snippet = body[:1500] if len(body) > 1500 else body
             parts.append(f"Body: {body_snippet}")
         
@@ -444,3 +608,33 @@ Respond ONLY with the JSON, no other text."""
             except:
                 # Last resort: return as-is (might fail validation)
                 return date_str[:10] if len(date_str) >= 10 else date_str
+
+    def _extract_body_from_payload(self, payload: Dict[str, Any]) -> str:
+        """Recursively extract text body from Gmail payload"""
+        body = ""
+        if 'parts' in payload:
+            for part in payload['parts']:
+                mime_type = part.get('mimeType')
+                if mime_type == 'text/plain':
+                    data = part.get('body', {}).get('data')
+                    if data:
+                        body += self._decode_base64url(data)
+                elif mime_type == 'multipart/alternative':
+                    body += self._extract_body_from_payload(part)
+        else:
+            # Single part
+            data = payload.get('body', {}).get('data')
+            if data:
+                body += self._decode_base64url(data)
+        
+        return body
+
+    def _decode_base64url(self, data: str) -> str:
+        """Decode base64url string"""
+        try:
+            # Add padding if needed
+            data = data.replace('-', '+').replace('_', '/')
+            padded = data + '=' * (4 - len(data) % 4)
+            return base64.urlsafe_b64decode(padded).decode('utf-8')
+        except Exception as e:
+            return ""

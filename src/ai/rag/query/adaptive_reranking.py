@@ -4,7 +4,10 @@ Adaptive Reranking Module
 Dynamically adjusts reranking weights based on query intent for better accuracy.
 """
 from typing import Dict, Tuple
+
 from ....utils.logger import setup_logger
+from .query_enhancer import QueryEnhancer
+from .rules import RERANKING_WEIGHTS
 
 logger = setup_logger(__name__)
 
@@ -20,45 +23,6 @@ class AdaptiveRerankingWeights:
     - Specific queries: Prioritize metadata (names, dates, labels)
     """
     
-    # Intent-to-weights mapping
-    INTENT_WEIGHTS = {
-        'recent': {
-            'semantic_weight': 0.25,
-            'keyword_weight': 0.15,
-            'metadata_weight': 0.15,
-            'recency_weight': 0.45,  # Heavily favor recent emails
-            'description': 'Optimized for recent/latest queries'
-        },
-        'action': {
-            'semantic_weight': 0.30,
-            'keyword_weight': 0.35,  # Keywords are critical for actions
-            'metadata_weight': 0.20,
-            'recency_weight': 0.15,
-            'description': 'Optimized for action queries (send, delete, archive)'
-        },
-        'search': {
-            'semantic_weight': 0.50,  # Prioritize semantic understanding
-            'keyword_weight': 0.20,
-            'metadata_weight': 0.15,
-            'recency_weight': 0.15,
-            'description': 'Optimized for general search queries'
-        },
-        'specific': {
-            'semantic_weight': 0.25,
-            'keyword_weight': 0.25,
-            'metadata_weight': 0.35,  # Names, dates, labels matter most
-            'recency_weight': 0.15,
-            'description': 'Optimized for specific queries (names, dates, labels)'
-        },
-        'default': {
-            'semantic_weight': 0.40,
-            'keyword_weight': 0.20,
-            'metadata_weight': 0.20,
-            'recency_weight': 0.20,
-            'description': 'Balanced weights for general queries'
-        }
-    }
-    
     @staticmethod
     def get_weights_for_intent(intent: str) -> Dict[str, float]:
         """
@@ -70,9 +34,9 @@ class AdaptiveRerankingWeights:
         Returns:
             Dictionary with weight values
         """
-        weights = AdaptiveRerankingWeights.INTENT_WEIGHTS.get(
+        weights = RERANKING_WEIGHTS.get(
             intent.lower(),
-            AdaptiveRerankingWeights.INTENT_WEIGHTS['default']
+            RERANKING_WEIGHTS['default']
         )
         
         logger.debug(f"Using {weights['description']} for intent: {intent}")
@@ -95,29 +59,8 @@ class AdaptiveRerankingWeights:
         Returns:
             Detected intent
         """
-        query_lower = query.lower()
-        
-        # Recent queries
-        recent_keywords = ['recent', 'latest', 'new', 'today', 'yesterday', 'this week', 'last']
-        if any(keyword in query_lower for keyword in recent_keywords):
-            return 'recent'
-        
-        # Action queries
-        action_keywords = ['send', 'sent', 'reply', 'forward', 'delete', 'archive', 'move', 'mark']
-        if any(keyword in query_lower for keyword in action_keywords):
-            return 'action'
-        
-        # Specific queries (names, dates, specific labels)
-        # Look for capitalized words (names), dates, or specific patterns
-        specific_patterns = ['from:', 'to:', 'label:', 'subject:', '@', '.com']
-        has_capitalized = any(word[0].isupper() for word in query.split() if len(word) > 1)
-        has_specific_pattern = any(pattern in query_lower for pattern in specific_patterns)
-        
-        if has_capitalized or has_specific_pattern:
-            return 'specific'
-        
-        # Default to search
-        return 'search'
+        # Use unified logic from QueryEnhancer
+        return QueryEnhancer.detect_intent(query)
     
     @staticmethod
     def get_adaptive_weights(
@@ -159,7 +102,7 @@ class AdaptiveRerankingWeights:
         Returns:
             Dictionary of all intent profiles with their weights
         """
-        return AdaptiveRerankingWeights.INTENT_WEIGHTS.copy()
+        return RERANKING_WEIGHTS.copy()
 
 
 def create_adaptive_reranker(intent: str):

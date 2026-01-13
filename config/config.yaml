@@ -1,0 +1,148 @@
+# Email AI Agent Configuration
+
+agent:
+  name: "Email AI Assistant"
+  email: "${AGENT_EMAIL}"
+  check_interval: 300  # seconds
+  auto_reply: false
+  dry_run: true
+  max_concurrent_emails: 5
+  timezone: "auto"  # "auto" to detect from system, or specify like "America/Los_Angeles", "America/New_York", "UTC"
+
+email:
+  address: "${EMAIL_ADDRESS}"
+  password: "${EMAIL_PASSWORD}"
+  imap:
+    server: "${IMAP_SERVER}"
+    port: 993
+    use_ssl: true
+  smtp:
+    server: "${SMTP_SERVER}"
+    port: 587
+    use_tls: true
+  folders:
+    inbox: "INBOX"
+    sent: "Sent"
+    archive: "Archive"
+    processed: "Processed"
+
+ai:
+  provider: "gemini"  # openai, anthropic, or gemini
+  model: "${AI_MODEL:-gemini-3-flash-preview}"  # Dynamically use environment variable or fallback to 3.0 Flash
+  api_key: "${GOOGLE_API_KEY}"
+  temperature: 0.7
+  max_tokens: 4096
+  system_prompt: |
+    You are a helpful email assistant. Your role is to:
+    - Read and understand emails
+    - Generate professional and context-aware responses
+    - Maintain a friendly and helpful tone
+    - Be concise but thorough
+    - Ask for clarification when needed
+
+database:
+  # Database URL - supports SQLite and PostgreSQL with pgvector
+  # SQLite: sqlite:///./data/emails.db
+  # PostgreSQL: postgresql://user:password@localhost:5432/database_name
+  # PostgreSQL automatically enables vector database functionality when DATABASE_URL starts with "postgresql"
+  url: "${DATABASE_URL}"
+  echo: false
+  pool_size: 5
+
+# RAG (Retrieval-Augmented Generation) Configuration
+# Vector Database: Qdrant (primary), PostgreSQL (fallback)
+rag:
+  # Embedding configuration
+  embedding_provider: "gemini"  # "gemini" or "sentence-transformers"
+  embedding_model: "models/embedding-001"  # Gemini embedding model
+  embedding_dimension: 768  # 768 for Gemini/all-mpnet-base-v2
+  
+  # Vector store configuration
+  # Supported: "auto" (Qdrant primary, PostgreSQL fallback), "qdrant", "postgres"
+  vector_store_backend: "auto"
+  collection_name: "email-knowledge"
+  
+  # Chunking configuration
+  chunk_size: 500  # Target chunk size in words
+  chunk_overlap: 50  # Overlap between chunks in words
+  use_semantic_chunking: true  # Respect sentence/paragraph boundaries
+  
+  # Search configuration
+  default_search_k: 10  # Number of results to return
+  rerank_results: true  # Enable reranking for better accuracy
+  use_hybrid_search: true  # Combine semantic + keyword search
+  
+  # Performance tuning
+  query_cache_ttl_seconds: 180  # Query result cache TTL
+  query_cache_size: 5000  # Query cache size
+  enable_search_diversity: true  # Remove near-duplicate results
+
+# Knowledge Graph Configuration
+# Graph Database: ArangoDB (primary), NetworkX (fallback)
+indexing:
+  # Graph backend: "arangodb" (production) or "networkx" (testing)
+  graph_backend: "arangodb"
+  
+  # ArangoDB connection settings
+  arango_url: "${ARANGODB_URL:-http://localhost:8529}"
+  arango_user: "${ARANGODB_USERNAME:-root}"
+  arango_password: "${ARANGODB_PASSWORD:-password}"
+  arango_database: "${ARANGODB_DATABASE:-clavr}"
+  
+  # Graph indexing settings
+  enable_knowledge_graph: true  # Enable graph-based indexing
+  validation_mode: "strict"  # "strict" or "warn"
+  
+  # Hybrid search weights
+  vector_score_weight: 0.6  # Weight for vector search results
+  graph_score_weight: 0.4  # Weight for graph traversal results
+
+logging:
+  level: "${LOG_LEVEL}"
+  file: "${LOG_FILE}"
+  format: "json"
+  rotation: "daily"
+  retention: "30 days"
+
+security:
+  secret_key: "${SECRET_KEY}"
+  encryption_key: "${ENCRYPTION_KEY}"
+  encrypt_stored_emails: true
+
+filters:
+  # Email filters for processing
+  - name: "priority"
+    type: "sender"
+    patterns:
+      - "*@important-domain.com"
+    priority: 1
+  - name: "ignore"
+    type: "subject"
+    patterns:
+      - "SPAM"
+      - "Unsubscribe"
+    action: "skip"
+
+# Voice Interface Configuration
+# Speech-to-Text and Text-to-Speech settings for voice interactions
+voice:
+  enabled: true  # Enable/disable voice features
+  
+  # Speech-to-Text (STT) Configuration
+  stt:
+    provider: "google"  # "google" (Google Cloud Speech-to-Text)
+    language: "en-US"  # Language code (en-US, en-GB, etc.)
+    sample_rate: 24000  # Audio sample rate in Hz (24000 for webm/opus from browsers)
+  
+  # Text-to-Speech (TTS) Configuration
+  tts:
+    provider: "gemini"  # "gemini" (Gemini 2.5 TTS - recommended) or "google" (Cloud TTS)
+    voice: "en-US-Neural2-D"  # Voice name (Neural2-D = male, Neural2-F = female)
+    language: "en-US"  # Language code
+    speaking_rate: 1.0  # Speaking rate (0.25 to 4.0, 1.0 = normal speed)
+    pitch: 0.0  # Pitch adjustment (-20.0 to 20.0 semitones, 0.0 = normal)
+
+# Note: Voice services require Google Cloud credentials
+# Set GOOGLE_APPLICATION_CREDENTIALS environment variable to path of service account JSON
+# Or use default application credentials if running on GCP
+

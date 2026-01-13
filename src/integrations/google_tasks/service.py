@@ -25,9 +25,9 @@ Breaking Change (v3.0.0):
 from typing import Optional, List, Dict, Any
 from datetime import datetime, timedelta
 
-from ...core.tasks.google_client import GoogleTasksClient
-from ...utils.logger import setup_logger
-from ...utils.config import Config
+from src.core.tasks.google_client import GoogleTasksClient
+from src.utils.logger import setup_logger
+from src.utils.config import Config
 from .exceptions import (
     TaskServiceException,
     TaskNotFoundException,
@@ -91,10 +91,7 @@ class TaskService:
         """
         if not credentials:
             raise AuthenticationException(
-                message="Google Tasks credentials required. "
-                        "Local storage is no longer supported. "
-                        "Please authenticate with Google OAuth. "
-                        "Use CredentialFactory.create_service('task', ...) for automatic setup.",
+                message="[INTEGRATION_REQUIRED] Tasks permission not granted. Please enable Google integration in Settings.",
                 service_name="tasks"
             )
         
@@ -107,8 +104,7 @@ class TaskService:
             
             if not self.google_tasks.is_available():
                 raise ServiceUnavailableException(
-                    message="Google Tasks API is not available. "
-                            "Please check your credentials and internet connection.",
+                    message="[INTEGRATION_REQUIRED] Tasks permission not granted. Please enable Google integration in Settings.",
                     service_name="tasks"
                 )
             
@@ -410,7 +406,8 @@ class TaskService:
         project: Optional[str] = None,
         limit: int = 100,
         tasklist_id: str = "@default",
-        show_completed: bool = False
+        show_completed: bool = False,
+        fast_mode: bool = False
     ) -> List[Dict[str, Any]]:
         """
         List tasks with filters
@@ -424,38 +421,42 @@ class TaskService:
             limit: Maximum results
             tasklist_id: Task list ID (default: @default, only for Google Tasks)
             show_completed: Show completed tasks (only for Google Tasks)
+            fast_mode: Fast mode for voice (only check @default list)
             
         Returns:
             List of tasks
         """
         try:
-            logger.info(f"[TASK_SERVICE] Listing tasks: status={status}")
+            logger.info(f"[TASK_SERVICE] Listing tasks: status={status}, fast_mode={fast_mode}")
             
             if self._is_google_tasks():
                 # Google Tasks (limited filtering)
                 # CRITICAL FIX: Check ALL task lists, not just @default
                 # Users might have tasks in different lists
-                try:
-                    all_task_lists = self.google_tasks.get_task_lists()
-                    logger.info(f"[TASK_SERVICE] Found {len(all_task_lists)} task lists: {[tl.get('title', tl.get('id', 'Unknown')) for tl in all_task_lists]}")
-                except Exception as e:
-                    logger.warning(f"[TASK_SERVICE] Could not get task lists, using @default only: {e}")
+                if fast_mode:
                     all_task_lists = [{'id': '@default', 'title': 'My Tasks'}]
+                    logger.info("[TASK_SERVICE] Fast mode: Using @default list only")
+                else:
+                    try:
+                        all_task_lists = self.google_tasks.get_task_lists()
+                        logger.info(f"[TASK_SERVICE] Found {len(all_task_lists)} task lists: {[tl.get('title', tl.get('id', 'Unknown')) for tl in all_task_lists]}")
+                    except Exception as e:
+                        logger.warning(f"[TASK_SERVICE] Could not get task lists, using @default only: {e}")
+                        all_task_lists = [{'id': '@default', 'title': 'My Tasks'}]
                 
                 # Collect tasks from all task lists
                 all_tasks = []
+                api_show_completed = show_completed
                 for task_list in all_task_lists:
                     list_id = task_list.get('id', '@default')
                     list_title = task_list.get('title', 'Unknown')
                     
-                    # CRITICAL: For pending tasks, fetch ALL tasks (showCompleted=True) then filter client-side
-                    # This ensures we catch ALL tasks with status='needsAction', even if Google API has sync issues
-                    # We'll filter by status='needsAction' client-side to get truly pending tasks
+                    # CRITICAL: Always fetch all tasks (show_completed=True) to avoid 
+                    # Google API sync issues where pending tasks are misclassified.
+                    # We will filter for 'needsAction' client-side for better reliability.
                     if status == "pending":
-                        # Fetch ALL tasks, then filter by status='needsAction' client-side
-                        # This catches all pending tasks even if API has sync issues
                         api_show_completed = True
-                        logger.info(f"[TASK_SERVICE] Fetching ALL tasks (showCompleted=True) from '{list_title}' ({list_id}) to filter for pending (status='needsAction')")
+                        logger.info(f"[TASK_SERVICE] Fetching all tasks from '{list_title}' ({list_id}) for pending filter")
                     elif status == "completed":
                         api_show_completed = True
                     else:
@@ -474,17 +475,9 @@ class TaskService:
                 
                 logger.info(f"[TASK_SERVICE] Retrieved {len(tasks)} tasks from Google Tasks API (show_completed={api_show_completed}, requested_status={status})")
                 
-                # Log task details for debugging - show ALL tasks with their statuses
+                # Log task summary for debugging
                 if tasks:
-                    # Log ALL tasks, not just first 10, to see what we're getting
-                    all_task_details = [(t.get('id', 'NO_ID')[:10], t.get('title', 'NO TITLE')[:50], t.get('status', 'NO STATUS'), t.get('due', 'NO DUE')) for t in tasks]
-                    logger.info(f"[TASK_SERVICE] ALL {len(tasks)} tasks retrieved:")
-                    for i, (task_id, title, task_status, due) in enumerate(all_task_details, 1):
-                        logger.info(f"[TASK_SERVICE]   {i}. [{task_status}] {title} (due: {due})")
-                    
-                    # Also log first 10 for quick reference
-                    task_details = all_task_details[:10]
-                    logger.info(f"[TASK_SERVICE] First 10 tasks: {task_details}")
+                    logger.info(f"[TASK_SERVICE] Retrieved {len(tasks)} tasks from Google Tasks API")
                 
                 # Filter by status client-side to ensure accuracy
                 # CRITICAL: Filter by raw Google API status='needsAction' to get truly pending tasks
@@ -623,11 +616,11 @@ class TaskService:
                 service_name="task"
             )
     
-    def get_overdue_tasks(self, limit: int = 50) -> List[Dict[str, Any]]:
+    def get_overdue_tasks(self, limit: int = 50, fast_mode: bool = False) -> List[Dict[str, Any]]:
         """Get overdue tasks"""
         if self._is_google_tasks():
             # For Google Tasks, filter client-side
-            all_tasks = self.google_tasks.list_tasks(show_completed=False)
+            all_tasks = self.list_tasks(show_completed=False, fast_mode=fast_mode)
             now = datetime.now()
             return [
                 t for t in all_tasks

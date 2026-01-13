@@ -1,11 +1,11 @@
 """
 Graph Query Parser for NetworkX
 
-Provides a query language similar to Cypher for NetworkX graphs.
+Provides a query language similar to legacy patterns for NetworkX graphs.
 Supports pattern matching, filtering, traversal, and aggregation.
 
-This parser enables the NetworkX backend to support Cypher-like queries,
-making it compatible with the Neo4j query interface for development/testing.
+This parser enables the NetworkX backend to support legacy-style queries,
+making it compatible with the graph query interface for development/testing.
 """
 import re
 from typing import Dict, Any, List, Optional, Set, Callable
@@ -22,7 +22,7 @@ from .graph_constants import (
     DEFAULT_QUERY_LIMIT,
     MAX_QUERY_RESULTS,
 )
-from ....utils.logger import setup_logger
+from src.utils.logger import setup_logger
 
 logger = setup_logger(__name__)
 
@@ -40,7 +40,7 @@ class QueryParser:
     """
     Parse and execute graph queries on NetworkX graphs
     
-    Supports Cypher-like query patterns for compatibility with Neo4j:
+    Supports legacy-style query patterns for compatibility with production backends:
     
     1. MATCH queries:
        MATCH (n:NodeType) WHERE n.property = value RETURN n

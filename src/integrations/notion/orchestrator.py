@@ -16,8 +16,8 @@ from .config import NotionConfig
 from .rag_integration import NotionGraphRAGIntegration
 from .autonomous_execution import NotionAutonomousExecution
 from .automation_efficiency import NotionAutomationAndEfficiency
-from ...utils.logger import setup_logger
-from ...utils.config import load_config
+from src.utils.logger import setup_logger
+from src.utils.config import load_config
 
 logger = setup_logger(__name__)
 
@@ -44,8 +44,8 @@ class NotionOrchestrator:
         
         Args:
             config: Optional configuration object
-            graph_manager: Optional KnowledgeGraphManager for Neo4j
-            rag_engine: Optional RAGEngine for Pinecone
+            graph_manager: Optional KnowledgeGraphManager for ArangoDB
+            rag_engine: Optional RAGEngine for Qdrant
             enable_all_capabilities: Whether to enable all three capabilities
         """
         # Validate Notion configuration

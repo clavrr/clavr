@@ -5,8 +5,10 @@ Clean, maintainable RAG architecture following industry best practices.
 
 Architecture:
 - Core: RAGEngine, EmbeddingProvider, VectorStore
-- Chunking: RecursiveTextChunker, EmailChunker
-- Query: QueryEnhancer, ResultReranker, HybridSearchEngine
+- Chunking: RecursiveTextChunker, EmailChunker, ContextualChunker
+- Query: QueryEnhancer, ResultReranker, HybridSearchEngine, HyDE, CrossEncoder
+- Pipeline: UnifiedRAGPipeline (recommended entry point)
+- Feedback: FeedbackCollector, FeedbackReranker
 - Processing: DocumentProcessor, UnifiedParserRAGBridge
 - Utils: Monitoring, Performance, Utilities
 """
@@ -20,7 +22,7 @@ from .core import (
     create_embedding_provider,
     VectorStore,
     PostgresVectorStore,
-    PineconeVectorStore,
+    QdrantVectorStore,
     create_vector_store
 )
 
@@ -29,7 +31,9 @@ from .chunking import (
     RecursiveTextChunker,
     Chunk,
     ChunkMetadata,
-    EmailChunker
+    EmailChunker,
+    ContextualChunker,
+    create_contextual_chunker
 )
 
 # Query processing
@@ -41,7 +45,20 @@ from .query import (
     create_adaptive_reranker,
     apply_diversity,
     maximal_marginal_relevance,
-    remove_near_duplicates
+    remove_near_duplicates,
+    # Advanced query processing
+    QueryDecomposer,
+    CrossEncoderReranker,
+    HyDEGenerator,
+    RelevanceGrader
+)
+
+# Unified Pipeline (recommended entry point)
+from .unified_pipeline import (
+    UnifiedRAGPipeline,
+    PipelineConfig,
+    PipelineResult,
+    create_unified_pipeline
 )
 
 # Monitoring
@@ -57,10 +74,6 @@ from .utils import (
 # Import directly: from src.ai.rag.processing.document_processor import DocumentProcessor
 # Import directly: from src.ai.rag.processing.parser_integration import UnifiedParserRAGBridge
 
-# Utilities are internal - not exported to avoid namespace pollution
-# Import directly: from src.ai.rag.utils.utils import extract_keywords
-# Performance modules are internal - not exported
-
 __all__ = [
     # Core interfaces
     "EmbeddingProvider",
@@ -74,7 +87,7 @@ __all__ = [
     
     # Vector stores
     "PostgresVectorStore",
-    "PineconeVectorStore",
+    "QdrantVectorStore",
     "create_vector_store",
     
     # Chunking
@@ -82,11 +95,17 @@ __all__ = [
     "Chunk",
     "ChunkMetadata",
     "EmailChunker",
+    "ContextualChunker",
+    "create_contextual_chunker",
     
     # Query enhancement
     "QueryEnhancer",
     "ResultReranker",
     "HybridSearchEngine",
+    "QueryDecomposer",
+    "CrossEncoderReranker",
+    "HyDEGenerator",
+    "RelevanceGrader",
     
     # Diversity and reranking
     "apply_diversity",
@@ -94,6 +113,12 @@ __all__ = [
     "remove_near_duplicates",
     "AdaptiveRerankingWeights",
     "create_adaptive_reranker",
+    
+    # Unified Pipeline (recommended)
+    "UnifiedRAGPipeline",
+    "PipelineConfig",
+    "PipelineResult",
+    "create_unified_pipeline",
     
     # Monitoring
     "RAGMonitor",
@@ -104,4 +129,5 @@ __all__ = [
     # "DocumentProcessor",  # Import: from src.ai.rag.document_processor import DocumentProcessor
     # "UnifiedParserRAGBridge",  # Import: from src.ai.rag.parser_integration import UnifiedParserRAGBridge
 ]
+
 

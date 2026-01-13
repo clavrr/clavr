@@ -83,12 +83,18 @@ class GeminiEmbeddingProvider(EmbeddingProvider):
             raise ImportError("google-generativeai package is required for Gemini embeddings")
         
         self.model_name = model_name
-        self._cache_size = cache_size
-        self._embedding_cache: dict[str, Tuple[List[float], datetime]] = {}
-        self._cache_ttl = timedelta(hours=cache_ttl_hours)
+        
+        # Use shared TTLCache
+        from .cache import TTLCache
+        self._embedding_cache = TTLCache(max_size=cache_size, ttl_seconds=cache_ttl_hours * 3600)
+        
         self._max_retries = max_retries
         self._base_delay = retry_base_delay
         self._dimension = 768  # Gemini embeddings are 768D
+        
+        # Shared ThreadPoolExecutor for batch processing
+        max_workers = int(os.environ.get('EMBEDDING_PARALLEL_WORKERS', '10'))
+        self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=max_workers)
     
     def get_dimension(self) -> int:
         """Get embedding dimension."""
@@ -101,22 +107,11 @@ class GeminiEmbeddingProvider(EmbeddingProvider):
     
     def _get_cached(self, cache_key: str) -> Optional[List[float]]:
         """Get cached embedding if valid."""
-        if cache_key in self._embedding_cache:
-            embedding, timestamp = self._embedding_cache[cache_key]
-            if datetime.now() - timestamp < self._cache_ttl:
-                return embedding
-            else:
-                del self._embedding_cache[cache_key]
-        return None
+        return self._embedding_cache.get(cache_key)
     
     def _set_cached(self, cache_key: str, embedding: List[float]):
         """Cache an embedding with LRU eviction."""
-        if len(self._embedding_cache) >= self._cache_size:
-            oldest_key = min(self._embedding_cache.keys(), 
-                           key=lambda k: self._embedding_cache[k][1])
-            del self._embedding_cache[oldest_key]
-        
-        self._embedding_cache[cache_key] = (embedding, datetime.now())
+        self._embedding_cache.set(cache_key, embedding)
     
     def _embed_with_retry(self, text: str, task_type: str) -> List[float]:
         """Embed text with exponential backoff retry logic."""
@@ -307,11 +302,10 @@ class GeminiEmbeddingProvider(EmbeddingProvider):
                 batch = processed_texts[i:i + batch_size]
                 batch_indices = processed_indices[i:i + batch_size]
                 
-                with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
-                    batch_results = list(executor.map(
-                        lambda t: self._embed_with_retry(t, "RETRIEVAL_DOCUMENT"),
-                        batch
-                    ))
+                batch_results = list(self.executor.map(
+                    lambda t: self._embed_with_retry(t, "RETRIEVAL_DOCUMENT"),
+                    batch
+                ))
                 
                 # Cache results
                 for text, embedding in zip(batch, batch_results):
@@ -339,6 +333,11 @@ class GeminiEmbeddingProvider(EmbeddingProvider):
         """Clear the embedding cache."""
         self._embedding_cache.clear()
         logger.info("Embedding cache cleared")
+        
+    def shutdown(self):
+        """Shutdown the embedding provider and release resources."""
+        self.executor.shutdown(wait=True)
+        logger.info("Gemini Embedding Provider shutdown complete")
 
 
 class SentenceTransformerEmbeddingProvider(EmbeddingProvider):

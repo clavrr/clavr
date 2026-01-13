@@ -6,6 +6,18 @@ Smart chunking for emails that preserves structure and improves search accuracy.
 import re
 from typing import List, Dict, Any, Optional
 from ....utils.logger import setup_logger
+from .chunking import RecursiveTextChunker
+from .chunking_constants import (
+    SENT_FROM_PATTERN,
+    OUTLOOK_FOOTER_PATTERN,
+    SIGNATURE_DELIMITER_PATTERN,
+    EXCESSIVE_NEWLINES_PATTERN,
+    WHITESPACE_PATTERN,
+    DISCLAIMER_KEYWORDS,
+    MAX_METADATA_LENGTH,
+    DEFAULT_CHUNK_SIZE_TOKENS,
+    DEFAULT_OVERLAP_TOKENS
+)
 
 logger = setup_logger(__name__)
 
@@ -25,14 +37,32 @@ class EmailChunker:
     - Smaller, focused chunks for better semantic matching
     """
     
-    def __init__(self, max_chunk_words: int = 300):
+    def __init__(
+        self, 
+        chunk_size: int = DEFAULT_CHUNK_SIZE_TOKENS,
+        overlap_tokens: int = DEFAULT_OVERLAP_TOKENS,
+        base_chunker: Optional[RecursiveTextChunker] = None
+    ):
         """
         Initialize email chunker.
         
         Args:
-            max_chunk_words: Maximum words per body chunk (default: 300)
+            chunk_size: Target chunk size in tokens (default: 512)
+            overlap_tokens: Overlap tokens (default: 50)
+            base_chunker: Optional existing RecursiveTextChunker instance
         """
-        self.max_chunk_words = max_chunk_words
+        self.chunk_size = chunk_size
+        self.overlap_tokens = overlap_tokens
+        
+        # Use provided chunker or create new one
+        if base_chunker:
+            self.base_chunker = base_chunker
+        else:
+            self.base_chunker = RecursiveTextChunker(
+                chunk_size=chunk_size,
+                overlap_tokens=overlap_tokens,
+                use_parent_child=False  # We handle structure manually
+            )
     
     def chunk_email(self, email_data: Dict[str, Any]) -> List[Dict[str, Any]]:
         """
@@ -69,7 +99,7 @@ class EmailChunker:
     
     def _create_safe_metadata(self, email_data: Dict[str, Any], chunk_type: str = 'body') -> Dict[str, Any]:
         """
-        Create safe metadata that won't exceed Pinecone's 40KB limit.
+        Create safe metadata that won't exceed vector store metadata limits.
         
         Only includes essential, small fields and truncates string values.
         """
@@ -93,13 +123,13 @@ class EmailChunker:
         for key in essential_fields:
             if key in email_data:
                 value = email_data[key]
-                # Truncate string values to max 500 chars
-                if isinstance(value, str) and len(value.encode('utf-8')) > 500:
-                    metadata[key] = value[:500] + '...'
-                elif isinstance(value, list) and len(str(value).encode('utf-8')) > 500:
+                # Truncate string values
+                if isinstance(value, str) and len(value.encode('utf-8')) > MAX_METADATA_LENGTH:
+                    metadata[key] = value[:MAX_METADATA_LENGTH] + '...'
+                elif isinstance(value, list) and len(str(value).encode('utf-8')) > MAX_METADATA_LENGTH:
                     # Truncate list representation
                     str_val = str(value)
-                    metadata[key] = str_val[:500] + '...'
+                    metadata[key] = str_val[:MAX_METADATA_LENGTH] + '...'
                 else:
                     metadata[key] = value
         
@@ -112,13 +142,57 @@ class EmailChunker:
             if isinstance(value, (int, float, bool)):
                 metadata[key] = value
             elif isinstance(value, str):
-                if len(value.encode('utf-8')) <= 500:
+                if len(value.encode('utf-8')) <= MAX_METADATA_LENGTH:
                     metadata[key] = value
             elif isinstance(value, list):
                 str_val = str(value)
-                if len(str_val.encode('utf-8')) <= 500:
+                if len(str_val.encode('utf-8')) <= MAX_METADATA_LENGTH:
                     metadata[key] = value
         
+        # CRITICAL: Ensure robust field mapping for common aliases
+        # This fixes missing metadata in index
+        if 'sender' not in metadata and 'from' in email_data:
+            metadata['sender'] = email_data['from']
+        if 'from' not in metadata and 'sender' in metadata:
+            metadata['from'] = metadata['sender']
+            
+        if 'date' not in metadata and 'timestamp' in email_data:
+            metadata['date'] = email_data['timestamp']
+        if 'timestamp' not in metadata and 'date' in metadata:
+            metadata['timestamp'] = metadata['date']
+            
+        if 'recipient' not in metadata and 'to' in email_data:
+            metadata['recipient'] = email_data['to']
+        if 'to' not in metadata and 'recipient' in metadata:
+            metadata['to'] = metadata['recipient']
+
+        # Bug #4 Fix: Ensure sender_email and sender_name are preserved for filtering
+        # These are crucial for sender-based search filtering
+        if 'sender_email' not in metadata and 'sender' in metadata:
+            # Extract email from sender string like "Name <email@domain.com>"
+            sender = metadata.get('sender', '')
+            if '@' in sender:
+                if '<' in sender and '>' in sender:
+                    # Format: "Name <email@domain.com>"
+                    import re
+                    email_match = re.search(r'<([^>]+@[^>]+)>', sender)
+                    if email_match:
+                        metadata['sender_email'] = email_match.group(1)
+                        metadata['sender_name'] = sender.split('<')[0].strip().strip('"')
+                else:
+                    # Already an email address
+                    metadata['sender_email'] = sender
+                    metadata['sender_name'] = sender.split('@')[0]
+            else:
+                # Just a name, use as sender_name
+                metadata['sender_name'] = sender
+        
+        # Ensure sender_email from email_data is preserved if present
+        if 'sender_email' in email_data and 'sender_email' not in metadata:
+            metadata['sender_email'] = email_data['sender_email']
+        if 'sender_name' in email_data and 'sender_name' not in metadata:
+            metadata['sender_name'] = email_data['sender_name']
+
         return metadata
     
     def _create_metadata_chunk(self, email_data: Dict[str, Any]) -> Dict[str, Any]:
@@ -160,52 +234,22 @@ class EmailChunker:
     
     def _chunk_body(self, body: str, email_data: Dict[str, Any]) -> List[Dict[str, Any]]:
         """
-        Chunk email body by semantic paragraphs.
+        Chunk email body using RecursiveTextChunker.
         
         Preserves:
-        - Paragraph boundaries
-        - List structure
-        - Quoted text context
+        - Paragraph boundaries (via RecursiveTextChunker separators)
+        - Semantic meaning (via token-based splitting)
         """
         if not body:
             return []
         
+        # Use the base chunker to split text
+        text_chunks = self.base_chunker.chunk(body)
+        
         chunks = []
-        
-        # Split by paragraphs (double newline)
-        paragraphs = re.split(r'\n\s*\n', body)
-        
-        current_chunk = []
-        current_words = 0
-        
-        for para in paragraphs:
-            if not para.strip():
-                continue
-            
-            para_words = len(para.split())
-            
-            # Check if adding this paragraph exceeds max chunk size
-            if current_words + para_words > self.max_chunk_words and current_chunk:
-                # Finalize current chunk
-                chunk_text = '\n\n'.join(current_chunk)
-                chunks.append({
-                    'content': chunk_text,
-                    'metadata': self._create_safe_metadata(email_data, chunk_type='body')
-                })
-                
-                # Start new chunk
-                current_chunk = [para]
-                current_words = para_words
-            else:
-                # Add to current chunk
-                current_chunk.append(para)
-                current_words += para_words
-        
-        # Add final chunk
-        if current_chunk:
-            chunk_text = '\n\n'.join(current_chunk)
+        for text_chunk in text_chunks:
             chunks.append({
-                'content': chunk_text,
+                'content': text_chunk.text,
                 'metadata': self._create_safe_metadata(email_data, chunk_type='body')
             })
         
@@ -221,36 +265,29 @@ class EmailChunker:
         - Excessive whitespace
         - "Sent from" footers
         """
-        # Remove "Sent from my iPhone/Android" footers
-        body = re.sub(r'Sent from my (iPhone|iPad|Android|Mobile).*', '', body, flags=re.IGNORECASE)
-        body = re.sub(r'Get Outlook for (iOS|Android).*', '', body, flags=re.IGNORECASE)
+        # Remove "Sent from" footers
+        body = SENT_FROM_PATTERN.sub('', body)
+        body = OUTLOOK_FOOTER_PATTERN.sub('', body)
         
         # Remove common signature delimiters
-        # Pattern: "-- " or "___" or "---" on its own line, followed by signature
-        body = re.sub(r'\n--\s*\n.*', '', body, flags=re.DOTALL)
-        body = re.sub(r'\n_{3,}\s*\n.*', '', body, flags=re.DOTALL)
-        body = re.sub(r'\n-{3,}\s*\n.*', '', body, flags=re.DOTALL)
+        body = SIGNATURE_DELIMITER_PATTERN.sub('', body)
         
-        # Remove long legal disclaimers (usually > 300 chars with specific keywords)
+        # Remove long legal disclaimers
         lines = body.split('\n')
         cleaned = []
-        disclaimer_keywords = [
-            'confidential', 'intended recipient', 'disclaimer', 
-            'privileged', 'unauthorized', 'dissemination'
-        ]
         
         for line in lines:
             # If line is very long and contains disclaimer keywords, skip it
             if len(line) > 300:
-                if any(keyword in line.lower() for keyword in disclaimer_keywords):
+                if any(keyword in line.lower() for keyword in DISCLAIMER_KEYWORDS):
                     continue  # Skip disclaimer line
             cleaned.append(line)
         
         body = '\n'.join(cleaned)
         
         # Clean excessive whitespace
-        body = re.sub(r'\n{3,}', '\n\n', body)  # Max 2 consecutive newlines
-        body = re.sub(r'[ \t]+', ' ', body)  # Normalize spaces/tabs
+        body = EXCESSIVE_NEWLINES_PATTERN.sub('\n\n', body)
+        body = WHITESPACE_PATTERN.sub(' ', body)
         
         return body.strip()
     
@@ -273,36 +310,13 @@ class EmailChunker:
         # Clean content
         content_clean = self._clean_email_body(content)
         
-        # Split into paragraphs
-        paragraphs = re.split(r'\n\s*\n', content_clean)
+        # Use the base chunker to split text
+        text_chunks = self.base_chunker.chunk(content_clean)
         
         chunks = []
-        current_chunk = []
-        current_words = 0
-        
-        for para in paragraphs:
-            if not para.strip():
-                continue
-            
-            para_words = len(para.split())
-            
-            if current_words + para_words > self.max_chunk_words and current_chunk:
-                chunk_text = '\n\n'.join(current_chunk)
-                chunks.append({
-                    'content': chunk_text,
-                    'metadata': metadata or {}
-                })
-                current_chunk = [para]
-                current_words = para_words
-            else:
-                current_chunk.append(para)
-                current_words += para_words
-        
-        # Add final chunk
-        if current_chunk:
-            chunk_text = '\n\n'.join(current_chunk)
+        for text_chunk in text_chunks:
             chunks.append({
-                'content': chunk_text,
+                'content': text_chunk.text,
                 'metadata': metadata or {}
             })
         

@@ -1,0 +1,61 @@
+created_at: '2025-10-22T21:14:56.435380'
+sample_size: 86
+writing_style:
+  avg_word_count: 563
+  avg_sentence_count: 39
+  avg_paragraph_count: 3
+  formality_score: 5.8
+  tone: professional
+  common_greetings: []
+  common_closings:
+  - '>>>>>>>>>>>> Best regards,'
+  - '> Best regards,'
+  - '>>>>>>>>>>>>>>> Best regards,'
+  - '>>>>>>>> Best regards,'
+  - '>>>>>>>>>>>>>>>>>>>>>> Best regards,'
+  uses_exclamations: true
+  uses_emojis: false
+response_patterns:
+  meeting_requests:
+    count: 53
+    avg_length: 730
+    typical_response: Detailed and thorough
+  cold_emails:
+    count: 4
+    avg_length: 582
+    typical_response: Detailed and thorough
+  colleague_emails:
+    count: 29
+    avg_length: 254
+    typical_response: Detailed and thorough
+preferences:
+  signature: 'anyone. If you believe you have received this email in error, please
+
+    contact the sender immediately.'
+  scheduling_preferences:
+  - !!python/tuple
+    - Thursday
+    - 22
+  - !!python/tuple
+    - Sunday
+    - 15
+  - !!python/tuple
+    - "12:40\u202FAM"
+    - 13
+  - !!python/tuple
+    - "8:53\u202FPM"
+    - 11
+  - !!python/tuple
+    - "6:41\u202FPM"
+    - 11
+  avg_response_length_preference: 563
+common_phrases:
+- Feel free to
+- Thank you for
+- Let me know
+- Hope this
+- Hope you're
+- Looking forward
+- I appreciate
+- Thanks for reaching out
+- I'd be happy

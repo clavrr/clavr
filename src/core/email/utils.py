@@ -69,6 +69,19 @@ def extract_message_body(payload: Dict[str, Any]) -> str:
         return ""
 
 
+def get_header_value(header_dict: Dict[str, str], key: str, default: str = '') -> str:
+    """Get header value case-insensitively"""
+    # Try exact match first
+    if key in header_dict:
+        return header_dict[key]
+    
+    # Try case-insensitive extraction
+    key_lower = key.lower()
+    for k, v in header_dict.items():
+        if k.lower() == key_lower:
+            return v
+    return default
+
 def format_message_from_gmail(
     message: Dict[str, Any],
     include_internal_date: bool = False
@@ -94,10 +107,10 @@ def format_message_from_gmail(
     formatted = {
         'id': message.get('id', ''),
         'thread_id': message.get('threadId'),
-        'subject': header_dict.get('Subject', 'No Subject'),
-        'sender': header_dict.get('From', 'Unknown'),
-        'recipient': header_dict.get('To', ''),
-        'date': header_dict.get('Date', ''),
+        'subject': get_header_value(header_dict, 'Subject', 'No Subject'),
+        'sender': get_header_value(header_dict, 'From', 'Unknown'),
+        'recipient': get_header_value(header_dict, 'To', ''),
+        'date': get_header_value(header_dict, 'Date', ''),
         'body': body,
         'labels': message.get('labelIds', []),
         'snippet': message.get('snippet', ''),

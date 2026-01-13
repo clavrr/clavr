@@ -108,7 +108,8 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
             "/redoc",
             "/auth/me",  # Temporarily exclude during development
             "/auth/google/login",
-            "/auth/google/callback"
+            "/auth/google/callback",
+            "/auth/session/status",  # Lightweight polling endpoint
         }
     
     async def dispatch(self, request: Request, call_next):

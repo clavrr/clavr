@@ -9,7 +9,7 @@ from datetime import datetime, timedelta
 
 from ..celery_app import celery_app
 from ..base_task import BaseTask, IdempotentTask
-from ...utils.logger import setup_logger
+from src.utils.logger import setup_logger
 
 logger = setup_logger(__name__)
 
@@ -41,8 +41,8 @@ def cleanup_expired_sessions(self) -> Dict[str, Any]:
     logger.info("Starting expired sessions cleanup")
     
     try:
-        from ...database import get_db_context
-        from ...database.models import Session
+        from src.database import get_db_context
+        from src.database.models import Session
         
         with get_db_context() as db:
             # Delete expired sessions
@@ -76,7 +76,7 @@ def update_cache_statistics(self) -> Dict[str, Any]:
     logger.info("Updating cache statistics")
     
     try:
-        from ...utils import CacheStats
+        from src.utils import CacheStats
         
         # Build stats dictionary from CacheStats class attributes
         stats = {
@@ -151,7 +151,7 @@ def backup_database(self) -> Dict[str, Any]:
     
     try:
         import subprocess
-        from ...utils.config import load_config
+        from src.utils.config import load_config
         
         config = load_config()
         db_url = os.getenv('DATABASE_URL', '')
@@ -243,7 +243,7 @@ def health_check_services(self) -> Dict[str, Any]:
         
         # Check database
         try:
-            from ...database import get_db_context
+            from src.database import get_db_context
             with get_db_context() as db:
                 db.execute(text("SELECT 1"))
             health_status['database'] = True
@@ -252,7 +252,8 @@ def health_check_services(self) -> Dict[str, Any]:
         
         # Check Redis
         try:
-            r = redis.from_url(os.getenv('REDIS_URL', 'redis://localhost:6379/0'))
+            from src.utils.urls import URLs
+            r = redis.from_url(URLs.REDIS)
             r.ping()
             health_status['redis'] = True
         except Exception as exc:
@@ -260,8 +261,8 @@ def health_check_services(self) -> Dict[str, Any]:
         
         # Check RAG engine
         try:
-            from ...ai.rag import RAGEngine
-            from ...utils.config import load_config
+            from src.ai.rag import RAGEngine
+            from src.utils.config import load_config
             # Use cached RAG engine from worker state
             from . import WorkerState
             rag = WorkerState.get_rag_engine()
@@ -301,9 +302,9 @@ def generate_usage_report(self, period: str = 'daily') -> Dict[str, Any]:
     logger.info(f"Generating {period} usage report")
     
     try:
-        from ...database import get_db_context
-        from ...database import User
-        from ...database.models import Session as DBSession
+        from src.database import get_db_context
+        from src.database import User
+        from src.database.models import Session as DBSession
         
         with get_db_context() as db:
             # Get user statistics

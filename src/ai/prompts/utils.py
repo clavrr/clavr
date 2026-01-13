@@ -1,96 +1,73 @@
 """
-Prompt Utilities - Helper functions for prompt formatting and validation
-
-Provides consistent prompt formatting, validation, and template management.
+Utility functions for prompt management.
 """
-from typing import Dict, Any, Optional, List
-import re
+from typing import Any, Dict, List, Optional
+from .constants import (
+    CORE_PERSONA, 
+    TONE_STYLE_GUIDELINES, 
+    OPERATIONAL_PRINCIPLES, 
+    MEMORY_INSTRUCTIONS
+)
 
-from ...utils.logger import setup_logger
-
-logger = setup_logger(__name__)
-
-
-def format_prompt(template: str, **kwargs) -> str:
+def format_prompt(template: str, **kwargs: Any) -> str:
     """
-    Format a prompt template with validation.
-    
-    Args:
-        template: Prompt template string with {placeholders}
-        **kwargs: Values to fill in placeholders
-        
-    Returns:
-        Formatted prompt string
-        
-    Raises:
-        ValueError: If required placeholders are missing
+    Format a prompt template with the provided variables.
     """
-    # Extract all placeholders from template
-    placeholders = set(re.findall(r'\{(\w+)\}', template))
-    
-    # Check for missing required placeholders
-    missing = placeholders - set(kwargs.keys())
-    if missing:
-        logger.warning(f"Missing placeholders in prompt: {missing}. Using empty strings.")
-        # Fill missing placeholders with empty strings
-        for placeholder in missing:
-            kwargs[placeholder] = ""
-    
-    # Check for extra kwargs (not necessarily an error, but worth logging)
-    extra = set(kwargs.keys()) - placeholders
-    if extra:
-        logger.debug(f"Extra kwargs provided (not used in template): {extra}")
-    
     try:
         return template.format(**kwargs)
     except KeyError as e:
-        logger.error(f"Error formatting prompt: {e}")
-        raise ValueError(f"Missing required placeholder: {e}")
+        raise ValueError(f"Missing key for prompt format: {e}")
 
 
-def build_system_user_prompt(system_prompt: str, user_prompt: str) -> List[Dict[str, str]]:
+class BasePromptBuilder:
     """
-    Build a standard system/user message pair for LLM calls.
+    Assembles modular prompts from reusable components.
     
-    Args:
-        system_prompt: System prompt
-        user_prompt: User prompt
+    Ensures that Clavr's persona and critical rules are 
+    consistently applied across all agents and domains.
+    """
+    
+    @staticmethod
+    def build_system_prompt(
+        agent_role: str,
+        capabilities: List[str],
+        specific_rules: Optional[List[str]] = None,
+        include_memory: bool = True
+    ) -> str:
+        """Assembles a full system prompt for an agent."""
+        components = [
+            CORE_PERSONA,
+            f"\nAGENT ROLE:\n{agent_role}",
+            "\nCAPABILITIES:\n- " + "\n- ".join(capabilities),
+            TONE_STYLE_GUIDELINES,
+            OPERATIONAL_PRINCIPLES
+        ]
         
-    Returns:
-        List of message dictionaries in LangChain format
-    """
-    from langchain_core.messages import SystemMessage, HumanMessage
-    
-    return [
-        SystemMessage(content=system_prompt),
-        HumanMessage(content=user_prompt)
-    ]
+        if include_memory:
+            components.append(MEMORY_INSTRUCTIONS)
+            
+        if specific_rules:
+            components.append("\nSPECIFIC DOMAIN RULES:\n- " + "\n- ".join(specific_rules))
+            
+        return "\n".join(components)
 
-
-def validate_template_variables(template: str, provided_vars: Dict[str, Any]) -> Dict[str, bool]:
-    """
-    Validate that all template variables are provided.
-    
-    Args:
-        template: Prompt template
-        provided_vars: Variables provided
+    @staticmethod
+    def build_conversational_prompt(
+        instruction: str,
+        context: Optional[str] = None,
+        is_voice: bool = False
+    ) -> str:
+        """Assembles a conversational response prompt."""
+        components = [
+            f"You are Clavr. {instruction}",
+            TONE_STYLE_GUIDELINES
+        ]
         
-    Returns:
-        Dictionary mapping variable names to whether they're provided
-    """
-    placeholders = set(re.findall(r'\{(\w+)\}', template))
-    return {var: var in provided_vars for var in placeholders}
-
-
-def extract_template_variables(template: str) -> List[str]:
-    """
-    Extract all variable names from a template.
-    
-    Args:
-        template: Prompt template string
-        
-    Returns:
-        List of variable names found in template
-    """
-    return list(set(re.findall(r'\{(\w+)\}', template)))
+        if context:
+            components.append(f"\nCONTEXT:\n{context}")
+            
+        if is_voice:
+            components.append("\nVOICE CONSTRAINTS:\n- NO MARKDOWN\n- NO EMOJIS\n- STRICT BREVITY")
+            
+        return "\n".join(components)
 

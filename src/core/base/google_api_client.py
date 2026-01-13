@@ -10,6 +10,7 @@ from googleapiclient.discovery import build
 
 from ...utils.logger import setup_logger
 from ...utils.config import Config
+from .exceptions import AuthenticationExpiredError, ServiceUnavailableError
 
 logger = setup_logger(__name__)
 
@@ -30,18 +31,43 @@ class BaseGoogleAPIClient(ABC):
     - _get_service_name(): Return the service name for logging
     """
     
-    def __init__(self, config: Config, credentials: Optional[Credentials] = None):
+    def __init__(self, config: Config, credentials: Optional[Credentials] = None, token_update_callback: Optional[Any] = None):
         """
         Initialize Google API client
         
         Args:
             config: Configuration object
             credentials: OAuth2 credentials (if None, will try to load from token.json)
+            token_update_callback: Optional callback(credentials) to persist refreshed tokens
         """
         self.config = config
         self.credentials = credentials or self._load_credentials()
+        self.token_update_callback = token_update_callback
+        
+        # Wrap credentials.refresh to trigger persistence callback
+        if self.credentials and self.token_update_callback:
+            self._wrap_credentials_refresh()
+            
         self.service = None
         self._initialize_service()
+
+    def _wrap_credentials_refresh(self):
+        """Monkey-patch credentials.refresh to call our callback after success"""
+        if not self.credentials:
+            return
+            
+        original_refresh = self.credentials.refresh
+        
+        def wrapped_refresh(request):
+            logger.info(f"Auto-refreshing credentials for {self._get_service_name()}...")
+            original_refresh(request)
+            logger.info(f"Credentials refreshed successfully. Invoking persistence callback.")
+            try:
+                self.token_update_callback(self.credentials)
+            except Exception as e:
+                logger.error(f"Failed to persist refreshed tokens: {e}")
+        
+        self.credentials.refresh = wrapped_refresh
     
     def _load_credentials(self) -> Optional[Credentials]:
         """
@@ -82,7 +108,7 @@ class BaseGoogleAPIClient(ABC):
             if self.service:
                 logger.info(f"[OK] {self._get_service_name()} API service initialized")
                 logger.debug(f"Service: {self.service}")
-                logger.debug(f"Credentials scopes: {self.credentials.scopes if self.credentials else 'None'}")
+                # logger.debug(f"Credentials scopes: {self.credentials.scopes if self.credentials else 'None'}")
             else:
                 logger.warning(f"Failed to build {self._get_service_name()} service")
                 
@@ -163,6 +189,9 @@ class BaseGoogleAPIClient(ABC):
         
         Returns:
             True if refresh successful, False otherwise
+            
+        Raises:
+            AuthenticationExpiredError: If refresh fails due to invalid_grant (token revoked/expired)
         """
         try:
             # Only refresh if credentials are actually expired
@@ -193,6 +222,11 @@ class BaseGoogleAPIClient(ABC):
             return False
             
         except Exception as e:
+            error_msg = str(e).lower()
+            if "invalid_grant" in error_msg or "token has been expired or revoked" in error_msg:
+                logger.critical(f"CRITICAL: {self._get_service_name()} refresh token invalid/revoked: {e}")
+                raise AuthenticationExpiredError(f"{self._get_service_name()} authentication expired: {e}")from e
+                
             logger.error(f"Failed to refresh {self._get_service_name()} credentials: {e}")
             return False
     

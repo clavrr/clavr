@@ -29,7 +29,7 @@ class GraphSearchService:
     def __init__(
         self,
         config: Config,
-        user_id: int,
+        user_id: Optional[int] = None, # Made optional
         rag_engine: Optional[RAGEngine] = None,
         graph_manager: Optional[KnowledgeGraphManager] = None
     ):
@@ -38,7 +38,7 @@ class GraphSearchService:
         
         Args:
             config: Application configuration
-            user_id: User ID for filtering
+            user_id: Default User ID (deprecated, pass to methods instead)
             rag_engine: Optional RAG engine instance
             graph_manager: Optional graph manager instance
         """
@@ -52,22 +52,7 @@ class GraphSearchService:
         
         if not graph_manager:
             # Initialize graph manager with config
-            graph_config = config.__dict__.get('indexing', {})
-            graph_backend = graph_config.get('graph_backend', 'networkx')
-            
-            if graph_backend == 'neo4j':
-                from ..indexing.graph.graph_constants import NEO4J_DEFAULT_URI
-                neo4j_uri = graph_config.get('neo4j_uri', NEO4J_DEFAULT_URI)
-                neo4j_user = graph_config.get('neo4j_user', 'neo4j')
-                neo4j_password = graph_config.get('neo4j_password', 'password')
-                graph_manager = KnowledgeGraphManager(
-                    backend='neo4j',
-                    neo4j_uri=neo4j_uri,
-                    neo4j_user=neo4j_user,
-                    neo4j_password=neo4j_password
-                )
-            else:
-                graph_manager = KnowledgeGraphManager(backend='networkx')
+            graph_manager = KnowledgeGraphManager(config=config)
         
         self.graph = graph_manager
         
@@ -84,18 +69,19 @@ class GraphSearchService:
         
         # Initialize GraphRAG analyzer
         from ..ai.llm_factory import LLMFactory
-        llm_client = LLMFactory.create_llm(config)
+        llm_client = LLMFactory.get_llm_for_provider(config)
         self.analyzer = GraphRAGAnalyzer(
             graph_manager=self.graph,
             llm_client=llm_client,
             config=config
         )
         
-        logger.info(f"GraphSearchService initialized for user {user_id} with RAG-Graph integration")
+        logger.info(f"GraphSearchService initialized (default_user={user_id})")
     
     async def search(
         self,
         query: str,
+        user_id: Optional[int] = None, # New argument
         use_graph: bool = True,
         use_vector: bool = True,
         max_results: int = 10
@@ -105,6 +91,7 @@ class GraphSearchService:
         
         Args:
             query: Natural language query
+            user_id: User ID for filtering (overrides request-level user_id)
             use_graph: Whether to use graph traversal
             use_vector: Whether to use vector search
             max_results: Maximum number of results
@@ -112,11 +99,16 @@ class GraphSearchService:
         Returns:
             Combined search results with sources
         """
-        logger.info(f"Graph search: '{query}' (user={self.user_id})")
+        # Resolve user_id: Method arg > Instance attr
+        effective_user_id = user_id if user_id is not None else self.user_id
+        if effective_user_id is None:
+             raise ValueError("user_id must be provided to search()")
+             
+        logger.info(f"Graph search: '{query}' (user={effective_user_id})")
         
         try:
             # Add user filter
-            filters = {'user_id': str(self.user_id)}
+            filters = {'user_id': str(effective_user_id)}
             
             # Execute hybrid query
             results = await self.hybrid.query(
@@ -488,5 +480,4 @@ class GraphSearchService:
                 
         except Exception as e:
             logger.error(f"GraphRAG analysis failed: {e}")
-            return {'error': str(e)}
             return {'error': str(e)}

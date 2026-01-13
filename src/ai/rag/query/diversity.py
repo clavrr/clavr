@@ -4,6 +4,7 @@ Result Diversity Enhancement
 Implements Maximal Marginal Relevance (MMR) algorithm to reduce near-duplicate
 results and improve result diversity.
 """
+import re
 from typing import List, Dict, Any, Optional
 import numpy as np
 
@@ -15,13 +16,6 @@ logger = setup_logger(__name__)
 def cosine_similarity(vec1: List[float], vec2: List[float]) -> float:
     """
     Calculate cosine similarity between two vectors.
-    
-    Args:
-        vec1: First vector
-        vec2: Second vector
-        
-    Returns:
-        Cosine similarity score (0-1)
     """
     try:
         a = np.array(vec1)
@@ -43,6 +37,7 @@ def cosine_similarity(vec1: List[float], vec2: List[float]) -> float:
 def text_similarity(text1: str, text2: str) -> float:
     """
     Calculate simple text similarity using Jaccard coefficient.
+    Uses regex for robust tokenization (handles punctuation).
     
     Args:
         text1: First text
@@ -52,9 +47,9 @@ def text_similarity(text1: str, text2: str) -> float:
         Similarity score (0-1)
     """
     try:
-        # Tokenize and create sets
-        words1 = set(text1.lower().split())
-        words2 = set(text2.lower().split())
+        # Tokenize using regex to handle punctuation
+        words1 = set(re.findall(r'\b\w+\b', text1.lower()))
+        words2 = set(re.findall(r'\b\w+\b', text2.lower()))
         
         # Jaccard similarity
         if not words1 or not words2:
@@ -78,18 +73,14 @@ def maximal_marginal_relevance(
 ) -> List[Dict[str, Any]]:
     """
     Apply Maximal Marginal Relevance (MMR) to diversify search results.
-    
-    MMR balances relevance and diversity by selecting documents that are:
-    1. Relevant to the query (high similarity)
-    2. Different from already selected documents (low similarity to each other)
+    Optimized implementation updates max-similarity vector iteratively.
     
     Args:
-        results: List of search results with scores
+        results: List of search results ("candidates")
         query_embedding: Optional query embedding for semantic similarity
         k: Number of results to return
         lambda_param: Balance between relevance (1.0) and diversity (0.0)
-                     0.5 = balanced (default)
-        similarity_key: Key to use for relevance scores ('rerank_score', 'distance', etc.)
+        similarity_key: Key to use for relevance scores
         
     Returns:
         Diversified list of results
@@ -111,7 +102,6 @@ def maximal_marginal_relevance(
                 score = 1.0 / (1.0 + score)
             relevance_scores.append(score)
         else:
-            # Default score
             relevance_scores.append(0.5)
     
     # Normalize relevance scores to 0-1
@@ -121,52 +111,108 @@ def maximal_marginal_relevance(
         if max_score > min_score:
             relevance_scores = [(s - min_score) / (max_score - min_score) for s in relevance_scores]
     
-    # Build similarity matrix between documents
+    # Pruning Optimization: Keep top N candidates to reduce matrix size
+    # For very large result sets (e.g. 500+), computing N*N matrix is slow.
+    if len(results) > 100:
+         # Sort by relevance
+         results_with_scores = list(zip(results, relevance_scores))
+         results_with_scores.sort(key=lambda x: x[1], reverse=True)
+         # Keep top 100
+         results_with_scores = results_with_scores[:100]
+         results, relevance_scores = zip(*results_with_scores)
+         results = list(results)
+         relevance_scores = list(relevance_scores)
+    
     n = len(results)
+    
+    # Build similarity matrix
     similarity_matrix = np.zeros((n, n))
     
-    for i in range(n):
-        for j in range(i + 1, n):
-            # Try to use embeddings if available, otherwise use text similarity
-            if 'embedding' in results[i] and 'embedding' in results[j]:
-                sim = cosine_similarity(results[i]['embedding'], results[j]['embedding'])
-            elif 'content' in results[i] and 'content' in results[j]:
-                sim = text_similarity(results[i]['content'], results[j]['content'])
-            else:
-                # Default: assume some similarity
-                sim = 0.3
+    # Check if we can use vectorized embedding calculation
+    embeddings = []
+    has_embeddings = True
+    for r in results:
+        if 'embedding' not in r or not r['embedding']:
+            has_embeddings = False
+            break
+        embeddings.append(r['embedding'])
+        
+    if has_embeddings and len(embeddings) == n:
+        try:
+            # Stack embeddings into matrix
+            emb_matrix = np.array(embeddings)
+            # Normalize rows
+            norm = np.linalg.norm(emb_matrix, axis=1, keepdims=True)
+            norm[norm == 0] = 1e-10
+            normalized_emb = emb_matrix / norm
+            # Compute similarity matrix via dot product
+            similarity_matrix = np.dot(normalized_emb, normalized_emb.T)
+            similarity_matrix = np.clip(similarity_matrix, 0.0, 1.0)
+        except Exception as e:
+            logger.warning(f"Vectorized similarity failed: {e}, falling back to loop")
+            has_embeddings = False
             
-            similarity_matrix[i][j] = sim
-            similarity_matrix[j][i] = sim
-    
-    # MMR algorithm
+    if not has_embeddings:
+        # Fallback to loop (slower)
+        for i in range(n):
+            for j in range(i + 1, n):
+                if 'embedding' in results[i] and 'embedding' in results[j]:
+                    sim = cosine_similarity(results[i]['embedding'], results[j]['embedding'])
+                elif 'content' in results[i] and 'content' in results[j]:
+                    sim = text_similarity(results[i]['content'], results[j]['content'])
+                else:
+                    sim = 0.3
+                
+                similarity_matrix[i][j] = sim
+                similarity_matrix[j][i] = sim
+                
+    # MMR Algorithm (Optimized)
     selected_indices = []
-    remaining_indices = list(range(n))
+    remaining_indices = set(range(n))
     
-    # Select first document (highest relevance)
+    # Array to track max similarity of each candidate to ANY selected doc
+    # Initialize with 0.0 (or -1.0)
+    current_max_sim = np.zeros(n)
+    
+    # 1. Select first document (highest relevance)
     first_idx = np.argmax(relevance_scores)
     selected_indices.append(first_idx)
     remaining_indices.remove(first_idx)
     
-    # Iteratively select remaining documents
+    # Update max_sim for all docs against this first selection
+    current_max_sim = np.maximum(current_max_sim, similarity_matrix[first_idx])
+    
+    # 2. Iteratively select remaining documents
     while len(selected_indices) < k and remaining_indices:
-        mmr_scores = []
+        best_mmr_score = -float('inf')
+        best_idx = -1
+        
+        # We only check remaining indices
+        # Optimization: convert to list for iteration or use numpy masking if n is large
+        # For n=100, simple loop is fine.
         
         for idx in remaining_indices:
-            # Relevance component (how relevant to query)
+            # Relevance component
             relevance = relevance_scores[idx]
             
-            # Diversity component (max similarity to already selected docs)
-            max_similarity = max([similarity_matrix[idx][s] for s in selected_indices])
+            # Diversity component (already updated in current_max_sim)
+            max_sim = current_max_sim[idx]
             
-            # MMR score: balance relevance and diversity
-            mmr_score = lambda_param * relevance - (1 - lambda_param) * max_similarity
-            mmr_scores.append(mmr_score)
+            # MMR score
+            mmr_score = lambda_param * relevance - (1 - lambda_param) * max_sim
+            
+            if mmr_score > best_mmr_score:
+                best_mmr_score = mmr_score
+                best_idx = idx
         
-        # Select document with highest MMR score
-        best_idx = remaining_indices[np.argmax(mmr_scores)]
+        if best_idx == -1: break # Should not happen
+        
         selected_indices.append(best_idx)
         remaining_indices.remove(best_idx)
+        
+        # 3. Update max similarities for next round
+        # Update vector only against the NEWLY selected document
+        current_max_sim = np.maximum(current_max_sim, similarity_matrix[best_idx])
     
     # Return selected documents in order
     diversified_results = [results[i] for i in selected_indices]
