@@ -316,6 +316,7 @@ class CredentialProvider:
             if auto_refresh and credentials.expired and credentials.refresh_token:
                 try:
                     from google.auth.transport.requests import Request
+                    # Try refreshing with current scopes
                     credentials.refresh(Request())
                     logger.info(f"Refreshed {provider} credentials for user {user_id}")
                     
@@ -354,9 +355,10 @@ class CredentialProvider:
                     # This occurs when the token has a superset of permissions (e.g. 'tasks' full)
                     # but we requested a subset (e.g. 'tasks.readonly').
                     if 'invalid_scope' in error_str and scopes is not None:
-                        logger.warning(f"Refresh failed with invalid_scope. Retrying without explicit scopes for {provider} user {user_id}")
+                        logger.debug(f"Initial refresh for {provider} (user {user_id}) failed with invalid_scope. Retrying with implicit scopes...")
                         try:
-                            # Re-initialize credentials without scopes
+                            # Re-initialize credentials without explicit scopes
+                            # This allows Google to refresh with whatever scopes are associated with the token
                             credentials = Credentials(
                                 token=access_token,
                                 refresh_token=refresh_token,
@@ -366,7 +368,7 @@ class CredentialProvider:
                                 scopes=None
                             )
                             credentials.refresh(Request())
-                            logger.info(f"Retry success: Refreshed {provider} credentials (implicit scopes) for user {user_id}")
+                            logger.info(f"Refreshed {provider} credentials (implicit scopes) for user {user_id}")
                             
                             # Proceed to save updates
                             from ..utils import encrypt_token
@@ -392,7 +394,7 @@ class CredentialProvider:
                             return credentials
                             
                         except Exception as retry_err:
-                            logger.error(f"Retry failed for {provider}: {retry_err}")
+                            logger.error(f"Implicit refresh retry failed for {provider}: {retry_err}")
                             # Fall through to original error handling if retry fails
                     
                     # Check if this is a fatal auth error (invalid_grant means token is revoked/expired permanently)

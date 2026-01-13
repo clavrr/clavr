@@ -13,7 +13,7 @@ from datetime import datetime, timezone, timedelta
 from ...utils.logger import setup_logger
 from ...utils.config import Config
 from ..llm_factory import LLMFactory
-from langchain_core.messages import SystemMessage
+from langchain_core.messages import SystemMessage, HumanMessage
 
 from ..prompts.autonomy_prompts import (
     MORNING_BRIEFING_SYSTEM_PROMPT,
@@ -168,8 +168,11 @@ class BriefingGenerator:
             # Use centralized Prompt
             prompt_content = MORNING_BRIEFING_SYSTEM_PROMPT.format(user_context=user_context)
 
-            # Construct messages list
-            messages = [SystemMessage(content=prompt_content)]
+            # Construct messages list (Gemini requires HumanMessage to trigger 'contents')
+            messages = [
+                SystemMessage(content=prompt_content),
+                HumanMessage(content="Please generate my morning briefing now based on the above context.")
+            ]
             
             result = await asyncio.to_thread(llm.invoke, messages)
             return result.content
@@ -312,7 +315,11 @@ class MeetingBriefGenerator:
             
             prompt_content = MEETING_BRIEFING_SYSTEM_PROMPT.format(user_context=user_context)
 
-            messages = [SystemMessage(content=prompt_content)]
+            # Construct messages list
+            messages = [
+                SystemMessage(content=prompt_content),
+                HumanMessage(content="Please generate the meeting brief now based on the above dossier context.")
+            ]
             
             result = await asyncio.to_thread(llm.invoke, messages)
             return result.content

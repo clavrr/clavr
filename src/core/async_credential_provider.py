@@ -115,20 +115,32 @@ class AsyncCredentialProvider:
                             logger.info(f"Refreshing UserIntegration token for user {user_id}")
                             loop = asyncio.get_event_loop()
                             
-                            def refresh_sync():
-                                creds.refresh(Request())
-                                return creds
-                                
-                            try:
-                                await loop.run_in_executor(None, refresh_sync)
-                                # Update DB
-                                integration.access_token = creds.token
-                                if creds.expiry:
-                                    integration.expires_at = creds.expiry.replace(tzinfo=None)
-                                await db.commit()
-                            except Exception as e:
-                                logger.error(f"Failed to refresh UserIntegration token: {e}")
-                                return None
+                            async def refresh_and_update():
+                                def refresh_sync():
+                                    try:
+                                        creds.refresh(Request())
+                                        return True
+                                    except Exception as e:
+                                        if 'invalid_scope' in str(e).lower():
+                                            logger.debug(f"Async refresh failed with invalid_scope for user {user_id}. Retrying with implicit scopes...")
+                                            # Try again without explicit scopes
+                                            creds.scopes = None
+                                            creds.refresh(Request())
+                                            return True
+                                        raise e
+
+                                try:
+                                    await loop.run_in_executor(None, refresh_sync)
+                                    # Update DB (integration object is already updated in memory by the execute results)
+                                    integration.access_token = creds.token
+                                    if creds.expiry:
+                                        integration.expires_at = creds.expiry.replace(tzinfo=None)
+                                    await db.commit()
+                                except Exception as e:
+                                    logger.error(f"Failed to refresh UserIntegration token for user {user_id}: {e}")
+                                    return None
+
+                            await refresh_and_update()
                                 
                         return creds
             except Exception as e:

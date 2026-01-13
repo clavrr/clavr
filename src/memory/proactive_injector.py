@@ -282,13 +282,13 @@ class ProactiveInjector:
                 soon = now + timedelta(hours=4)
                 
                 # Query for events in the next 4 hours
-                query = f"""
-                MATCH (e:CalendarEvent)
-                WHERE e.user_id = $user_id
-                  AND datetime(e.start_time) >= datetime($now)
-                  AND datetime(e.start_time) <= datetime($soon)
-                RETURN e.title, e.start_time
-                LIMIT 2
+                query = """
+                FOR e IN CalendarEvent
+                    FILTER e.user_id == @user_id
+                      AND e.start_time >= @now
+                      AND e.start_time <= @soon
+                    LIMIT 2
+                    RETURN { title: e.title, start_time: e.start_time }
                 """
                 
                 results = await self.graph_manager.query(
@@ -325,11 +325,12 @@ class ProactiveInjector:
                 for entity in context.active_entities:
                     if hasattr(self.graph_manager, "query"):
                         query = """
-                        MATCH (p:Person)-[:HAS_STATUS]->(s:Status)
-                        WHERE toLower(p.name) CONTAINS toLower($entity)
-                          AND s.type IN ['OOO', 'Busy', 'Unavailable']
-                        RETURN p.name, s.type, s.until
-                        LIMIT 1
+                        FOR p IN Person
+                            FILTER CONTAINS(LOWER(p.name), LOWER(@entity))
+                            FOR s IN OUTBOUND p HAS_STATUS
+                                FILTER s.type IN ['OOO', 'Busy', 'Unavailable']
+                                LIMIT 1
+                                RETURN { name: p.name, type: s.type, until: s.until }
                         """
                         
                         results = await self.graph_manager.query(

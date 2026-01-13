@@ -13,9 +13,7 @@ from src.utils.logger import setup_logger
 
 logger = setup_logger(__name__)
 
-# =============================================================================
 # ENTITY EXTRACTION
-# =============================================================================
 
 # Words to exclude from entity extraction (expanded)
 EXCLUDED_ENTITIES: Set[str] = {
@@ -103,9 +101,7 @@ def normalize_fact_content(content: str) -> str:
     return ' '.join(content.lower().split())
 
 
-# =============================================================================
 # EMBEDDING UTILITIES
-# =============================================================================
 
 _embedding_provider = None
 

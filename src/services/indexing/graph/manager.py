@@ -927,21 +927,8 @@ class KnowledgeGraphManager:
          return await asyncio.to_thread(_execute)
 
     async def _query_arangodb(self, query: str, params: Dict[str, Any]) -> List[Dict[str, Any]]:
-        """Execute AQL query, with automatic legacy-to-AQL translation."""
-        # Import translator
-        try:
-            from .legacy_query_translator import translate_legacy_query
-            
-            # Check if query looks like legacy Cypher (contains MATCH)
-            if 'MATCH' in query.upper():
-                aql_query, aql_params = translate_legacy_query(query, params)
-            else:
-                aql_query, aql_params = query, params
-        except (ImportError, ModuleNotFoundError):
-            aql_query, aql_params = query, params
-        except Exception as e:
-            logger.warning(f"Legacy query translation failed, using original: {e}")
-            aql_query, aql_params = query, params
+        """Execute AQL query."""
+        aql_query, aql_params = query, params
         
         def _execute():
             try:

@@ -162,16 +162,33 @@ class PersonIntelligenceService:
         """Get basic person profile from graph."""
         try:
             query = """
-            MATCH (p)
-            WHERE (p:Person OR p:Contact) AND (elementId(p) = $id OR p.id = $id OR p.email = $id)
-            RETURN p.name as name, 
-                   p.email as email,
-                   p.emails as emails,
-                   p.source as source,
-                   p.company as company,
-                   p.title as title
-            LIMIT 1
+            FOR p IN Person
+                FILTER p.id == @id OR p.email == @id
+                LIMIT 1
+                RETURN {
+                    name: p.name,
+                    email: p.email,
+                    emails: p.emails,
+                    source: p.source,
+                    company: p.company,
+                    title: p.title
+                }
             """
+            # Also check Contact collection
+            if not person_id.startswith('p:'): # Basic check if it's not already a Person ID
+                query = """
+                FOR p IN Contact
+                    FILTER p.id == @id OR p.email == @id
+                    LIMIT 1
+                    RETURN {
+                        name: p.name,
+                        email: p.email,
+                        emails: p.emails,
+                        source: p.source,
+                        company: p.company,
+                        title: p.title
+                    }
+                """
             result = await self.graph.execute_query(query, {"id": person_id})
             if result:
                 row = result[0]
@@ -207,13 +224,15 @@ class PersonIntelligenceService:
             cutoff = (datetime.utcnow() - timedelta(days=days)).isoformat()
             
             query = """
-            MATCH (p)-[r]-(content)
-            WHERE (elementId(p) = $person_id OR p.id = $person_id OR p.email = $person_id)
-              AND content.user_id = $user_id
-              AND content.timestamp >= $cutoff
-            WITH labels(content)[0] as type, count(*) as count, max(content.timestamp) as last
-            RETURN type, count, last
-            ORDER BY count DESC
+            FOR p IN Person
+                FILTER p.id == @person_id OR p.email == @person_id
+                FOR content, edge IN ANY p FROM, TO, CC, HAS_ATTENDEE, ASSIGNED_TO, MENTIONS
+                    FILTER content.user_id == @user_id
+                       AND content.timestamp >= @cutoff
+                    COLLECT type = content.node_type WITH COUNT INTO count
+                    AGGREGATE last = MAX(content.timestamp)
+                    SORT count DESC
+                    RETURN { type, count, last }
             """
             
             result = await self.graph.execute_query(query, {
@@ -289,14 +308,17 @@ class PersonIntelligenceService:
         try:
             # Unanswered emails
             email_query = """
-            MATCH (p)-[:SENT]->(e:Email)
-            WHERE (elementId(p) = $person_id OR p.id = $person_id OR p.email = $person_id)
-              AND e.user_id = $user_id
-              AND e.timestamp >= $cutoff
-              AND NOT (e)<-[:REPLIED_TO]-(:Email)
-            RETURN e.id as id, e.subject as subject, e.timestamp as timestamp
-            ORDER BY e.timestamp DESC
-            LIMIT 5
+            FOR p IN Person
+                FILTER p.id == @person_id OR p.email == @person_id
+                FOR e IN OUTBOUND p SENT
+                    FILTER e.user_id == @user_id
+                       AND e.timestamp >= @cutoff
+                    # Check if any reply exists
+                    LET replies = (FOR r IN INBOUND e REPLIED_TO RETURN r)
+                    FILTER LENGTH(replies) == 0
+                    SORT e.timestamp DESC
+                    LIMIT 5
+                    RETURN { id: e.id, subject: e.subject, timestamp: e.timestamp }
             """
             
             email_result = await self.graph.execute_query(email_query, {
@@ -316,13 +338,14 @@ class PersonIntelligenceService:
             
             # Pending tasks involving this person
             task_query = """
-            MATCH (p)-[:ASSIGNED_TO|ASSIGNED_BY]-(t:Task)
-            WHERE (elementId(p) = $person_id OR p.id = $person_id OR p.email = $person_id)
-              AND t.user_id = $user_id
-              AND t.status IN ['pending', 'in_progress']
-            RETURN t.id as id, t.title as title, t.due_date as due_date
-            ORDER BY t.due_date
-            LIMIT 5
+            FOR p IN Person
+                FILTER p.id == @person_id OR p.email == @person_id
+                FOR t IN ANY p ASSIGNED_TO, ASSIGNED_BY
+                    FILTER t.user_id == @user_id
+                       AND t.status IN ['pending', 'in_progress']
+                    SORT t.due_date
+                    LIMIT 5
+                    RETURN { id: t.id, title: t.title, due_date: t.due_date }
             """
             
             task_result = await self.graph.execute_query(task_query, {
@@ -352,13 +375,15 @@ class PersonIntelligenceService:
         """Get topics/projects shared with this person."""
         try:
             query = """
-            MATCH (p)-[:DISCUSSES|WORKS_ON|PARTICIPATES_IN]-(entity)-[:DISCUSSES|WORKS_ON|PARTICIPATES_IN]-(content)
-            WHERE (elementId(p) = $person_id OR p.id = $person_id OR p.email = $person_id)
-              AND content.user_id = $user_id
-              AND (entity:Topic OR entity:Project)
-            RETURN DISTINCT entity.name as name, count(*) as strength
-            ORDER BY strength DESC
-            LIMIT 10
+            FOR p IN Person
+                FILTER p.id == @person_id OR p.email == @person_id
+                FOR entity, edge IN ANY p DISCUSSES, WORKS_ON, PARTICIPATES_IN
+                    FOR content IN ANY entity DISCUSSES, WORKS_ON, PARTICIPATES_IN
+                        FILTER content.user_id == @user_id
+                        COLLECT name = entity.name WITH COUNT INTO strength
+                        SORT strength DESC
+                        LIMIT 10
+                        RETURN { name, strength }
             """
             
             result = await self.graph.execute_query(query, {
@@ -383,12 +408,13 @@ class PersonIntelligenceService:
         try:
             # Get channel distribution
             channel_query = """
-            MATCH (p)-[r]-(content)
-            WHERE (elementId(p) = $person_id OR p.id = $person_id OR p.email = $person_id)
-              AND content.user_id = $user_id
-            WITH labels(content)[0] as type, count(*) as count
-            RETURN type, count
-            ORDER BY count DESC
+            FOR p IN Person
+                FILTER p.id == @person_id OR p.email == @person_id
+                FOR content, edge IN ANY p FROM, TO, CC, HAS_ATTENDEE, ASSIGNED_TO, MENTIONS
+                    FILTER content.user_id == @user_id
+                    COLLECT type = content.node_type WITH COUNT INTO count
+                    SORT count DESC
+                    RETURN { type, count }
             """
             
             channel_result = await self.graph.execute_query(channel_query, {
@@ -415,15 +441,23 @@ class PersonIntelligenceService:
                 else:
                     patterns.communication_frequency = "rare"
             
-            # Get response time (simplified - would need reply chain analysis)
             response_query = """
-            MATCH (e1:Email)-[:REPLIED_TO]->(e2:Email)
-            WHERE (e1.sender = $person_id OR e2.sender = $person_id)
-              AND (e1.user_id = $user_id OR e2.user_id = $user_id)
-            RETURN avg(
-                duration.between(datetime(e1.timestamp), datetime(e2.timestamp)).hours
-            ) as avg_response_hours
-            LIMIT 1
+            FOR e1 IN Email
+                FILTER e1.sender == @person_id OR e1.user_id == @user_id
+                FOR e2 IN OUTBOUND e1 REPLIED_TO
+                    FILTER e1.user_id == @user_id OR e2.user_id == @user_id
+                    RETURN DATE_DIFF(e2.timestamp, e1.timestamp, "h")
+            """
+            # Take average of returned diffs in Python if desired, or use AQL
+            response_query = """
+            LET diffs = (
+                FOR e1 IN Email
+                    FILTER e1.sender == @person_id OR e1.user_id == @user_id
+                    FOR e2 IN OUTBOUND e1 REPLIED_TO
+                        FILTER e1.user_id == @user_id OR e2.user_id == @user_id
+                        RETURN ABS(DATE_DIFF(e2.timestamp, e1.timestamp, "h"))
+            )
+            RETURN LENGTH(diffs) > 0 ? AVERAGE(diffs) : null
             """
             # Note: This query is simplified and may need adjustment for actual graph structure
             
@@ -449,13 +483,14 @@ class PersonIntelligenceService:
         try:
             # Get interaction counts by week for last 8 weeks
             query = """
-            MATCH (p)-[r]-(content)
-            WHERE (elementId(p) = $person_id OR p.id = $person_id OR p.email = $person_id)
-              AND content.user_id = $user_id
-              AND content.timestamp >= $cutoff
-            WITH date(datetime(content.timestamp)) as day, count(*) as count
-            RETURN day, count
-            ORDER BY day
+            FOR p IN Person
+                FILTER p.id == @person_id OR p.email == @person_id
+                FOR content, edge IN ANY p FROM, TO, CC, HAS_ATTENDEE, ASSIGNED_TO, MENTIONS
+                    FILTER content.user_id == @user_id
+                       AND content.timestamp >= @cutoff
+                    COLLECT day = DATE_FORMAT(content.timestamp, "%Y-%m-%d") WITH COUNT INTO count
+                    SORT day
+                    RETURN { day, count }
             """
             
             cutoff = (datetime.utcnow() - timedelta(days=56)).isoformat()  # 8 weeks
@@ -532,14 +567,14 @@ class PersonIntelligenceService:
             
             # Check for upcoming meetings
             upcoming_query = """
-            MATCH (e:CalendarEvent)-[:HAS_ATTENDEE]->(p)
-            WHERE (elementId(p) = $person_id OR p.id = $person_id OR p.email = $person_id)
-              AND e.user_id = $user_id
-              AND e.start_time >= $now
-              AND e.start_time <= $next_week
-            RETURN e.title as title, e.start_time as start_time
-            ORDER BY e.start_time
-            LIMIT 1
+            FOR e IN CalendarEvent
+                FILTER e.user_id == @user_id
+                   AND e.start_time >= @now
+                   AND e.start_time <= @next_week
+                FOR p IN OUTBOUND e HAS_ATTENDEE
+                    FILTER p.id == @person_id OR p.email == @person_id
+                    LIMIT 1
+                    RETURN { title: e.title, start_time: e.start_time }
             """
             
             upcoming_result = await self.graph.execute_query(upcoming_query, {

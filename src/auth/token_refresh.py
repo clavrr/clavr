@@ -185,6 +185,50 @@ async def refresh_token_with_retry(
                 f"{error_type}: {error_str}"
             )
             
+            # Check if it's an invalid_scope error
+            if "invalid_scope" in error_str.lower() and scopes is not None:
+                logger.debug(f"Refresh for session {session.id} failed with invalid_scope. Retrying with implicit scopes...")
+                try:
+                    # Re-initialize credentials without explicit scopes
+                    credentials = Credentials(
+                        token=access_token,
+                        refresh_token=refresh_token,
+                        token_uri="https://oauth2.googleapis.com/token",
+                        client_id=client_id,
+                        client_secret=client_secret,
+                        scopes=None
+                    )
+                    credentials.refresh(Request())
+                    logger.info(f"Successfully refreshed token for session {session.id} using implicit scopes")
+                    
+                    # Update tokens in database
+                    encrypted_access_token = encrypt_token(credentials.token)
+                    session.gmail_access_token = cast(str, encrypted_access_token)
+                    
+                    if credentials.refresh_token and credentials.refresh_token != refresh_token:
+                        session.gmail_refresh_token = cast(str, encrypt_token(credentials.refresh_token))
+                    
+                    if credentials.expiry:
+                        session.token_expiry = credentials.expiry.replace(tzinfo=None)
+                    
+                    db.commit()
+                    db.refresh(session)
+                    
+                    # Log successful token refresh
+                    await log_auth_event(
+                        db=db,
+                        event_type=AuditEventType.TOKEN_REFRESH_SUCCESS,
+                        user_id=session.user_id,
+                        success=True,
+                        session_id=session.id,
+                        attempt=attempt + 1,
+                        encrypted=True
+                    )
+                    return True, credentials
+                except Exception as retry_err:
+                    logger.debug(f"Implicit refresh retry also failed: {retry_err}")
+                    # Fall through to standard error handling and retry logic
+            
             # Check if it's an invalid_grant error (permanent - token revoked/expired)
             # Google OAuth can raise various exceptions, check for invalid_grant in multiple ways
             # Common exception types: RefreshError, OAuth2Error, or generic Exception with invalid_grant message

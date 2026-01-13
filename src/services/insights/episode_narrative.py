@@ -215,10 +215,17 @@ class EpisodeNarrativeService:
         """Get episode node data."""
         try:
             query = """
-            MATCH (e:Episode {id: $id})
-            RETURN e.id as id, e.name as name, e.description as description,
-                   e.start_time as start_time, e.end_time as end_time,
-                   e.event_count as event_count, e.significance as significance
+            FOR e IN Episode
+                FILTER e.id == @id
+                RETURN {
+                    id: e.id,
+                    name: e.name,
+                    description: e.description,
+                    start_time: e.start_time,
+                    end_time: e.end_time,
+                    event_count: e.event_count,
+                    significance: e.significance
+                }
             """
             result = await self.graph.execute_query(query, {"id": episode_id})
             if result:
@@ -243,14 +250,18 @@ class EpisodeNarrativeService:
             end_time = episode.get("end_time", "")
             
             query = """
-            MATCH (e)-[:OCCURRED_DURING]->(tb:TimeBlock)
-            WHERE tb.start_time >= $start AND tb.start_time <= $end
-            RETURN e.id as id, labels(e)[0] as type, 
-                   NOT_NULL(e.subject, e.title, e.text) as title,
-                   e.timestamp as timestamp,
-                   e.source as source
-            ORDER BY e.timestamp
-            LIMIT $limit
+            FOR tb IN TimeBlock
+                FILTER tb.start_time >= @start AND tb.start_time <= @end
+                FOR e IN INBOUND tb OCCURRED_DURING
+                    SORT e.timestamp
+                    LIMIT @limit
+                    RETURN {
+                        id: e.id,
+                        type: e.node_type,
+                        title: NOT_NULL(e.subject, e.title, e.text),
+                        timestamp: e.timestamp,
+                        source: e.source
+                    }
             """
             
             result = await self.graph.execute_query(query, {
@@ -279,13 +290,14 @@ class EpisodeNarrativeService:
             end_time = episode.get("end_time", "")
             
             query = """
-            MATCH (e)-[:OCCURRED_DURING]->(tb:TimeBlock)
-            WHERE tb.start_time >= $start AND tb.start_time <= $end
-            MATCH (e)-[:FROM|TO|CC|HAS_ATTENDEE|ASSIGNED_TO|MENTIONS]-(p:Person)
-            RETURN p.name as name, p.email as email, p.id as id,
-                   count(DISTINCT e) as interaction_count
-            ORDER BY interaction_count DESC
-            LIMIT $limit
+            FOR tb IN TimeBlock
+                FILTER tb.start_time >= @start AND tb.start_time <= @end
+                FOR e IN INBOUND tb OCCURRED_DURING
+                    FOR p IN ANY e FROM, TO, CC, HAS_ATTENDEE, ASSIGNED_TO, MENTIONS
+                        COLLECT name = p.name, email = p.email, id = p.id WITH COUNT INTO interaction_count
+                        SORT interaction_count DESC
+                        LIMIT @limit
+                        RETURN { name, email, id, interaction_count }
             """
             
             result = await self.graph.execute_query(query, {
@@ -325,10 +337,10 @@ class EpisodeNarrativeService:
             
             # Find completed tasks
             task_query = """
-            MATCH (t:Task)
-            WHERE t.completed_at >= $start AND t.completed_at <= $end
-            RETURN t.id as id, t.title as title, 'task_completed' as type
-            LIMIT 5
+            FOR t IN ActionItem
+                FILTER t.completed_at >= @start AND t.completed_at <= @end
+                LIMIT 5
+                RETURN { id: t.id, title: t.title, type: 'task_completed' }
             """
             
             tasks = await self.graph.execute_query(task_query, {
@@ -345,10 +357,10 @@ class EpisodeNarrativeService:
             
             # Find documents created
             doc_query = """
-            MATCH (d:Document)
-            WHERE d.created_at >= $start AND d.created_at <= $end
-            RETURN d.id as id, d.title as title, 'document_created' as type
-            LIMIT 3
+            FOR d IN Document
+                FILTER d.created_at >= @start AND d.created_at <= @end
+                LIMIT 3
+                RETURN { id: d.id, title: d.title, type: 'document_created' }
             """
             
             docs = await self.graph.execute_query(doc_query, {
@@ -404,11 +416,11 @@ class EpisodeNarrativeService:
             
             # Find pending tasks created during episode
             task_query = """
-            MATCH (t:Task)
-            WHERE t.created_at >= $start AND t.created_at <= $end
-              AND (t.status IS NULL OR t.status IN ['pending', 'in_progress'])
-            RETURN t.id as id, t.title as title, t.due_date as due_date
-            LIMIT 5
+            FOR t IN ActionItem
+                FILTER t.created_at >= @start AND t.created_at <= @end
+                  AND (t.status == null OR t.status IN ['pending', 'in_progress'])
+                LIMIT 5
+                RETURN { id: t.id, title: t.title, due_date: t.due_date }
             """
             
             tasks = await self.graph.execute_query(task_query, {
@@ -444,9 +456,20 @@ class EpisodeNarrativeService:
         """Get topics associated with an episode."""
         try:
             query = """
-            MATCH (t:Topic)-[:ACTIVE_DURING]->(e:Episode {id: $id})
-            RETURN t.name as name
-            ORDER BY t.name
+            FOR e IN Episode
+                FILTER e.id == @id
+                FOR t IN INBOUND e ACTIVE_DURING
+                    # Wait, check schema. Is it Topic -> Episode or Episode -> Topic?
+                    # The original was (t:Topic)-[:ACTIVE_DURING]->(e:Episode)
+                    RETURN t.name
+            """
+            
+            # Re-verifying schema for Topics: (Topic)-[:ACTIVE_DURING]->(Episode)
+            query = """
+            FOR t IN Topic
+                FOR e IN OUTBOUND t ACTIVE_DURING
+                    FILTER e.id == @id
+                    RETURN t.name
             """
             
             result = await self.graph.execute_query(query, {"id": episode_id})
@@ -465,13 +488,18 @@ class EpisodeNarrativeService:
         """Get episodes in a date range."""
         try:
             query = """
-            MATCH (e:Episode)
-            WHERE e.user_id = $user_id
-              AND e.start_time >= $start
-              AND e.start_time <= $end
-            RETURN e.id as id, e.name as name, e.event_count as event_count,
-                   e.start_time as start_time, e.end_time as end_time
-            ORDER BY e.event_count DESC
+            FOR e IN Episode
+                FILTER e.user_id == @user_id
+                  AND e.start_time >= @start
+                  AND e.start_time <= @end
+                SORT e.event_count DESC
+                RETURN {
+                    id: e.id,
+                    name: e.name,
+                    event_count: e.event_count,
+                    start_time: e.start_time,
+                    end_time: e.end_time
+                }
             """
             
             result = await self.graph.execute_query(query, {
@@ -497,13 +525,14 @@ class EpisodeNarrativeService:
         try:
             # Get activity counts by type
             query = """
-            MATCH (e)-[:OCCURRED_DURING]->(tb:TimeBlock)
-            WHERE tb.user_id = $user_id
-              AND tb.start_time >= $start
-              AND tb.start_time <= $end
-            WITH labels(e)[0] as type, count(*) as count
-            RETURN type, count
-            ORDER BY count DESC
+            FOR tb IN TimeBlock
+                FILTER tb.user_id == @user_id
+                  AND tb.start_time >= @start
+                  AND tb.start_time <= @end
+                FOR e IN INBOUND tb OCCURRED_DURING
+                    COLLECT type = e.node_type WITH COUNT INTO count
+                    SORT count DESC
+                    RETURN { type, count }
             """
             
             result = await self.graph.execute_query(query, {

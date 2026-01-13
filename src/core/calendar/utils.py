@@ -752,25 +752,24 @@ def resolve_name_to_email_via_graph(
         
         # Use case-insensitive matching for better results
         # First try exact match, then try partial/fuzzy match
-        graph_query = """
-        MATCH (a:Alias)
-        WHERE toLower(a.value) = toLower($name)
-        MATCH (a)<-[:HAS_ALIAS]-(p:Person)
-        MATCH (p)-[:HAS_EMAIL]->(e:EmailAddress)
-        RETURN e.address AS email
-        LIMIT 1
-        """
-        
-        # Add user_id filter if provided (for multi-user support)
         if user_id:
             graph_query = """
-            MATCH (a:Alias)
-            WHERE toLower(a.value) = toLower($name)
-            MATCH (a)<-[:HAS_ALIAS]-(p:Person)
-            WHERE p.user_id = $user_id OR p.user_id IS NULL
-            MATCH (p)-[:HAS_EMAIL]->(e:EmailAddress)
-            RETURN e.address AS email
-            LIMIT 1
+            FOR a IN Alias
+                FILTER LOWER(a.value) == LOWER(@name)
+                FOR p IN INBOUND a HAS_ALIAS
+                    FILTER p.user_id == @user_id OR p.user_id == null
+                    FOR e IN OUTBOUND p HAS_EMAIL
+                        LIMIT 1
+                        RETURN e.address
+            """
+        else:
+            graph_query = """
+            FOR a IN Alias
+                FILTER LOWER(a.value) == LOWER(@name)
+                FOR p IN INBOUND a HAS_ALIAS
+                    FOR e IN OUTBOUND p HAS_EMAIL
+                        LIMIT 1
+                        RETURN e.address
             """
         
         params = {"name": name.strip()}
@@ -827,38 +826,30 @@ def resolve_name_to_email_via_graph(
         
         # If exact match failed, try partial/fuzzy match (contains)
         # This helps find "Nick" when stored as "Nicholas" or "Nicky"
-        fuzzy_query = """
-        MATCH (a:Alias)
-        WHERE toLower(a.value) CONTAINS toLower($name) OR toLower($name) CONTAINS toLower(a.value)
-        MATCH (a)<-[:HAS_ALIAS]-(p:Person)
-        MATCH (p)-[:HAS_EMAIL]->(e:EmailAddress)
-        RETURN e.address AS email, a.value AS alias
-        ORDER BY 
-            CASE 
-                WHEN toLower(a.value) = toLower($name) THEN 1
-                WHEN toLower(a.value) STARTS WITH toLower($name) THEN 2
-                WHEN toLower($name) STARTS WITH toLower(a.value) THEN 3
-                ELSE 4
-            END
-        LIMIT 1
-        """
-        
         if user_id:
             fuzzy_query = """
-            MATCH (a:Alias)
-            WHERE toLower(a.value) CONTAINS toLower($name) OR toLower($name) CONTAINS toLower(a.value)
-            MATCH (a)<-[:HAS_ALIAS]-(p:Person)
-            WHERE p.user_id = $user_id OR p.user_id IS NULL
-            MATCH (p)-[:HAS_EMAIL]->(e:EmailAddress)
-            RETURN e.address AS email, a.value AS alias
-            ORDER BY 
-                CASE 
-                    WHEN toLower(a.value) = toLower($name) THEN 1
-                    WHEN toLower(a.value) STARTS WITH toLower($name) THEN 2
-                    WHEN toLower($name) STARTS WITH toLower(a.value) THEN 3
-                    ELSE 4
-                END
-            LIMIT 1
+            FOR a IN Alias
+                FILTER CONTAINS(LOWER(a.value), LOWER(@name)) OR CONTAINS(LOWER(@name), LOWER(a.value))
+                FOR p IN INBOUND a HAS_ALIAS
+                    FILTER p.user_id == @user_id OR p.user_id == null
+                    FOR e IN OUTBOUND p HAS_EMAIL
+                        SORT LOWER(a.value) == LOWER(@name) ? 1 : 
+                             STARTS_WITH(LOWER(a.value), LOWER(@name)) ? 2 : 
+                             STARTS_WITH(LOWER(@name), LOWER(a.value)) ? 3 : 4
+                        LIMIT 1
+                        RETURN { email: e.address, alias: a.value }
+            """
+        else:
+            fuzzy_query = """
+            FOR a IN Alias
+                FILTER CONTAINS(LOWER(a.value), LOWER(@name)) OR CONTAINS(LOWER(@name), LOWER(a.value))
+                FOR p IN INBOUND a HAS_ALIAS
+                    FOR e IN OUTBOUND p HAS_EMAIL
+                        SORT LOWER(a.value) == LOWER(@name) ? 1 : 
+                             STARTS_WITH(LOWER(a.value), LOWER(@name)) ? 2 : 
+                             STARTS_WITH(LOWER(@name), LOWER(a.value)) ? 3 : 4
+                        LIMIT 1
+                        RETURN { email: e.address, alias: a.value }
             """
         
         results = execute_graph_query(fuzzy_query, params)

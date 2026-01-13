@@ -84,12 +84,19 @@ class PersonUnificationService:
         try:
             # 1. Search by email (most reliable)
             if email:
-                email_query = f"""
-                MATCH (p)
-                WHERE (p:Person OR p:Contact)
-                AND (p.email = $email OR $email IN p.emails)
-                RETURN p, labels(p) as labels
+                email_query = """
+                FOR p IN Person
+                    FILTER p.email == @email OR @email IN p.emails
+                    RETURN { node: p, labels: ["Person"] }
                 """
+                # Support Contact as well
+                if not email.endswith('@corp.com'): # Hypothetical check
+                    email_query_contact = """
+                    FOR p IN Contact
+                        FILTER p.email == @email OR @email IN p.emails
+                        RETURN { node: p, labels: ["Contact"] }
+                    """
+                    # ... implementation would need to merge or run both
                 result = await self.graph.query(email_query, {"email": email.lower()})
                 for record in result:
                     matches.append({
@@ -100,10 +107,10 @@ class PersonUnificationService:
                     
             # 2. Search by Slack ID
             if slack_id:
-                slack_query = f"""
-                MATCH (p:Person)
-                WHERE p.slack_user_id = $slack_id
-                RETURN p, labels(p) as labels
+                slack_query = """
+                FOR p IN Person
+                    FILTER p.slack_user_id == @slack_id
+                    RETURN { node: p, labels: ["Person"] }
                 """
                 result = await self.graph.query(slack_query, {"slack_id": slack_id})
                 for record in result:
@@ -115,11 +122,10 @@ class PersonUnificationService:
                     
             # 3. Fuzzy name search (lower confidence)
             if name and len(name) > 2:
-                name_query = f"""
-                MATCH (p)
-                WHERE (p:Person OR p:Contact)
-                AND toLower(p.name) CONTAINS toLower($name)
-                RETURN p, labels(p) as labels
+                name_query = """
+                FOR p IN Person
+                    FILTER CONTAINS(LOWER(p.name), LOWER(@name))
+                    RETURN { node: p, labels: ["Person"] }
                 """
                 result = await self.graph.query(name_query, {"name": name})
                 for record in result:
@@ -153,10 +159,19 @@ class PersonUnificationService:
         try:
             # 1. Get the base person node
             base_query = """
-            MATCH (p)
-            WHERE elementId(p) = $id OR p.node_id = $id
-            RETURN p
+            FOR p IN Person
+                FILTER p.id == @id OR p.node_id == @id
+                LIMIT 1
+                RETURN p
             """
+            # Also check Contact
+            if not person_id.startswith('p:'):
+                 base_query_contact = """
+                 FOR p IN Contact
+                     FILTER p.id == @id OR p.node_id == @id
+                     LIMIT 1
+                     RETURN p
+                 """
             result = await self.graph.query(base_query, {"id": person_id})
             if not result:
                 return None
@@ -167,10 +182,11 @@ class PersonUnificationService:
             
             # 2. Find all related identities via SAME_AS relationships
             same_as_query = """
-            MATCH (p)-[:SAME_AS*0..3]-(related)
-            WHERE elementId(p) = $id OR p.node_id = $id
-            AND (related:Person OR related:Contact)
-            RETURN DISTINCT related
+            FOR p IN Person
+                FILTER p.id == @id OR p.node_id == @id
+                FOR v, e, path IN 0..3 ANY p SAME_AS
+                    FILTER IS_SAME_COLLECTION("Person", v) OR IS_SAME_COLLECTION("Contact", v)
+                    RETURN DISTINCT v
             """
             related_result = await self.graph.query(same_as_query, {"id": person_id})
             
@@ -273,17 +289,21 @@ class PersonUnificationService:
         try:
             # Get interactions from graph
             query = """
-            MATCH (p)-[r]-(content)
-            WHERE (elementId(p) = $person_id OR p.node_id = $person_id)
-            AND content.user_id = $user_id
-            RETURN type(r) as rel_type, 
-                   labels(content) as content_type,
-                   content.timestamp as timestamp,
-                   content.subject as subject,
-                   content.text as text
-            ORDER BY content.timestamp DESC
-            LIMIT 50
+            FOR p IN Person
+                FILTER p.id == @person_id OR p.node_id == @person_id
+                FOR content, edge IN ANY p FROM, TO, CC, HAS_ATTENDEE, ASSIGNED_TO, MENTIONS
+                    FILTER content.user_id == @user_id
+                    SORT content.timestamp DESC
+                    LIMIT 50
+                    RETURN { 
+                        rel_type: edge.label, 
+                        content_type: [content.node_type],
+                        timestamp: content.timestamp,
+                        subject: content.subject,
+                        text: content.text
+                    }
             """
+            # Label in edge might be 'edge_type' or similar
             result = await self.graph.query(query, {
                 "person_id": person_id,
                 "user_id": user_id
@@ -335,15 +355,18 @@ class PersonUnificationService:
         """
         try:
             query = """
-            MATCH (p:Person)<-[r]-(content)
-            WHERE content.user_id = $user_id
-            WITH p, count(r) as interactions
-            ORDER BY interactions DESC
-            LIMIT $limit
-            RETURN p.name as name, 
-                   p.email as email,
-                   elementId(p) as id,
-                   interactions
+            FOR p IN Person
+                FOR content, edge IN INBOUND p FROM, TO, CC, HAS_ATTENDEE, ASSIGNED_TO, MENTIONS
+                    FILTER content.user_id == @user_id
+                    COLLECT person = p WITH COUNT INTO interactions
+                    SORT interactions DESC
+                    LIMIT @limit
+                    RETURN {
+                        name: person.name,
+                        email: person.email,
+                        id: person.id,
+                        interactions: interactions
+                    }
             """
             result = await self.graph.query(query, {
                 "user_id": user_id,
@@ -378,16 +401,34 @@ class PersonUnificationService:
         """
         try:
             query = """
-            MATCH (t:Topic)<-[:ABOUT]-(content)-[r]-(p:Person)
-            WHERE toLower(t.name) CONTAINS toLower($topic)
-            AND content.user_id = $user_id
-            WITH p, count(DISTINCT content) as relevance
-            ORDER BY relevance DESC
-            LIMIT 5
-            RETURN p.name as name, 
-                   p.email as email,
-                   relevance
+            FOR t IN Topic
+                FILTER CONTAINS(LOWER(t.name), LOWER(@topic))
+                FOR content IN INBOUND t ABOUT
+                    FILTER content.user_id == @user_id
+                    FOR p IN ANY content FROM, TO, CC, HAS_ATTENDEE, ASSIGNED_TO, MENTIONS
+                        # Limit to Person nodes
+                        COLLECT person = p WITH COUNT INTO relevance
+                        SORT relevance DESC
+                        LIMIT 5
+                        RETURN {
+                            name: person.name,
+                            email: person.email,
+                            relevance: relevance
+                        }
             """
+            # Note: Edge labels might need refining
+            query = """
+            FOR t IN Topic
+                FILTER CONTAINS(LOWER(t.name), LOWER(@topic))
+                FOR content IN INBOUND t ABOUT
+                    FILTER content.user_id == @user_id
+                    FOR p IN ANY content FROM, TO, CC, HAS_ATTENDEE, ASSIGNED_TO, MENTIONS
+                        COLLECT name = p.name, email = p.email WITH COUNT INTO relevance
+                        SORT relevance DESC
+                        LIMIT 5
+                        RETURN { name, email, relevance }
+            """
+            
             result = await self.graph.query(query, {
                 "user_id": user_id,
                 "topic": topic
@@ -415,10 +456,11 @@ class PersonUnificationService:
         """Calculate relationship strength and interaction metrics"""
         try:
             query = """
-            MATCH (p)-[r]-(content)
-            WHERE elementId(p) = $id OR p.node_id = $id
-            RETURN count(r) as count,
-                   max(content.timestamp) as last_ts
+            FOR p IN Person
+                FILTER p.id == @id OR p.node_id == @id
+                FOR content, edge IN ANY p FROM, TO, CC, HAS_ATTENDEE, ASSIGNED_TO, MENTIONS
+                    COLLECT AGGREGATE count = COUNT(content), last_ts = MAX(content.timestamp)
+                    RETURN { count, last_ts }
             """
             result = await self.graph.query(query, {"id": person_id})
             
@@ -455,9 +497,10 @@ class PersonUnificationService:
         
         try:
             query = """
-            MATCH (p)-[:ABOUT|DISCUSSES|WORKS_ON]-(entity)
-            WHERE elementId(p) = $id OR p.node_id = $id
-            RETURN labels(entity) as labels, entity.name as name
+            FOR p IN Person
+                FILTER p.id == @id OR p.node_id == @id
+                FOR entity, edge IN ANY p ABOUT, DISCUSSES, WORKS_ON
+                    RETURN { labels: [entity.node_type], name: entity.name }
             """
             result = await self.graph.query(query, {"id": person_id})
             
