@@ -2,8 +2,9 @@
 SQLAlchemy models for multi-user authentication and settings
 """
 from datetime import datetime, timedelta
-from sqlalchemy import Column, Integer, String, Boolean, DateTime, Text, ForeignKey, JSON, Index, Float
+from sqlalchemy import Column, Integer, String, Boolean, DateTime, Text, ForeignKey, JSON, Index, Float, or_
 from sqlalchemy.orm import DeclarativeBase, relationship
+from sqlalchemy.ext.hybrid import hybrid_property
 
 class Base(DeclarativeBase):
     pass
@@ -36,8 +37,22 @@ class User(Base):
     total_emails_indexed = Column(Integer, default=0)  # Total count of indexed emails
     indexing_progress_percent = Column(Float, default=0.0)  # Progress indicator (0-100)
     
-    # Admin access
-    is_admin = Column(Boolean, default=False, nullable=False, index=True)
+    # Admin access (private column, exposed via hybrid property)
+    _is_admin = Column("is_admin", Boolean, default=False, nullable=False, index=True)
+
+    @hybrid_property
+    def is_admin(self) -> bool:
+        """Check if user has admin privileges (from DB or clavr.me domain)"""
+        return self._is_admin or (self.email and self.email.endswith('clavr.me'))
+
+    @is_admin.setter
+    def is_admin(self, value: bool):
+        self._is_admin = value
+
+    @is_admin.expression
+    def is_admin(cls):
+        """SQL expression for admin check (enables filtering in queries)"""
+        return or_(cls._is_admin == True, cls.email.like('%clavr.me'))
     
     # Relationships
     sessions = relationship("Session", back_populates="user", cascade="all, delete-orphan")
