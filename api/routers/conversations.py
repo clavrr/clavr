@@ -11,7 +11,7 @@ from src.utils.logger import setup_logger
 
 logger = setup_logger(__name__)
 
-router = APIRouter(prefix="/api/conversations", tags=["conversations"])
+router = APIRouter(prefix="/conversations", tags=["conversations"])
 
 @router.get("")
 async def get_recent_conversations(

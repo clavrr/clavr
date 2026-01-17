@@ -24,7 +24,7 @@ from api.dependencies import get_current_user_required
 
 logger = setup_logger(__name__)
 
-router = APIRouter(prefix="/api/autonomy", tags=["autonomy"])
+router = APIRouter(prefix="/autonomy", tags=["autonomy"])
 
 
 # ==================== Request/Response Models ====================

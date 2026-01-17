@@ -21,7 +21,7 @@ from src.services.profile_cache import get_profile_cache
 from src.services.profile_service import get_profile_service
 
 logger = setup_logger(__name__)
-router = APIRouter(prefix="/api/profile", tags=["profile"])
+router = APIRouter(prefix="/profile", tags=["profile"])
 
 
 # ============================================

@@ -20,7 +20,7 @@ from src.utils.audio_transcoder import StreamingTranscoder
 from src.services.service_constants import ServiceConstants
 
 logger = setup_logger(__name__)
-router = APIRouter(prefix="/api/voice", tags=["voice"])
+router = APIRouter(prefix="/voice", tags=["voice"])
 
 
 

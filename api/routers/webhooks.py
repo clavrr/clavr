@@ -16,7 +16,7 @@ from src.features.webhook_service import WebhookService
 from src.database.models import User
 from api.auth import get_current_user_required as get_current_user
 
-router = APIRouter(prefix="/api/webhooks", tags=["webhooks"])
+router = APIRouter(prefix="/webhooks", tags=["webhooks"])
 
 
 # Pydantic Schemas

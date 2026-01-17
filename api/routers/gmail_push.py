@@ -17,7 +17,7 @@ from src.workers.tasks.indexing_tasks import index_new_email_notification
 
 logger = setup_logger(__name__)
 
-router = APIRouter(prefix="/api/gmail/push", tags=["gmail-push"])
+router = APIRouter(prefix="/gmail/push", tags=["gmail-push"])
 
 
 class GmailPushNotification(BaseModel):

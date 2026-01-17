@@ -12,7 +12,7 @@ from src.database.models import User
 from src.utils.logger import setup_logger
 
 logger = setup_logger(__name__)
-router = APIRouter(prefix="/api/chat", tags=["chat"])
+router = APIRouter(prefix="/chat", tags=["chat"])
 
 # Shared SSE streaming headers
 SSE_HEADERS = {
@@ -103,7 +103,7 @@ async def chat_stream_alias(
 
 
 # Legacy /api/query router
-query_router = APIRouter(prefix="/api/query", tags=["query"])
+query_router = APIRouter(prefix="/query", tags=["query"])
 
 
 @query_router.post("/stream")
