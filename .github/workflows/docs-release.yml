@@ -49,7 +49,7 @@ jobs:
         git log --pretty=format:"- %s (%h)" --since="30 days ago" >> CHANGELOG.md || true
     
     - name: Upload documentation
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@v6
       with:
         name: documentation
         path: |
@@ -84,7 +84,7 @@ jobs:
         echo "**Full Changelog**: https://github.com/${{ github.repository }}/compare/$(git describe --tags --abbrev=0 HEAD^)...${{ github.event.release.tag_name }}" >> release-notes.md
     
     - name: Upload release notes
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@v6
       with:
         name: release-notes
         path: release-notes.md
