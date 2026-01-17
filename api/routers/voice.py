@@ -7,6 +7,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 import json
 import asyncio
 import base64
+from typing import Dict, Any
 
 import re
 
@@ -18,10 +19,46 @@ from src.database.models import User
 from src.services.voice_service import VoiceService
 from src.utils.audio_transcoder import StreamingTranscoder
 from src.services.service_constants import ServiceConstants
+from api.auth import get_current_user_required
 
 logger = setup_logger(__name__)
 router = APIRouter(prefix="/voice", tags=["voice"])
 
+
+@router.get("/introduction")
+async def get_voice_introduction(
+    current_user: User = Depends(get_current_user_required),
+    db: AsyncSession = Depends(get_async_db),
+    config = Depends(get_config)
+) -> Dict[str, Any]:
+    """
+    Get initialization data for the voice interface.
+    
+    Returns:
+        - User details (name, context)
+        - Connected integrations
+        - Proactive reminders/suggestions for the greeting
+        - Capability summary
+    """
+    try:
+        voice_service = VoiceService(db, config)
+        config_data = await voice_service.get_voice_configuration(current_user)
+        
+        return {
+            "success": True,
+            "introduction": config_data
+        }
+    except Exception as e:
+        logger.error(f"[VoiceAPI] Error getting introduction: {e}", exc_info=True)
+        # Return partial/fallback data on error instead of 500
+        return {
+            "success": False,
+            "error": str(e),
+            "introduction": {
+                "user_name": extract_first_name(current_user.name, current_user.email),
+                "proactive_reminder": ""
+            }
+        }
 
 
 @router.websocket("/ws/transcribe")

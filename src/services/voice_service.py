@@ -118,7 +118,7 @@ class VoiceService:
             logger.error(f"Failed to fetch integration status: {e}")
             return ""
     
-    async def _get_dynamic_variables(self, user: User) -> dict:
+    async def get_voice_configuration(self, user: User) -> dict:
         """
         Gather dynamic variables for ElevenLabs personalization.
         These populate {{variable}} placeholders in the ElevenLabs system prompt.
@@ -280,7 +280,7 @@ class VoiceService:
             try:
                 if provider_name == "elevenlabs":
                     client = ElevenLabsLiveClient(tools=tools)
-                    dynamic_variables = await self._get_dynamic_variables(user)
+                    dynamic_variables = await self.get_voice_configuration(user)
                     if dynamic_variables:
                         for key, val in dynamic_variables.items():
                             if isinstance(val, str) and len(val) > 1000:
@@ -288,7 +288,7 @@ class VoiceService:
                 else:
                     client = GeminiLiveClient(tools=tools)
                     # Also fetch variables for Gemini to format the prompt locally
-                    dynamic_variables = await self._get_dynamic_variables(user)
+                    dynamic_variables = await self.get_voice_configuration(user)
                 
                 async for response in client.stream_audio(
                     audio_generator, 
