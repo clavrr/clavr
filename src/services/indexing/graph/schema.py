@@ -259,6 +259,14 @@ class GraphSchema:
     # Schema version
     VERSION = SCHEMA_VERSION
     
+    # Properties that should be encrypted at rest in the graph
+    SENSITIVE_PROPERTIES: Set[str] = {
+        "subject", "body", "content", "full_text", "summary", 
+        "text", "description", "notes", "sender", "recipients", 
+        "cc", "bcc", "name", "email", "phone", "address", 
+        "key_points", "entities", "financial_data", "items", "attachment_info"
+    }
+    
     # Required properties for each node type
     REQUIRED_PROPERTIES: Dict[NodeType, Set[str]] = {
         NodeType.EMAIL: {"subject", "sender", "date", "body"},

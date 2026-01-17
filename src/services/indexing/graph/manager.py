@@ -45,6 +45,7 @@ from .graph_constants import (
 )
 from src.utils.logger import setup_logger
 from src.utils.config import Config
+from src.utils.encryption import encrypt_token, decrypt_token
 
 logger = setup_logger(__name__)
 
@@ -182,6 +183,42 @@ class KnowledgeGraphManager:
             NodeType.EMAIL: ["thread_id", "date"],
             NodeType.CONTACT: ["email"],
         }
+    
+    def _encrypt_graph_properties(self, properties: Dict[str, Any]) -> Dict[str, Any]:
+        """Encrypt sensitive properties before storing in the graph."""
+        if not properties:
+            return properties
+        
+        new_props = properties.copy()
+        for key, value in properties.items():
+            if key in GraphSchema.SENSITIVE_PROPERTIES:
+                if isinstance(value, str) and value:
+                    new_props[key] = encrypt_token(value)
+                elif isinstance(value, (list, dict)):
+                    # For complex types, serialize to JSON then encrypt
+                    new_props[key] = f"ENC:{encrypt_token(json.dumps(value))}"
+                    
+        return new_props
+
+    def _decrypt_graph_properties(self, properties: Dict[str, Any]) -> Dict[str, Any]:
+        """Decrypt sensitive properties after retrieving from the graph."""
+        if not properties:
+            return properties
+        
+        new_props = properties.copy()
+        for key, value in properties.items():
+            # Try to decrypt if it looks like an encrypted string or if it's in sensitive list
+            if isinstance(value, str):
+                if value.startswith("ENC:"):
+                    try:
+                        decrypted = decrypt_token(value[4:])
+                        new_props[key] = json.loads(decrypted)
+                    except Exception:
+                        pass
+                elif key in GraphSchema.SENSITIVE_PROPERTIES:
+                    new_props[key] = decrypt_token(value)
+                    
+        return new_props
         
     def set_reactive_service(self, service: Any):
         """Set the reactive service for event emission."""
@@ -230,9 +267,12 @@ class KnowledgeGraphManager:
         for warning in validation_result.warnings:
             logger.warning(f"Node validation warning: {warning}")
         
+        # Encrypt sensitive properties before adding metadata
+        encrypted_properties = self._encrypt_graph_properties(properties)
+        
         # Add metadata
         properties_with_meta = {
-            **properties,
+            **encrypted_properties,
             "node_type": node_type.value,
             "created_at": datetime.now().isoformat(),
         }
@@ -337,9 +377,12 @@ class KnowledgeGraphManager:
                 except ValueError as e:
                     logger.warning(f"Could not validate relationship types: {e}")
         
+        # Encrypt relationship properties
+        encrypted_properties = self._encrypt_graph_properties(properties)
+        
         # Add metadata
         properties_with_meta = {
-            **properties,
+            **encrypted_properties,
             "rel_type": rel_type.value,
             "created_at": datetime.now().isoformat(),
         }
@@ -382,11 +425,12 @@ class KnowledgeGraphManager:
         """
         if self.backend_type == GraphBackend.NETWORKX:
             if self.graph.has_node(node_id):
-                return dict(self.graph.nodes[node_id])
+                return self._decrypt_graph_properties(dict(self.graph.nodes[node_id]))
             return None
         
         elif self.backend_type == GraphBackend.ARANGODB:
-            return await self._get_node_arangodb(node_id)
+            node = await self._get_node_arangodb(node_id)
+            return self._decrypt_graph_properties(node) if node else None
 
     
     async def get_nodes_batch(
@@ -414,14 +458,15 @@ class KnowledgeGraphManager:
             result = {}
             for node_id in node_ids:
                 if self.graph.has_node(node_id):
-                    node_data = dict(self.graph.nodes[node_id])
+                    node_data = self._decrypt_graph_properties(dict(self.graph.nodes[node_id]))
                     # Filter by node_type if specified
                     if node_type is None or node_data.get('node_type') == node_type.value:
                         result[node_id] = node_data
             return result
         
         elif self.backend_type == GraphBackend.ARANGODB:
-            return await self._get_nodes_batch_arangodb(node_ids, node_type)
+            nodes = await self._get_nodes_batch_arangodb(node_ids, node_type)
+            return {nid: self._decrypt_graph_properties(data) for nid, data in nodes.items()}
 
     
     async def find_node_by_property(
@@ -445,11 +490,12 @@ class KnowledgeGraphManager:
             for node_id, data in self.graph.nodes(data=True):
                 if (data.get('node_type') == node_type.value and 
                     data.get(property_name) == property_value):
-                    return {'id': node_id, **data}
+                    return self._decrypt_graph_properties({'id': node_id, **data})
             return None
         
         elif self.backend_type == GraphBackend.ARANGODB:
-            return await self._find_node_by_property_arangodb(node_type, property_name, property_value)
+            node = await self._find_node_by_property_arangodb(node_type, property_name, property_value)
+            return self._decrypt_graph_properties(node) if node else None
     
     async def _find_node_by_property_arangodb(
         self,
@@ -599,10 +645,12 @@ class KnowledgeGraphManager:
             List of nodes found during traversal
         """
         if self.backend_type == GraphBackend.NETWORKX:
-            return await self._traverse_networkx(start_node, rel_types, depth, direction)
+            nodes = await self._traverse_networkx(start_node, rel_types, depth, direction)
         
         elif self.backend_type == GraphBackend.ARANGODB:
-            return await self._traverse_arangodb(start_node, rel_types, depth, direction)
+            nodes = await self._traverse_arangodb(start_node, rel_types, depth, direction)
+            
+        return [self._decrypt_graph_properties(node) for node in nodes]
 
     
     async def find_path(
@@ -661,19 +709,20 @@ class KnowledgeGraphManager:
                     edges = self.graph.get_edge_data(node_id, neighbor)
                     for edge_key, edge_data in edges.items():
                         if rel_type is None or edge_data.get("rel_type") == rel_type.value:
-                            neighbors.append((neighbor, edge_data))
+                            neighbors.append((neighbor, self._decrypt_graph_properties(edge_data)))
             
             if direction in ["incoming", "both"]:
                 for neighbor in self.graph.predecessors(node_id):
                     edges = self.graph.get_edge_data(neighbor, node_id)
                     for edge_key, edge_data in edges.items():
                         if rel_type is None or edge_data.get("rel_type") == rel_type.value:
-                            neighbors.append((neighbor, edge_data))
+                            neighbors.append((neighbor, self._decrypt_graph_properties(edge_data)))
             
             return neighbors
         
         elif self.backend_type == GraphBackend.ARANGODB:
-            return await self._get_neighbors_arangodb(node_id, rel_type, direction)
+            neighbors = await self._get_neighbors_arangodb(node_id, rel_type, direction)
+            return [(nid, self._decrypt_graph_properties(props)) for nid, props in neighbors]
 
     
     async def get_neighbors_batch(
@@ -705,6 +754,7 @@ class KnowledgeGraphManager:
             result = {node_id: [] for node_id in node_ids}
             for node_id in node_ids:
                 if self.graph.has_node(node_id):
+                    # Use the already decrypted get_neighbors
                     neighbors = await self.get_neighbors(node_id, None, direction)
                     # Filter by rel_types if specified
                     if rel_types:
@@ -717,7 +767,7 @@ class KnowledgeGraphManager:
                         filtered_neighbors = []
                         for nid, props in neighbors:
                             if self.graph.has_node(nid):
-                                neighbor_data = dict(self.graph.nodes[nid])
+                                neighbor_data = self._decrypt_graph_properties(dict(self.graph.nodes[nid]))
                                 if neighbor_data.get("node_type") in target_type_values:
                                     filtered_neighbors.append((nid, props))
                         neighbors = filtered_neighbors
@@ -725,7 +775,11 @@ class KnowledgeGraphManager:
             return result
         
         elif self.backend_type == GraphBackend.ARANGODB:
-             return await self._get_neighbors_batch_arangodb(node_ids, rel_types, direction, target_node_types)
+             neighbors_map = await self._get_neighbors_batch_arangodb(node_ids, rel_types, direction, target_node_types)
+             return {
+                 nid: [(target_id, self._decrypt_graph_properties(props)) for target_id, props in neighbors]
+                 for nid, neighbors in neighbors_map.items()
+             }
 
     
     async def get_stats(self) -> GraphStats:

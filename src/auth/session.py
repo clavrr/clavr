@@ -60,26 +60,12 @@ async def create_session(
     # Generate secure token and its hash
     raw_token, hashed_token = generate_session_token()
     
-    # Encrypt Gmail tokens before storage
-    try:
-        encrypted_access_token = encrypt_token(gmail_access_token)
-        encrypted_refresh_token = encrypt_token(gmail_refresh_token) if gmail_refresh_token else None
-    except Exception as e:
-        logger.error(f"Failed to encrypt Gmail tokens: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to secure tokens"
-        )
-    
-    # Convert scopes list to comma-separated string for storage
-    scopes_str = ",".join(granted_scopes) if granted_scopes else None
-    
-    # Create session with HASHED session token and ENCRYPTED Gmail tokens
+    # Create session with HASHED session token and raw Gmail tokens (model handles encryption)
     db_session = DBSession(
         user_id=user_id,
         session_token=hashed_token,  # Store HASH, not raw token
-        gmail_access_token=encrypted_access_token,  # Store ENCRYPTED token
-        gmail_refresh_token=encrypted_refresh_token,  # Store ENCRYPTED token
+        gmail_access_token=gmail_access_token,
+        gmail_refresh_token=gmail_refresh_token,
         granted_scopes=scopes_str,  # Store granted OAuth scopes
         token_expiry=token_expiry,
         expires_at=datetime.utcnow() + timedelta(days=days)

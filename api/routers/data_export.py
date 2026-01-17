@@ -7,7 +7,7 @@ Endpoints:
 - GET /api/export/status/{task_id} - Check export generation status
 """
 
-from fastapi import APIRouter, Depends, HTTPException, Query, BackgroundTasks, status
+from fastapi import APIRouter, Depends, HTTPException, Query, BackgroundTasks, status, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 from typing import Optional
@@ -22,6 +22,7 @@ from src.database import get_async_db as get_db
 from src.database.models import User
 from src.features.data_export import generate_export_for_user
 from src.utils.config import Config
+from src.auth.audit import log_auth_event, AuditEventType
 
 logger = logging.getLogger(__name__)
 
@@ -34,6 +35,7 @@ EXPORT_TOKENS = {}  # token -> (user_id, export_data, expires_at)
 
 @router.post("/request")
 async def request_data_export(
+    request: Request,
     format: str = Query(default="zip", description="Export format: json, csv, or zip"),
     include_vectors: bool = Query(default=False, description="Include vector embeddings (large!)"),
     include_email_content: bool = Query(default=True, description="Include full email content"),
@@ -65,6 +67,16 @@ async def request_data_export(
         )
     
     logger.info(f"Data export requested by user {current_user.id} (format: {format})")
+    
+    # Log audit event
+    await log_auth_event(
+        db=db,
+        event_type=AuditEventType.DATA_EXPORT_REQUEST,
+        user_id=current_user.id,
+        request=request,
+        format=format,
+        include_vectors=include_vectors
+    )
     
     try:
         # For JSON/CSV, we can generate immediately if it's a small dataset
@@ -130,7 +142,11 @@ async def request_data_export(
 
 
 @router.get("/download/{token}")
-async def download_export(token: str):
+async def download_export(
+    token: str,
+    request: Request,
+    db: AsyncSession = Depends(get_db)
+):
     """
     Download a generated data export using a secure token
     
@@ -153,6 +169,15 @@ async def download_export(token: str):
         )
     
     logger.info(f"User {user_id} downloading export with token {token[:10]}...")
+    
+    # Log audit event
+    await log_auth_event(
+        db=db,
+        event_type=AuditEventType.DATA_EXPORT_DOWNLOAD,
+        user_id=user_id,
+        request=request,
+        token_prefix=token[:8]
+    )
     
     # Determine content type and filename
     if isinstance(export_data, bytes):

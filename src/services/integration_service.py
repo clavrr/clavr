@@ -12,7 +12,6 @@ import os
 from src.database.models import User, UserIntegration
 from src.utils.logger import setup_logger
 from src.utils.config import Config
-from src.utils.encryption import encrypt_token
 from src.auth.oauth import GMAIL_SCOPES, CALENDAR_SCOPES, TASKS_SCOPES, DRIVE_SCOPES
 
 logger = setup_logger(__name__)
@@ -175,9 +174,9 @@ class IntegrationService:
         existing = result.scalar_one_or_none()
         
         if existing:
-            existing.access_token = encrypt_token(access_token)
+            existing.access_token = access_token
             if refresh_token:
-                existing.refresh_token = encrypt_token(refresh_token)
+                existing.refresh_token = refresh_token
             existing.expires_at = expires_at
             existing.integration_metadata = metadata
             existing.is_active = True  # Always reactivate upon successful reconnection
@@ -186,8 +185,8 @@ class IntegrationService:
             new_integration = UserIntegration(
                 user_id=user_id,
                 provider=provider,
-                access_token=encrypt_token(access_token),
-                refresh_token=encrypt_token(refresh_token) if refresh_token else None,
+                access_token=access_token,
+                refresh_token=refresh_token,
                 expires_at=expires_at,
                 is_active=True,
                 integration_metadata=metadata
