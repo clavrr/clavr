@@ -27,7 +27,7 @@ VALIDATION_MODE_STRICT = "strict"  # Raise errors on validation failure
 DEFAULT_AVG_DEGREE_PRECISION = 2  # Decimal places for average degree
 
 # Error Messages
-ERROR_NODE_NOT_FOUND = "Node '{node_id}' does not not exist in the graph"
+ERROR_NODE_NOT_FOUND = "Node '{node_id}' does not exist in the graph"
 ERROR_RELATIONSHIP_SOURCE_MISSING = "Cannot create relationship: source node '{from_node}' does not exist"
 ERROR_RELATIONSHIP_TARGET_MISSING = "Cannot create relationship: target node '{to_node}' does not exist"
 ERROR_INVALID_NODE_PROPERTIES = "Node validation failed for type '{node_type}'. Missing required properties: {missing}"

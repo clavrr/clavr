@@ -330,7 +330,8 @@ Answer strictly 'YES' or 'NO'. Consider them the same if they are synonyms or re
             result = await asyncio.to_thread(self.llm.invoke, [msg])
             res_text = result.content.strip().upper() if hasattr(result, 'content') else str(result).strip().upper()
             return "YES" in res_text
-        except Exception:
+        except Exception as e:
+            logger.debug(f"Topic semantic equivalence check failed: {e}")
             return False
     
     async def _link_to_topic(

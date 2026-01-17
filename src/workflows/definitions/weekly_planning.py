@@ -144,8 +144,8 @@ class WeeklyPlanningWorkflow(Workflow):
                         start_dt = datetime.fromisoformat(start.replace('Z', '+00:00'))
                         end_dt = datetime.fromisoformat(end.replace('Z', '+00:00'))
                         total_minutes += (end_dt - start_dt).total_seconds() / 60
-                    except:
-                        total_minutes += 60  # Default 1 hour
+                    except Exception as e:
+                        logger.debug(f"[WeeklyPlanning] Failed to parse event time: {e}")
             
             day_stats[day] = {
                 "event_count": len(day_events),

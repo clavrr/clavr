@@ -23,7 +23,7 @@ Usage:
     
     # Stream responses
     async for chunk in LLMFactory.stream_llm_response(config, "Hello"):
-        print(chunk, end="")
+        logger.debug(f"Chunk: {chunk}")
 """
 from typing import Optional, AsyncGenerator, Generator, Dict, Any, List
 from threading import Lock

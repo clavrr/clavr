@@ -97,7 +97,10 @@ class ResponseFormatter:
         Returns:
             Formatted, context-aware response
         """
-        if not entities:
+        if results.get("cross_stack_summary") or results.get("topic"):
+            # This is a Semantic Sync result
+            base_response = self._format_cross_stack_response(results, entities)
+        elif not entities:
             # No entities, return standard response
             base_response = self._format_standard_response(results)
         else:
@@ -327,6 +330,49 @@ class ResponseFormatter:
         
         return "\n".join(content_parts)
     
+    def _format_cross_stack_response(
+        self,
+        results: Dict[str, Any],
+        entities: Optional[Dict[str, Any]] = None
+    ) -> str:
+        """
+        Format a professional 360-degree synthesis response (Semantic Sync).
+        """
+        topic = results.get("topic", "Project Summary")
+        summary = results.get("cross_stack_summary") or results.get("summary", "No summary available.")
+        
+        content_parts = [
+            f"🌐 **360° Executive Summary: {topic}**",
+            "---",
+            summary,
+            ""
+        ]
+        
+        # Add Key Facts if present (Semantic Sync specific)
+        facts = results.get("key_facts", [])
+        if facts:
+            content_parts.append("**Key Intelligence:**")
+            for fact in facts[:5]:
+                content_parts.append(f"• {fact}")
+            content_parts.append("")
+            
+        # Add Action Items
+        actions = results.get("action_items", [])
+        if actions:
+            content_parts.append("**⚡ Recommended Actions:**")
+            for action in actions[:3]:
+                title = action.get("title", "Unknown Task")
+                source = action.get("source", "Clavr")
+                content_parts.append(f"• [{source.upper()}] {title}")
+            content_parts.append("")
+            
+        # Add involved people
+        people = results.get("people_involved", [])
+        if people:
+            content_parts.append(f"**👥 Key Stakeholders:** {', '.join(people[:5])}")
+            
+        return "\n".join(content_parts)
+
     def format_supervisor_plan(self, plan_steps: List[Dict[str, Any]]) -> str:
         """
         Format the Supervisor's execution plan for the user.

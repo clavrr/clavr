@@ -476,8 +476,8 @@ class PersonUnificationService:
                 if last_ts:
                     try:
                         last_interaction = datetime.fromisoformat(last_ts.replace("Z", "+00:00"))
-                    except:
-                        pass
+                    except Exception as e:
+                        logger.debug(f"[PersonUnification] Last interaction timestamp parse failed: {e}")
                         
                 return strength, count, last_interaction
                 

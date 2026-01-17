@@ -56,18 +56,8 @@ class BaseAgent(ABC):
         # Shortcuts for convenience
         self.memory_lane = domain_context.memory_lane if domain_context else None
         
-        # Memory Orchestrator is no longer passed directly, accessed via import or if needed
-        # But we previously used self.memory_orchestrator.
-        # Ideally, DomainContext might not hold MemoryOrchestrator as that's "Global".
-        # But for backward compatibility with existing method calls, we should check if we need it.
-        # Current retrieve_relevant_memory uses it.
-        # We'll assume we can get it from global or pass it? 
-        # Actually, let's allow it to be None for now and rely on imports if possible,
-        # OR better: add it to DomainContext as a reference if the factory puts it there?
-        # The Factory has access to LaneManager.
-        # Implementation Plan didn't specify MemoryOrchestrator in DomainContext explicitly but implies "Specialized".
-        # Let's keep self.memory_orchestrator as None for now and fix methods to use imports or context.
         # Unified Memory System
+        # Memory Orchestrator provides global context and cross-session learning capabilities.
         self.memory_orchestrator = get_memory_orchestrator()
         
         self.event_emitter = event_emitter
@@ -101,7 +91,7 @@ class BaseAgent(ABC):
         Returns:
             The agent's response as a string
         """
-        pass
+        raise NotImplementedError("Subclasses must implement run()")
     
     def _route_query(self, query: str, routes: Dict[str, List[str]]) -> Optional[str]:
         """
@@ -136,13 +126,36 @@ class BaseAgent(ABC):
     async def retrieve_user_preferences(self, user_id: Optional[int] = None) -> str:
         """
         Retrieve user preferences to personalize agent interactions.
-        Uses DomainContext (Memory Lane + Vector Store).
+        Uses Unified Memory System (MemoryOrchestrator) with legacy fallback.
         """
-        if not self.domain_context or not user_id:
+        if not user_id:
+            return ""
+
+        # 1. Try to get preferences via MemoryOrchestrator (Unified System)
+        if self.memory_orchestrator:
+            try:
+                context = await self.memory_orchestrator.get_context_for_agent(
+                    user_id=user_id,
+                    agent_name=self.name,
+                    query="What are the user's general and domain-specific preferences?",
+                    include_layers=["semantic"] # Preferences mostly live in semantic layer
+                )
+                if context.user_preferences:
+                    pref_str = "KNOWN PREFERENCES:\n"
+                    for pref in context.user_preferences:
+                        content = pref.get('content', '')
+                        if content:
+                            pref_str += f"- {content}\n"
+                    return pref_str
+            except Exception as e:
+                logger.debug(f"[{self.name}] MemoryOrchestrator preference retrieval failed: {e}")
+
+        # 2. Legacy Fallback: Direct memory access
+        if not self.domain_context:
             return ""
             
         try:
-            # 1. Try to get explicit preferences from Memory Lane (Behavioral)
+            # Try to get explicit preferences from Memory Lane (Behavioral)
             if self.memory_lane:
                 facts = self.memory_lane.get_facts_for_context(category="preference")
                 if facts:
@@ -204,54 +217,94 @@ class BaseAgent(ABC):
             
         return False
 
-    async def record_interaction(self, user_id: int, interaction_type: str, details: Dict[str, Any]) -> bool:
+    async def record_interaction(
+        self,
+        user_id: int,
+        session_id: Optional[str] = None,
+        interaction_type: str = "turn",
+        query: Optional[str] = None,
+        response: Optional[str] = None,
+        success: bool = True,
+        details: Optional[Dict[str, Any]] = None,
+        entities: Optional[List[str]] = None,
+        topics: Optional[List[str]] = None,
+        importance: float = 0.5
+    ) -> bool:
         """
-        Record a significant agent interaction to the graph ('Write-Back').
+        Unified interaction recording for persistent learning and session context.
         
-        This enables:
-        1. Relationship reinforcement (e.g. email sent -> strengthens connection with sender)
-        2. Behavior learning (e.g. task completed -> feeds pattern miner)
+        This replaces legacy graph write-back and redundant turn recording.
+        It handles both conversation turns (learn_from_turn) and discrete actions (remember).
         
         Args:
             user_id: ID of the user
-            interaction_type: Type of interaction (email_sent, task_created, etc.)
-            details: Metadata (e.g., related_person_email, target_id)
+            session_id: Optional session ID (required for session context)
+            interaction_type: "turn" for conversation, or specific action type (e.g. "email_sent")
+            query: The user's input/query
+            response: The agent's output/response
+            success: Whether the operation was successful
+            details: Metadata/details for discrete actions
+            entities: Extracted entities
+            topics: Extracted topics
+            importance: Salience score (0-1) for storage layer determination
         """
-        try:
-            from api.dependencies import AppState
-            graph_manager = AppState.get_graph_manager()
-            
-            if not graph_manager:
-                return False
-                
-            # 1. Reinforce Relationships
-            target_person = details.get('related_person_email') or details.get('related_person_name')
-            if target_person:
-                # We need to find the Person node first. logic simplified for brevity.
-                # Ideally, RelationshipStrengthManager handles this via UnifiedIndexer.
-                pass
-                
-            # 2. Feed Behavior Learner (via creating Event nodes if they don't exist)
-            # Most tools (Gmail, Asana) create events via Crawlers eventually.
-            # But for immediate feedback, we might want to log 'AgentAction' nodes?
-            # For now, we'll rely on Crawlers for the 'Event' nodes, but we can
-            # manually trigger a lightweight 'Action' node for the agent's contribution.
-            
-            # Create AGENT_ACTION node
-            props = {
-                "type": interaction_type,
-                "agent": self.name,
-                "details": json.dumps(details),
-                "timestamp": datetime.utcnow().isoformat(),
-                "user_id": user_id
-            }
-            # Just logging for now until we have a formal schema for Agent Actions
-            logger.info(f"[{self.name}] Recorded interaction: {interaction_type}")
-            return True
-            
-        except Exception as e:
-            logger.warning(f"[{self.name}] Failed to record interaction: {e}")
+        if not user_id:
             return False
+
+        if not self.memory_orchestrator:
+            logger.debug(f"[{self.name}] MemoryOrchestrator not available for recording")
+            return False
+            
+        success_recorded = True
+        
+        # 1. Handle Conversation Turn (Working Memory & History)
+        if interaction_type == "turn" and session_id and query and response:
+            try:
+                with LatencyMonitor(f"[{self.name}] Recording Turn"):
+                    await self.memory_orchestrator.learn_from_turn(
+                        user_id=user_id,
+                        session_id=session_id,
+                        user_message=query,
+                        assistant_response=response,
+                        agent_name=self.name,
+                        success=success,
+                        entities=entities,
+                        topics=topics
+                    )
+            except Exception as e:
+                logger.debug(f"[{self.name}] Failed to learn from turn: {e}")
+                success_recorded = False
+
+        # 2. Handle Discrete Action or Fact (Semantic & Graph Memory)
+        if interaction_type != "turn" or details:
+            try:
+                category = details.get('category', 'general') if details else 'general'
+                content = query or response or f"Action: {interaction_type}"
+                
+                # If it's a specific action (not just a turn), enrich content with details
+                if interaction_type != "turn" and details:
+                    details_str = ", ".join([f"{k}={v}" for k, v in details.items() if k != 'category'])
+                    content = f"{interaction_type}: {content} ({details_str})"
+                
+                with LatencyMonitor(f"[{self.name}] Recording Action"):
+                    await self.memory_orchestrator.remember(
+                        user_id=user_id,
+                        content=content,
+                        category=category,
+                        source=self.name,
+                        importance=importance,
+                        session_id=session_id
+                    )
+                
+                # Proactive relationship reinforcement if applicable
+                # Proactive relationship reinforcement is now handled by 'remember' (graph nodes)
+                # Left empty intentionally as previous specific logic is deprecated.
+                     
+            except Exception as e:
+                logger.warning(f"[{self.name}] Failed to record discrete interaction: {e}")
+                success_recorded = False
+                
+        return success_recorded
         
     async def _extract_params(
         self, 
@@ -523,6 +576,7 @@ class BaseAgent(ABC):
         """Set the current session ID for working memory integration."""
         self._current_session_id = session_id
     
+
     async def retrieve_relevant_memory(
         self, 
         query: str, 
@@ -802,7 +856,8 @@ class BaseAgent(ABC):
             else:
                 months = delta.days // 30
                 return f"{months}mo ago"
-        except:
+        except (ValueError, TypeError, AttributeError):
+            # Timestamp parsing/formatting failed
             return ""
     
     async def _search_with_temporal_context(

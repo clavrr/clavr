@@ -33,148 +33,166 @@ def proactive_think(self) -> Dict[str, Any]:
         config = load_config()
         
         with get_db_context() as db:
-            # For prototype, we'll check a default user_id=1 or configured user.
-            user_id = 1 # Keep user_id here as it's used by both perception and evaluation
+            # Get all active users to process (not just hardcoded user_id=1)
+            # Use sync query since we're in a sync Celery task
+            from src.database.models import User
             
-            # Load Graph Manager (Phase 7: Living Memory)
-            from ...services.indexing.graph import KnowledgeGraphManager
-            # Initialize with default config/ArangoDB credentials.
-            # Ideally we check config.indexing.enable_graph or similar
-            graph_manager = None
-            try:
-                graph_manager = KnowledgeGraphManager(config=config)
-                # Quick check if backend is available (will log warning if not)
-            except Exception as e:
-                logger.warning(f"[Thinking] Graph Manager init failed: {e}")
-
-            # Services (Perception Needs Semantic Memory + Graph)
-            semantic_memory = SemanticMemory(db)
+            active_users = db.query(User.id).filter(User.is_active == True).all()
+            active_user_ids = [row[0] for row in active_users]
             
-            # Factory for gathering raw streams
-            factory = CredentialFactory(config)
+            if not active_user_ids:
+                logger.info("[AutonomyTask] No active users found, skipping")
+                return {"status": "skipped", "reason": "no_active_users"}
             
-            # Initialize Calendar Service EARLY (needed for Planning)
-            calendar_service = None
-            try:
-                calendar_service = factory.create_service('calendar', user_id=user_id, db_session=db)
-            except Exception:
-                pass 
-                
-            # Phase 5: Perception Agent (Signal Filtering)
-            from ...agents.perception.agent import PerceptionAgent, PerceptionEvent, SignalType
-            perception_agent = PerceptionAgent()
+            logger.info(f"[AutonomyTask] Processing {len(active_user_ids)} active users")
             
-            email_service = None
-            try:
-                email_service = factory.create_service('email', user_id=user_id, db_session=db)
-            except Exception:
-                pass # Email might not be active
-                
-            # Simulate Event Stream (e.g. check last 15 mins of email)
-            detected_triggers = []
-            if email_service:
-                # Fetch recent unread
-                recent_emails = email_service.search_emails(query="is:unread newer_than:15m", limit=5) or []
-                for email in recent_emails:
-                    event = PerceptionEvent(
-                        type="email", 
-                        source_id=email.get('id'), 
-                        content=email, 
-                        timestamp=datetime.now().isoformat()
-                    )
-                    trigger = asyncio.run(perception_agent.perceive_event(event, user_id))
-                    if trigger:
-                        detected_triggers.append(trigger)
-                        
-            # Log Triggers
-            for t in detected_triggers:
-                 logger.info(f"[Thinking] ⚡️ Perception Trigger: {t.category.upper()} - {t.reason}")
-                 
-            # Phase 6: Proactive Planning (Goal-Driven Reasoning)
-            from ...ai.autonomy.planner import ProactivePlanner
-            planner = ProactivePlanner(db)
+            all_results = []
+            for user_id in active_user_ids:
+                try:
+                    result = _process_user_autonomy(db, config, user_id)
+                    all_results.append({"user_id": user_id, "result": result})
+                except Exception as e:
+                    logger.error(f"[AutonomyTask] Failed for user {user_id}: {e}")
+                    all_results.append({"user_id": user_id, "error": str(e)})
             
-            # Pass initialized calendar_service
-            plans = asyncio.run(planner.check_goals_against_state(user_id, calendar_service))
-            
-            for plan in plans:
-                logger.info(f"[Planning] 🧠 Plan Generated: {plan['type']} - {plan['description']}")
-                
-                # Execute Plan: Block Time
-                if plan['type'] == 'block_time' and calendar_service:
-                    try:
-                        # Assuming create_event signature: summary, start, end
-                        # Need to parse start string to datetime
-                        start_time = datetime.fromisoformat(plan['params']['start'])
-                        end_time = start_time + timedelta(minutes=plan['params']['duration_minutes'])
-                        
-                        # Execute Calendar Block
-                        # calendar_service.create_event(summary=..., start=..., end=...)
-                        # Mocking execution for safety unless user approved 'Auto-Exec'.
-                        # For now, we LOG the action.
-                        logger.info(f"[Planning] 🚀 EXECUTION: Blocking Calendar for '{plan['params']['summary']}'")
-                        # calendar_service.create_event(...) 
-                    except Exception as e:
-                        logger.error(f"[Planning] Execution failed: {e}")
-            
-            # Continue with Standard Periodic Evaluation (Phase 1-2 logic)
-            # 1. Initialize Credentials & Calendar Service
-            calendar_service = None
-            try:
-                # Use factory to create service with credentials automatically
-                calendar_service = factory.create_service(
-                    'calendar', 
-                    user_id=user_id, 
-                    db_session=db
-                )
-            except Exception as e:
-                logger.warning(f"[Thinking] Failed to init CalendarService: {e}")
-                
-            # 2. Initialize Semantic Memory (already done above, but keeping for clarity if needed elsewhere)
-            # semantic_memory = SemanticMemory(db) 
-            
-            # 3. Initialize Evaluator with services
-            evaluator = ContextEvaluator(
-                config=config,
-                calendar_service=calendar_service,
-                semantic_memory=semantic_memory
-            )
-            
-            async def run_evaluation():
-                return await evaluator.evaluate_context(user_id)
-                
-            result = asyncio.run(run_evaluation())
-            
-            action_needed = result.get('action_needed')
-            proposed = result.get('proposed_action')
-            reason = result.get('reason')
-            
-            if action_needed:
-                logger.info(f"[Thinking] 💡 Action Proposed: {proposed.upper()} (Reason: {reason})")
-                
-                # Execute Action
-                if proposed == "generate_morning_briefing":
-                    logger.info(f"[Thinking] Triggering morning briefing for user {user_id}")
-                    # In a real app, we might check if one was already sent today to avoid duplicates.
-                    # For now, we trust the evaluator's logic (time window).
-                    generate_morning_briefing.delay(user_id)
+            return {"status": "completed", "results": all_results}
                     
-                elif proposed == "prepare_meeting_brief":
-                    event_id = result.get('context_data', {}).get('event_id')
-                    if event_id:
-                        logger.info(f"[Thinking] Triggering meeting brief for {event_id}")
-                        generate_meeting_brief.delay(user_id, event_id)
-                    else:
-                        logger.warning("[Thinking] Proposed meeting brief but no event_id found.")
-                     
-            else:
-                logger.info(f"[Thinking] 💤 No action needed. (Reason: {reason})")
-                
-            return result
-        
     except Exception as e:
         logger.error(f"[Thinking] Error in think loop: {e}", exc_info=True)
         raise e
+
+
+def _process_user_autonomy(db, config, user_id: int) -> Dict[str, Any]:
+    """Process autonomy logic for a single user."""
+    logger.info(f"[Thinking] Processing user {user_id}...")
+    
+    # Load Graph Manager (Phase 7: Living Memory)
+    from ...services.indexing.graph import KnowledgeGraphManager
+    graph_manager = None
+    try:
+        graph_manager = KnowledgeGraphManager(config=config)
+    except Exception as e:
+        logger.warning(f"[Thinking] Graph Manager init failed: {e}")
+
+    # Services (Perception Needs Semantic Memory + Graph)
+    semantic_memory = SemanticMemory(db)
+    
+    # Factory for gathering raw streams
+    factory = CredentialFactory(config)
+    
+    # Initialize Calendar Service EARLY (needed for Planning)
+    calendar_service = None
+    try:
+        calendar_service = factory.create_service('calendar', user_id=user_id, db_session=db)
+    except Exception as e:
+        logger.debug(f"[Thinking] Calendar service not available: {e}")
+        
+    # Phase 5: Perception Agent (Signal Filtering)
+    from ...agents.perception.agent import PerceptionAgent, PerceptionEvent, SignalType
+    perception_agent = PerceptionAgent(config)
+    
+    email_service = None
+    try:
+        email_service = factory.create_service('email', user_id=user_id, db_session=db)
+    except Exception as e:
+        logger.debug(f"[Thinking] Email service not available: {e}")
+        
+    # Simulate Event Stream (e.g. check last 15 mins of email)
+    detected_triggers = []
+    if email_service:
+        recent_emails = email_service.search_emails(query="is:unread newer_than:15m", limit=5) or []
+        for email in recent_emails:
+            event = PerceptionEvent(
+                type="email", 
+                source_id=email.get('id'), 
+                content=email, 
+                timestamp=datetime.now().isoformat()
+            )
+            trigger = asyncio.run(perception_agent.perceive_event(event, user_id))
+            if trigger:
+                detected_triggers.append(trigger)
+                
+    # Log Triggers
+    for t in detected_triggers:
+        logger.info(f"[Thinking] ⚡️ Perception Trigger: {t.category.upper()} - {t.reason}")
+         
+    # Phase 6: Proactive Planning (Goal-Driven Reasoning)
+    from ...ai.autonomy.planner import ProactivePlanner
+    planner = ProactivePlanner(db, config)
+    
+    plans = asyncio.run(planner.check_goals_against_state(user_id, calendar_service))
+    
+    # Phase 6.5: Execute Plans via ActionExecutor
+    for plan in plans:
+        logger.info(f"[Planning] 🧠 Plan Generated: {plan['type']} - {plan['description']}")
+        
+        # Execute via ActionExecutor (respects user autonomy settings)
+        try:
+            from ...ai.autonomy.action_executor import ActionExecutor
+            from ...database.async_database import async_session_factory
+            
+            async def execute_plan_async():
+                async with async_session_factory() as async_db:
+                    executor = ActionExecutor(async_db, config, factory)
+                    return await executor.execute_plan(dict(plan), user_id)
+            
+            result = asyncio.run(execute_plan_async())
+            
+            if result.success:
+                if result.status == 'executed':
+                    logger.info(f"[Planning] ✅ EXECUTED: {plan['type']} (action_id={result.action_id})")
+                elif result.status == 'pending_approval':
+                    logger.info(f"[Planning] ⏳ PENDING APPROVAL: {plan['type']} (action_id={result.action_id})")
+            else:
+                logger.error(f"[Planning] ❌ FAILED: {plan['type']} - {result.error}")
+                
+        except Exception as e:
+            logger.error(f"[Planning] Execution error: {e}", exc_info=True)
+    
+
+    # Context Evaluation (Phase 1-2 logic)
+    evaluator = ContextEvaluator(
+        config=config,
+        calendar_service=calendar_service,
+        semantic_memory=semantic_memory
+    )
+    
+    async def run_evaluation():
+        return await evaluator.evaluate_context(user_id)
+        
+    result = asyncio.run(run_evaluation())
+    
+    action_needed = result.get('action_needed')
+    proposed = result.get('proposed_action')
+    reason = result.get('reason')
+    
+    if action_needed:
+        logger.info(f"[Thinking] 💡 Action Proposed: {proposed.upper()} (Reason: {reason})")
+        
+        if proposed == "generate_morning_briefing":
+            logger.info(f"[Thinking] Triggering morning briefing for user {user_id}")
+            generate_morning_briefing.delay(user_id)
+            
+        elif proposed == "prepare_meeting_brief":
+            event_id = result.get('context_data', {}).get('event_id')
+            if event_id:
+                logger.info(f"[Thinking] Triggering meeting brief for {event_id}")
+                generate_meeting_brief.delay(user_id, event_id)
+            else:
+                logger.warning("[Thinking] Proposed meeting brief but no event_id found.")
+    else:
+        logger.info(f"[Thinking] 💤 No action needed. (Reason: {reason})")
+        
+    # Phase 7: Proactive Insight Generation
+    from ...services.proactive.context_service import ContextService
+    context_service = ContextService(config, db_session=db, graph_manager=graph_manager)
+    
+    insight_result = asyncio.run(context_service.generate_proactive_insight(user_id))
+    if insight_result and insight_result.get('insight'):
+        logger.info(f"[Thinking] 🌟 Proactive Insight: {insight_result['insight']}")
+    
+    return result
+
 
 @celery_app.task(base=BaseTask, bind=True, name='src.workers.tasks.autonomy_tasks.generate_morning_briefing')
 def generate_morning_briefing(self, user_id: int) -> Dict[str, Any]:
@@ -204,15 +222,15 @@ def generate_morning_briefing(self, user_id: int) -> Dict[str, Any]:
             calendar_service = None
             try:
                  calendar_service = factory.create_service('calendar', user_id=user_id, db_session=db)
-            except Exception:
-                 pass # Optional context
+            except Exception as e:
+                 logger.debug(f"[Briefing] Calendar service not available: {e}")
                  
             # Task Service
             task_service = None
             try:
                  task_service = factory.create_service('task', user_id=user_id, db_session=db)
-            except Exception:
-                 pass # Optional context
+            except Exception as e:
+                 logger.debug(f"[Briefing] Task service not available: {e}")
                  
             # 2. Generate Briefing
             from ...ai.autonomy.briefing import BriefingGenerator
@@ -319,33 +337,83 @@ def ingest_asana_delta(self) -> Dict[str, Any]:
     """
     Background crawler for Asana.
     Fetches tasks and updates the Knowledge Graph.
+    
+    Uses Redis to persist sync state for efficient delta syncs.
     """
     logger.info("[Ingestion] Starting Asana crawl...")
+    
+    # Redis key for sync state
+    SYNC_STATE_KEY = "asana:last_sync_time"
+    
     try:
         config = load_config()
+        
         # Initialize Graph Manager
         from ...services.indexing.graph import KnowledgeGraphManager
         graph_manager = None
         try:
-             graph_manager = KnowledgeGraphManager(config=config)
+            graph_manager = KnowledgeGraphManager(config=config)
         except Exception as e:
-             logger.error(f"[Ingestion] Graph init failed: {e}")
-             return {"status": "failed", "reason": "Graph init failed"}
+            logger.error(f"[Ingestion] Graph init failed: {e}")
+            return {"status": "failed", "reason": "Graph init failed"}
 
         # Initialize Ingestor
         from ...services.ingestion.asana import AsanaIngestor
         ingestor = AsanaIngestor(graph_manager, config)
         
-        # Run Sync
-        # In real world, we'd persist 'last_sync_time' in DB or Redis
-        # For prototype, we sync 'recent' delta every time.
+        # Get last sync time from Redis
+        last_sync_time = None
+        redis_client = None
+        
+        try:
+            import redis
+            import os
+            
+            redis_url = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+            redis_client = redis.from_url(redis_url, decode_responses=True)
+            
+            stored_time = redis_client.get(SYNC_STATE_KEY)
+            if stored_time:
+                last_sync_time = datetime.fromisoformat(stored_time)
+                logger.info(f"[Ingestion] Resuming from last sync: {last_sync_time}")
+            else:
+                # First sync - start from 7 days ago to get recent history
+                last_sync_time = datetime.utcnow() - timedelta(days=7)
+                logger.info(f"[Ingestion] First sync, fetching from: {last_sync_time}")
+                
+        except ImportError:
+            logger.warning("[Ingestion] Redis not available, syncing last 24 hours")
+            last_sync_time = datetime.utcnow() - timedelta(hours=24)
+        except Exception as e:
+            logger.warning(f"[Ingestion] Redis error: {e}, syncing last 24 hours")
+            last_sync_time = datetime.utcnow() - timedelta(hours=24)
+        
+        # Record sync start time (to save after successful sync)
+        sync_start_time = datetime.utcnow()
+        
+        # Run Sync with last_sync_time
         async def run_sync():
-            return await ingestor.run_sync()
+            return await ingestor.run_sync(last_sync_time=last_sync_time)
             
         stats = asyncio.run(run_sync())
         
+        # Update last sync time in Redis on success
+        if redis_client and stats.get('processed', 0) >= 0:
+            try:
+                redis_client.set(SYNC_STATE_KEY, sync_start_time.isoformat())
+                # Set TTL of 30 days (in case sync stops running, we don't want stale data)
+                redis_client.expire(SYNC_STATE_KEY, 60 * 60 * 24 * 30)
+                logger.info(f"[Ingestion] Updated last_sync_time to {sync_start_time}")
+            except Exception as e:
+                logger.warning(f"[Ingestion] Failed to update sync time in Redis: {e}")
+        
         logger.info(f"[Ingestion] Asana Sync Complete. Stats: {stats}")
-        return {"status": "success", "stats": stats}
+        return {
+            "status": "success", 
+            "stats": stats,
+            "last_sync_time": last_sync_time.isoformat() if last_sync_time else None,
+            "sync_completed_at": sync_start_time.isoformat()
+        }
         
     except Exception as e:
         logger.error(f"[Ingestion] Asana crawl failed: {e}", exc_info=True)

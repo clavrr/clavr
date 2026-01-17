@@ -122,6 +122,11 @@ from .webhook_tasks import (
     trigger_export_completed_webhook,
 )
 
+# Workflow tasks
+from .workflow_tasks import (
+    run_workflow,
+)
+
 __all__ = [
     # Email
     'sync_user_emails',
@@ -175,4 +180,5 @@ __all__ = [
     'trigger_task_completed_webhook',
     'trigger_indexing_completed_webhook',
     'trigger_export_completed_webhook',
+    'run_workflow',
 ]

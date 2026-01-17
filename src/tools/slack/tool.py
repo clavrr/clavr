@@ -19,6 +19,9 @@ class SlackInput(BaseModel):
     user: Optional[str] = Field(default=None, description="User ID or name")
     thread_ts: Optional[str] = Field(default=None, description="Thread timestamp for replies")
     limit: Optional[int] = Field(default=10, description="Result limit")
+    status_text: Optional[str] = Field(default=None, description="Status text for set_status action")
+    status_emoji: Optional[str] = Field(default=None, description="Status emoji for set_status action")
+    expiration: Optional[int] = Field(default=0, description="Status expiration timestamp (0 for none)")
 
 class SlackTool(BaseTool):
     """
@@ -29,6 +32,7 @@ class SlackTool(BaseTool):
     - search: Search for messages or users
     - send: Send a new message to a channel or user
     - reply: Reply to a specific thread
+    - set_status: Set user's status (text and emoji)
     """
     
     name: str = "slack"
@@ -36,10 +40,12 @@ class SlackTool(BaseTool):
     args_schema: Type[BaseModel] = SlackInput
     
     config: Optional[Config] = Field(default=None, exclude=True)
-    user_id: int = Field(default=1, exclude=True)
+    user_id: int = Field(description="User ID - required for multi-tenancy", exclude=True)
     _slack_client: Any = None
     
-    def __init__(self, config: Optional[Config] = None, user_id: int = 1, **kwargs):
+    def __init__(self, config: Optional[Config] = None, user_id: int = None, **kwargs):
+        if user_id is None:
+            raise ValueError("user_id is required for SlackTool - cannot default to 1 for multi-tenancy")
         super().__init__(**kwargs)
         self.config = config or load_config()
         self.user_id = user_id
@@ -71,8 +77,8 @@ class SlackTool(BaseTool):
                 
                 resp = self.slack_client.post_message(channel=channel, text=text)
                 if resp.get('ok'):
-                    return f"✅ Message sent to Slack channel {channel}."
-                return f"❌ Failed to send message: {resp.get('error', 'Unknown error')}"
+                    return f"Message sent to Slack channel {channel}."
+                return f"Failed to send message: {resp.get('error', 'Unknown error')}"
 
             elif action == "reply":
                 channel = kwargs.get("channel")
@@ -83,17 +89,39 @@ class SlackTool(BaseTool):
                 
                 resp = self.slack_client.post_message(channel=channel, text=text, thread_ts=thread_ts)
                 if resp.get('ok'):
-                    return "✅ Reply sent to Slack thread."
-                return f"❌ Failed to send reply: {resp.get('error', 'Unknown error')}"
+                    return "Reply sent to Slack thread."
+                return f"Failed to send reply: {resp.get('error', 'Unknown error')}"
 
             elif action == "search":
                 # For now, searching is a placeholder as the client doesn't have a search method yet
                 # We can use the orchestrator logic or direct API if needed
-                return f"🔍 Searching Slack for '{query}'... (Feature refinement in progress)"
+                return f"Searching Slack for '{query}'... (Feature refinement in progress)"
 
             elif action == "list":
                 # Listing channels or recent messages
-                return "📋 Listing recent Slack activity... (Feature refinement in progress)"
+                return "Listing recent Slack activity... (Feature refinement in progress)"
+
+            elif action == "set_status":
+                status_text = kwargs.get("status_text", "")
+                status_emoji = kwargs.get("status_emoji", "")
+                expiration = kwargs.get("expiration", 0)
+                
+                # Resolve Slack user ID from internal user_id
+                slack_user_id = self._resolve_slack_user_id()
+                
+                if not slack_user_id:
+                    return "Error: Could not resolve your Slack user ID. Please ensure Slack integration is configured."
+
+                resp = self.slack_client.set_user_status(
+                    user_id=slack_user_id,
+                    status_text=status_text,
+                    status_emoji=status_emoji,
+                    expiration=expiration
+                )
+                
+                if resp.get('ok'):
+                    return f"Status updated to: {status_emoji} {status_text}"
+                return f"Failed to update status: {resp.get('error', 'Unknown error')}"
 
             else:
                 return f"Unknown action: {action}. Supported: send, reply, search, list"
@@ -101,6 +129,69 @@ class SlackTool(BaseTool):
         except Exception as e:
             logger.error(f"Slack tool error: {e}", exc_info=True)
             return f"Error executing Slack action: {str(e)}"
+    
+    def _resolve_slack_user_id(self) -> Optional[str]:
+        """
+        Resolve internal user_id to Slack user ID.
+        
+        Strategy:
+        1. Check UserIntegration.integration_metadata for cached slack_user_id
+        2. Fall back to Slack API lookup by email if not cached
+        3. Cache result in integration_metadata for future lookups
+        
+        Returns:
+            Slack user ID string (e.g. 'U1234567890') or None
+        """
+        try:
+            from ...database import get_db_context
+            from ...database.models import UserIntegration, User
+            
+            with get_db_context() as db:
+                # Check for cached Slack ID in UserIntegration metadata
+                integration = db.query(UserIntegration).filter(
+                    UserIntegration.user_id == self.user_id,
+                    UserIntegration.provider == 'slack'
+                ).first()
+                
+                if integration and integration.integration_metadata:
+                    cached_id = integration.integration_metadata.get('slack_user_id')
+                    if cached_id:
+                        logger.debug(f"[SlackTool] Found cached Slack ID for user {self.user_id}")
+                        return cached_id
+                
+                # Fall back to Slack API lookup by email
+                user = db.query(User).filter(User.id == self.user_id).first()
+                if not user or not user.email:
+                    logger.warning(f"[SlackTool] No email found for user {self.user_id}")
+                    return None
+                
+                # Query Slack API by email
+                if self.slack_client and getattr(self.slack_client, 'web_client', None):
+                    try:
+                        resp = self.slack_client.web_client.users_lookupByEmail(email=user.email)
+                        
+                        if resp.get('ok'):
+                            slack_user_id = resp.get('user', {}).get('id')
+                            logger.info(f"[SlackTool] Resolved Slack ID for {user.email}: {slack_user_id}")
+                            
+                            # Cache in integration metadata for future lookups
+                            if slack_user_id and integration:
+                                meta = dict(integration.integration_metadata or {})
+                                meta['slack_user_id'] = slack_user_id
+                                integration.integration_metadata = meta
+                                db.commit()
+                                logger.debug(f"[SlackTool] Cached Slack ID in UserIntegration")
+                            
+                            return slack_user_id
+                        else:
+                            logger.warning(f"[SlackTool] Slack lookup failed for {user.email}: {resp.get('error')}")
+                    except Exception as api_err:
+                        logger.debug(f"[SlackTool] Slack API lookup failed: {api_err}")
+                
+        except Exception as e:
+            logger.warning(f"[SlackTool] Failed to resolve Slack user ID: {e}")
+        
+        return None
 
     async def _arun(self, action: str = "list", query: str = "", **kwargs) -> str:
         """Async execution."""

@@ -40,11 +40,11 @@ from ..integrations.google_tasks.exceptions import (
     TaskServiceException,
     AuthenticationException as TaskAuthenticationException
 )
-from ..integrations.notion.service import NotionService
 from ..integrations.notion.exceptions import (
     NotionServiceException,
     ServiceUnavailableException as NotionServiceUnavailableException
 )
+from ..integrations.linear.service import LinearService
 from .rag_service import RAGService
 
 # Create base exception aliases for backward compatibility
@@ -395,6 +395,45 @@ class ServiceFactory:
                 key.split('_')[0] for key in self._service_cache.keys()
             ))
         }
+
+
+    def create_linear_service(
+        self,
+        user_id: Optional[int] = None,
+        db_session: Optional[Session] = None
+    ) -> LinearService:
+        """
+        Create Linear service with automatic credential loading from database.
+        
+        Args:
+            user_id: User ID for database credentials
+            db_session: Database session
+            
+        Returns:
+            Configured LinearService instance
+        """
+        api_key = None
+        if user_id and db_session:
+            from ..database.models import UserIntegration
+            from ..utils.encryption import decrypt_token
+            
+            # Fetch integration from DB
+            integration = db_session.query(UserIntegration).filter(
+                UserIntegration.user_id == user_id,
+                UserIntegration.provider == 'linear',
+                UserIntegration.is_active == True
+            ).first()
+            
+            if integration and integration.access_token:
+                try:
+                    # Decrypt token
+                    api_key = decrypt_token(integration.access_token)
+                except Exception as e:
+                    logger.warning(f"Failed to decrypt Linear token for user {user_id}: {e}")
+                    api_key = integration.access_token
+        
+        # Fallback to global API key (handled inside LinearService/LinearClient)
+        return LinearService(config=self.config, api_key=api_key)
 
 
 # ===================================================================

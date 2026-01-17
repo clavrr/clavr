@@ -1,7 +1,7 @@
 """
 Memory Integrator
 
-Integrates memory system with ClavrAgent orchestrator.
+Integrates memory system with agent orchestrator.
 """
 from typing import Dict, Any, Optional, List
 
@@ -11,7 +11,7 @@ from ..models.persistence import MemoryPattern
 
 class MemoryIntegrator:
     """
-    Integrates memory system with ClavrAgent orchestrator
+    Integrates memory system with agent orchestrator
     """
     
     def __init__(self, memory_system: SimplifiedMemorySystem):
@@ -23,7 +23,7 @@ class MemoryIntegrator:
                                         execution_result: Dict[str, Any],
                                         user_id: Optional[int] = None):
         """
-        Learn from ClavrAgent orchestrator execution
+        Learn from agent orchestrator execution
         """
         # Extract learning data
         success = execution_result.get('success', False)
@@ -32,7 +32,8 @@ class MemoryIntegrator:
         
         try:
             execution_time = float(execution_time_str.replace('s', ''))
-        except:
+        except (ValueError, AttributeError) as e:
+            self.logger.debug(f"[MemoryIntegrator] Failed to parse execution_time '{execution_time_str}': {e}")
             execution_time = 0.0
         
         execution_type = execution_result.get('execution_type', 'standard')

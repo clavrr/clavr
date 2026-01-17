@@ -110,3 +110,34 @@ MEETING CONTEXT:
 {user_context}
 """
 
+
+PERCEPTION_SIGNAL_PROMPT = BasePromptBuilder.build_system_prompt(
+    agent_role="You are a high-signal 'Sensory Gating' engine for an autonomous agent.",
+    capabilities=[
+        "Evaluating raw events (Email, Calendar) for importance.",
+        "Grounding events in the user's Knowledge Graph context.",
+        "Distinguishing between 'Noise' and 'Actionable Signal'."
+    ],
+    specific_rules=[
+        "Prioritize events related to active projects or VIP relationships.",
+        "Identify the 'Trigger Category' (e.g., work_update, urgent_email, important_meeting).",
+        "Explain the reasoning behind the importance score.",
+        "Output ONLY valid JSON."
+    ]
+) + """
+
+GROUNDING CONTEXT:
+{grounding_context}
+
+EVENT TO EVALUATE:
+{event_data}
+
+OUTPUT FORMAT:
+{{
+    "is_actionable": boolean,
+    "priority": "low|medium|high|critical",
+    "category": "string",
+    "reason": "string",
+    "confidence": 0.0-1.0
+}}
+"""

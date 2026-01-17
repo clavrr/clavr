@@ -1,0 +1,385 @@
+# CI/CD Pipeline - Testing & Code Quality
+name: CI - Tests & Quality
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main, develop ]
+  workflow_dispatch:
+
+env:
+  PYTHON_VERSION: '3.9'
+  POETRY_VERSION: '1.7.1'
+
+jobs:
+  # Job 1: Code Quality Checks
+  code-quality:
+    name: Code Quality & Linting
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0  # Full history for better analysis
+    
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: ${{ env.PYTHON_VERSION }}
+        cache: 'pip'
+    
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install flake8 black isort mypy pylint bandit safety
+        pip install -r requirements.txt
+    
+    - name: Run Black (Code Formatting Check)
+      run: |
+        black --check --diff src/ api/ tests/
+      continue-on-error: true
+    
+    - name: Run isort (Import Sorting Check)
+      run: |
+        isort --check-only --diff src/ api/ tests/
+      continue-on-error: true
+    
+    - name: Run Flake8 (Linting)
+      run: |
+        flake8 src/ api/ tests/ --count --statistics --show-source
+      continue-on-error: true
+    
+    - name: Run Pylint (Advanced Linting)
+      run: |
+        pylint src/ api/ --exit-zero --output-format=colorized
+      continue-on-error: true
+    
+    - name: Run MyPy (Type Checking)
+      run: |
+        mypy src/ api/ --ignore-missing-imports --no-strict-optional
+      continue-on-error: true
+    
+    - name: Check for circular imports
+      run: |
+        python scripts/check_circular_imports.py
+
+  # Job 2: Security Scanning
+  security:
+    name: Security Scanning
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: ${{ env.PYTHON_VERSION }}
+        cache: 'pip'
+    
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install bandit safety pip-audit
+        pip install -r requirements.txt
+    
+    - name: Run Bandit (Security Linter)
+      run: |
+        bandit -r src/ api/ -f json -o bandit-report.json || true
+        bandit -r src/ api/ -f screen
+      continue-on-error: true
+    
+    - name: Run Safety (Dependency Vulnerability Check)
+      run: |
+        safety check --json || true
+        safety check
+      continue-on-error: true
+    
+    - name: Run pip-audit (Dependency Audit)
+      run: |
+        pip-audit --desc --format json -o pip-audit-report.json || true
+        pip-audit --desc
+      continue-on-error: true
+    
+    - name: Upload security reports
+      uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: security-reports
+        path: |
+          bandit-report.json
+          pip-audit-report.json
+        retention-days: 30
+
+  # Job 3: Unit Tests
+  unit-tests:
+    name: Unit Tests (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ['3.9', '3.10', '3.11']
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Set up Python ${{ matrix.python-version }}
+      uses: actions/setup-python@v5
+      with:
+        python-version: ${{ matrix.python-version }}
+        cache: 'pip'
+    
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install pytest pytest-cov pytest-asyncio pytest-mock
+        pip install -r requirements.txt
+    
+    - name: Run unit tests with coverage
+      run: |
+        pytest tests/ -v \
+          --cov=src \
+          --cov=api \
+          --cov-report=term-missing \
+          --cov-report=xml \
+          --cov-report=html \
+          --junitxml=junit-report.xml \
+          -m "unit or not integration"
+    
+    - name: Upload coverage to Codecov
+      uses: codecov/codecov-action@v4
+      if: matrix.python-version == '3.9'
+      with:
+        file: ./coverage.xml
+        flags: unittests
+        name: codecov-umbrella
+      continue-on-error: true
+    
+    - name: Upload test results
+      uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: test-results-${{ matrix.python-version }}
+        path: |
+          junit-report.xml
+          htmlcov/
+        retention-days: 30
+
+  # Job 4: Integration Tests
+  integration-tests:
+    name: Integration Tests
+    runs-on: ubuntu-latest
+    
+    services:
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_USER: notely_test
+          POSTGRES_PASSWORD: test_password
+          POSTGRES_DB: notely_test
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+      
+      redis:
+        image: redis:7-alpine
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 6379:6379
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: ${{ env.PYTHON_VERSION }}
+        cache: 'pip'
+    
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install pytest pytest-cov pytest-asyncio pytest-mock
+        pip install -r requirements.txt
+    
+    - name: Wait for services
+      run: |
+        sleep 10
+    
+    - name: Run integration tests
+      env:
+        DATABASE_URL: postgresql://notely_test:test_password@localhost:5432/notely_test
+        REDIS_URL: redis://localhost:6379/0
+        TESTING: true
+      run: |
+        pytest tests/ -v \
+          --cov=src \
+          --cov=api \
+          --cov-report=term-missing \
+          --cov-report=xml \
+          -m "integration"
+    
+    - name: Upload integration test results
+      uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: integration-test-results
+        path: |
+          coverage.xml
+        retention-days: 30
+
+  # Job 5: Webhook Tests (Specific)
+  webhook-tests:
+    name: Webhook Feature Tests
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: ${{ env.PYTHON_VERSION }}
+        cache: 'pip'
+    
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install pytest pytest-cov pytest-asyncio pytest-mock httpx
+        pip install -r requirements.txt
+    
+    - name: Test webhook imports
+      run: |
+        python -c "from src.database.webhook_models import WebhookEventType, WebhookSubscription, WebhookDelivery"
+        python -c "from src.features.webhook_service import WebhookService"
+        python -c "from api.routers.webhooks import router"
+        python -c "from src.workers.tasks.webhook_tasks import deliver_webhook_task"
+        echo "All webhook imports successful"
+    
+    - name: Test HMAC signature generation
+      run: |
+        python -c "
+        from src.features.webhook_service import WebhookService
+        import hmac
+        import hashlib
+        service = WebhookService(None)
+        payload = '{\"test\": \"data\"}'
+        secret = 'test_secret_key_12345'
+        sig = service.generate_signature(payload, secret)
+        expected = 'sha256=' + hmac.new(secret.encode(), payload.encode(), hashlib.sha256).hexdigest()
+        assert sig == expected, f'Signature mismatch: {sig} != {expected}'
+        print('HMAC signature generation verified')
+        "
+    
+    - name: Run webhook tests with coverage
+      run: |
+        pytest tests/test_webhooks.py -v \
+          --cov=src.features.webhook_service \
+          --cov=src.database.webhook_models \
+          --cov=api.routers.webhooks \
+          --cov=src.workers.tasks.webhook_tasks \
+          --cov-report=term-missing \
+          --cov-report=xml
+    
+    - name: Upload webhook test results
+      uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: webhook-test-results
+        path: |
+          coverage.xml
+        retention-days: 30
+
+  # Job 6: Build Check
+  build-check:
+    name: Build & Import Verification
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: ${{ env.PYTHON_VERSION }}
+        cache: 'pip'
+    
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+    
+    - name: Test critical imports
+      run: |
+        python -c "from src.utils import QueryClassifier"
+        python -c "from src.ai.rag import RAGEngine"
+        python -c "from src.services import RAGService"
+        python -c "from src.database import init_db, get_session"
+        python -c "from api.main import app"
+        echo "All critical imports successful"
+    
+    - name: Test database models
+      run: |
+        python -c "
+        from src.database.models import User, Email, Task, CalendarEvent
+        from src.database.webhook_models import WebhookSubscription, WebhookDelivery
+        print('All database models imported successfully')
+        "
+    
+    - name: Verify API endpoints
+      run: |
+        python -c "
+        from api.main import app
+        routes = [r.path for r in app.routes]
+        webhook_routes = [r for r in routes if 'webhook' in r]
+        print(f'Found {len(webhook_routes)} webhook routes')
+        assert len(webhook_routes) > 0, 'No webhook routes found'
+        "
+
+  # Job 7: Test Summary
+  test-summary:
+    name: Test Summary
+    runs-on: ubuntu-latest
+    needs: [code-quality, security, unit-tests, integration-tests, webhook-tests, build-check]
+    if: always()
+    
+    steps:
+    - name: Check job results
+      run: |
+        echo "### CI Pipeline Summary" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "| Job | Status |" >> $GITHUB_STEP_SUMMARY
+        echo "|-----|--------|" >> $GITHUB_STEP_SUMMARY
+        echo "| Code Quality | ${{ needs.code-quality.result }} |" >> $GITHUB_STEP_SUMMARY
+        echo "| Security Scanning | ${{ needs.security.result }} |" >> $GITHUB_STEP_SUMMARY
+        echo "| Unit Tests | ${{ needs.unit-tests.result }} |" >> $GITHUB_STEP_SUMMARY
+        echo "| Integration Tests | ${{ needs.integration-tests.result }} |" >> $GITHUB_STEP_SUMMARY
+        echo "| Webhook Tests | ${{ needs.webhook-tests.result }} |" >> $GITHUB_STEP_SUMMARY
+        echo "| Build Check | ${{ needs.build-check.result }} |" >> $GITHUB_STEP_SUMMARY
+    
+    - name: Determine overall result
+      run: |
+        if [[ "${{ needs.code-quality.result }}" == "failure" ]] || \
+           [[ "${{ needs.unit-tests.result }}" == "failure" ]] || \
+           [[ "${{ needs.webhook-tests.result }}" == "failure" ]] || \
+           [[ "${{ needs.build-check.result }}" == "failure" ]]; then
+          echo "CI Pipeline failed - critical jobs failed"
+          exit 1
+        else
+          echo "CI Pipeline passed"
+        fi

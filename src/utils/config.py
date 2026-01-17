@@ -23,6 +23,21 @@ class ConfigDefaults:
     EMAIL_FOLDER_SENT = "Sent"
     EMAIL_FOLDER_ARCHIVE = "Archive"
     EMAIL_FOLDER_PROCESSED = "Processed"
+
+    # Default promo patterns for email filtering
+    EMAIL_PROMO_PATTERNS = [
+        # Newsletter platforms
+        '@substack.com', '@beehiiv.com',
+        '@convertkit.com', '@ghost.io',
+        '@interviewcake.com', 
+        # Social media
+        '@facebookmail.com', 
+        # E-commerce / Streaming
+        '@primevideo.com', '@email.amazon.com', '@netflix.com',
+        '@spotify.com', '@doordash.com', 
+        # Explicit marketing
+        'newsletter@', 'marketing@',
+    ]
     
     # Agent defaults
     AGENT_NAME = "Email AI Assistant"
@@ -34,7 +49,7 @@ class ConfigDefaults:
     # AI/LLM defaults
     AI_PROVIDER_GEMINI = "gemini"
     AI_MODEL_DEFAULT = "gemini-3-flash-preview"
-    AI_TEMPERATURE_DEFAULT = 0.7
+    AI_TEMPERATURE_DEFAULT = 0.0
     AI_MAX_TOKENS_DEFAULT = 1000
     AI_SYSTEM_PROMPT_DEFAULT = "You are a helpful email assistant."
     
@@ -83,6 +98,14 @@ class ConfigDefaults:
     SERVER_PORT_DEFAULT = 8000
     API_BASE_URL_DEFAULT = "http://localhost:8000"
     FRONTEND_URL_DEFAULT = "http://localhost:3000"
+    
+    # Ghost Collaborator defaults
+    GHOST_BUG_KEYWORDS = ["bug", "broken", "error", "crash", "not working", "failed", "issue", "regression"]
+    GHOST_URGENT_KEYWORDS = ["urgent", "asap", "blocker", "critical", "emergency", "p0", "p1"]
+    GHOST_DECISION_KEYWORDS = ["should we", "what do you think", "decide", "vote", "alignment", "agreement"]
+    GHOST_ACTION_KEYWORDS = ["todo", "action item", "follow up", "need to", "must", "deadline"]
+    GHOST_CONFIDENCE_THRESHOLD = 0.3
+    GHOST_HEATED_THRESHOLD = 0.5
     
     # Config file defaults
     CONFIG_PATH_DEFAULT = "config/config.yaml"
@@ -161,6 +184,7 @@ class ConfigDefaults:
     
     OAUTH_SCOPE_SLACK = "channels:read,chat:write,files:read,files:write,users:read,users:read.email"
     OAUTH_SCOPE_ASANA = "default"
+    OAUTH_SCOPE_LINEAR = "read,write"
     
     # OAuth URLs
     OAUTH_URL_GOOGLE_AUTH = "https://accounts.google.com/o/oauth2/v2/auth"
@@ -171,12 +195,15 @@ class ConfigDefaults:
     OAUTH_URL_NOTION_TOKEN = "https://api.notion.com/v1/oauth/token"
     OAUTH_URL_ASANA_AUTH = "https://app.asana.com/-/oauth_authorize"
     OAUTH_URL_ASANA_TOKEN = "https://app.asana.com/-/oauth_token"
+    OAUTH_URL_LINEAR_AUTH = "https://linear.app/oauth/authorize"
+    OAUTH_URL_LINEAR_TOKEN = "https://api.linear.app/oauth/token"
 
     # Default OAuth Redirect URIs
     OAUTH_REDIRECT_GOOGLE = "${API_BASE_URL}/auth/google/callback"
     OAUTH_REDIRECT_SLACK = "${API_BASE_URL}/integrations/slack/callback"
     OAUTH_REDIRECT_NOTION = "${API_BASE_URL}/integrations/notion/callback"
     OAUTH_REDIRECT_ASANA = "${API_BASE_URL}/integrations/asana/callback"
+    OAUTH_REDIRECT_LINEAR = "${API_BASE_URL}/integrations/linear/callback"
     
     # Calendar Tool Defaults
     CALENDAR_SEARCH_DAYS_BACK = 7
@@ -412,18 +439,34 @@ class OAuthConfigs(BaseModel):
     providers: Dict[str, OAuthConfig]
 
 
+class IndexingConfig(BaseModel):
+    """Indexing/Graph configuration"""
+    graph_backend: str = "arangodb"
+    arango_url: str = "http://localhost:8529"
+    arango_user: str = "root"
+    arango_password: str = "password"
+    arango_database: str = "clavr"
+    enable_knowledge_graph: bool = True
+    validation_mode: str = "strict"
+    vector_score_weight: float = 0.6
+    graph_score_weight: float = 0.4
+
+
 class Config(BaseModel):
     """Main configuration"""
     agent: AgentConfig
     email: EmailConfig
     ai: AIConfig
     google_maps_api_key: Optional[str] = None
+    linear_api_key: Optional[str] = None
+    linear_webhook_secret: Optional[str] = None
     database: DatabaseConfig = DatabaseConfig()
     logging: LoggingConfig = LoggingConfig()
     security: Optional[SecurityConfig] = None
     server: Optional[ServerConfig] = None
     filters: List[FilterConfig] = []
     rag: Optional[RAGConfig] = None  # RAG configuration (optional, uses defaults if not provided)
+    indexing: IndexingConfig = IndexingConfig() # Indexing/Graph configuration
     voice: Optional[VoiceConfig] = None  # Voice configuration (optional, uses defaults if not provided)
     oauth: Optional[OAuthConfigs] = None # OAuth configurations (optional)
 
@@ -445,6 +488,13 @@ def load_config(config_path: str = ConfigDefaults.CONFIG_PATH_DEFAULT) -> Config
     # Load Google Maps API key from environment if not in YAML
     if not config_dict.get('google_maps_api_key'):
         config_dict['google_maps_api_key'] = os.getenv('GOOGLE_MAPS_API_KEY')
+    
+    # Load Linear API key from environment if not in YAML
+    if not config_dict.get('linear_api_key'):
+        config_dict['linear_api_key'] = os.getenv('LINEAR_API_KEY')
+    
+    if not config_dict.get('linear_webhook_secret'):
+        config_dict['linear_webhook_secret'] = os.getenv('LINEAR_WEBHOOK_SECRET')
     
     # Initialize OAuth providers if missing
     if 'oauth' not in config_dict:
@@ -491,6 +541,14 @@ def _ensure_oauth_defaults(providers: Dict[str, Any]):
             "token_url": ConfigDefaults.OAUTH_URL_ASANA_TOKEN,
             "scopes": ConfigDefaults.OAUTH_SCOPE_ASANA,
             "redirect_uri": f"{api_url}/integrations/asana/callback"
+        },
+        "linear": {
+            "client_id": os.getenv("LINEAR_CLIENT_ID"),
+            "client_secret": os.getenv("LINEAR_CLIENT_SECRET"),
+            "auth_url": ConfigDefaults.OAUTH_URL_LINEAR_AUTH,
+            "token_url": ConfigDefaults.OAUTH_URL_LINEAR_TOKEN,
+            "scopes": ConfigDefaults.OAUTH_SCOPE_LINEAR,
+            "redirect_uri": f"{api_url}/integrations/linear/callback"
         }
     }
     

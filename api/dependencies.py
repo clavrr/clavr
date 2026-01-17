@@ -35,6 +35,7 @@ class AppState:
     _weather_tool: Optional[WeatherTool] = None
     _finance_tool: Optional[FinanceTool] = None
     _orchestrator: Optional[Any] = None
+    _connection_manager: Optional['ConnectionManager'] = None
     
     @classmethod
     def get_config(cls) -> Config:
@@ -105,6 +106,19 @@ class AppState:
         return cls._graph_manager
     
     @classmethod
+    def get_connection_manager(cls) -> Optional['ConnectionManager']:
+        """Get or create ConnectionManager singleton for WebSocket notifications."""
+        if cls._connection_manager is None:
+            try:
+                from api.websocket_manager import ConnectionManager
+                cls._connection_manager = ConnectionManager()
+                logger.info("[OK] ConnectionManager initialized")
+            except Exception as e:
+                logger.warning(f"Failed to initialize ConnectionManager: {e}")
+                cls._connection_manager = None
+        return cls._connection_manager
+    
+    @classmethod
     def get_rag_engine(cls) -> 'RAGEngine':
         """Get or create RAG engine singleton"""
         if cls._rag_engine is None:
@@ -168,7 +182,8 @@ class AppState:
         return cls.get_rag_engine()
     
     @classmethod
-    def get_email_tool(cls, user_id: int = 1, request: Optional[Any] = None, user_first_name: Optional[str] = None) -> EmailTool:
+    def get_email_tool(cls, user_id: int, request: Optional[Any] = None, user_first_name: Optional[str] = None) -> EmailTool:
+        """Get EmailTool with consolidated credentials. user_id is required."""
         """Get EmailTool with consolidated credentials."""
         config = cls.get_config()
         rag_engine = cls.get_rag_engine()
@@ -193,11 +208,15 @@ class AppState:
         if not user_id and request and hasattr(request.state, 'user') and request.state.user:
             user_id = request.state.user.id
         
-        credentials = cls._get_credentials(user_id or 1, 'google_calendar', request)
-        return CalendarTool(config=config, user_id=user_id or 1, credentials=credentials, rag_engine=rag_engine)
+        if not user_id:
+            raise ValueError("user_id is required for get_calendar_tool - cannot default to 1 for multi-tenancy")
+        
+        credentials = cls._get_credentials(user_id, 'google_calendar', request)
+        return CalendarTool(config=config, user_id=user_id, credentials=credentials, rag_engine=rag_engine)
 
     @classmethod
-    def get_drive_service(cls, user_id: int = 1, request: Optional[Any] = None) -> Any:
+    def get_drive_service(cls, user_id: int, request: Optional[Any] = None) -> Any:
+        """Get GoogleDriveService with consolidated credentials. user_id is required."""
         """Get GoogleDriveService with consolidated credentials."""
         config = cls.get_config()
         credentials = cls._get_credentials(user_id, 'google_drive', request)
@@ -206,8 +225,8 @@ class AppState:
         return GoogleDriveService(config=config, credentials=credentials)
     
     @classmethod
-    def get_task_tool(cls, user_id: int = 1, request: Optional[Any] = None, user_first_name: Optional[str] = None, db: Optional[Any] = None) -> TaskTool:
-        """Get TaskTool with consolidated credentials."""
+    def get_task_tool(cls, user_id: int, request: Optional[Any] = None, user_first_name: Optional[str] = None, db: Optional[Any] = None) -> TaskTool:
+        """Get TaskTool with consolidated credentials. user_id is required."""
         config = cls.get_config()
         storage_path = f"./data/tasks_{user_id}.json"
         
@@ -257,8 +276,8 @@ class AppState:
         return cls._notion_tool
     
     @classmethod
-    def get_keep_tool(cls, user_id: int = 1, request: Optional[Any] = None) -> KeepTool:
-        """Get KeepTool with consolidated credentials."""
+    def get_keep_tool(cls, user_id: int, request: Optional[Any] = None) -> KeepTool:
+        """Get KeepTool with consolidated credentials. user_id is required."""
         config = cls.get_config()
         credentials = cls._get_credentials(user_id, 'gmail', request) # Keep uses Gmail scopes
         return KeepTool(config=config, user_id=user_id, credentials=credentials)
@@ -278,8 +297,8 @@ class AppState:
         return cls._weather_tool
     
     @classmethod
-    def get_drive_tool(cls, user_id: int = 1, request: Optional[Any] = None):
-        """Get DriveTool with consolidated credentials."""
+    def get_drive_tool(cls, user_id: int, request: Optional[Any] = None):
+        """Get DriveTool with consolidated credentials. user_id is required."""
         from src.tools.drive import DriveTool
         config = cls.get_config()
         credentials = cls._get_credentials(user_id, 'google_drive', request)
@@ -291,8 +310,8 @@ class AppState:
             return DriveTool(config=config, user_id=user_id, credentials=None)
     
     @classmethod
-    def get_brief_service(cls, user_id: int = 1, request: Optional[Any] = None) -> Any:
-        """Get BriefService with aggregated services."""
+    def get_brief_service(cls, user_id: int, request: Optional[Any] = None) -> Any:
+        """Get BriefService with aggregated services. user_id is required."""
         from src.services.dashboard.brief_service import BriefService
         from src.integrations.google_calendar.service import CalendarService
         config = cls.get_config()
@@ -358,48 +377,18 @@ class AppState:
             Orchestrator instance for handling complex multi-step queries
         """
         if cls._orchestrator is None:
-            try:
-                # from src.agent.orchestration import create_orchestrator
-                logger.warning("Legacy orchestration module is deprecated/removed.")
-                return None
-                
-                config = cls.get_config()
-                
-                # Get tools with optional request context for credentials
-                tools = [
-                    cls.get_email_tool(user_id=user_id or 1, request=request),
-                    cls.get_calendar_tool(user_id=user_id, request=request),
-                    cls.get_task_tool(user_id=user_id or 1, request=request),
-                    cls.get_summarize_tool(),
-                    cls.get_notion_tool()  # Include NotionTool
-                ]
-                
-                # Get RAG engine and graph manager for agent roles
-                rag_engine = cls.get_rag_engine()
-                graph_manager = None
-                try:
-                    from src.services.indexing.graph.manager import KnowledgeGraphManager
-                    graph_manager = KnowledgeGraphManager(config=config)
-                except Exception as e:
-                    logger.debug(f"Could not initialize graph manager: {e}")
-                
-                cls._orchestrator = create_orchestrator(
-                    tools=tools,
-                    config=config,
-                    db=db,
-                    rag_engine=rag_engine,
-                    graph_manager=graph_manager
-                )
-                logger.info("[OK] Orchestrator initialized")
-            except ImportError:
-                logger.warning("Orchestration module not available. Install required dependencies.")
-                return None
+            # Legacy orchestration module has been deprecated and removed
+            # Raise explicit error instead of returning None to prevent NoneType errors
+            raise NotImplementedError(
+                "Legacy orchestration module is deprecated and removed. "
+                "Use SupervisorAgent directly for multi-step query execution."
+            )
         
         return cls._orchestrator
     
     @classmethod
-    def get_finance_tool(cls, user_id: int = 1) -> FinanceTool:
-        """Get or create FinanceTool singleton"""
+    def get_finance_tool(cls, user_id: int) -> FinanceTool:
+        """Get or create FinanceTool singleton. user_id is required."""
         if cls._finance_tool is None:
             config = cls.get_config()
             graph_manager = cls.get_knowledge_graph_manager()
@@ -417,6 +406,7 @@ class AppState:
         from src.tools.timezone.tool import TimezoneTool
         from src.tools.slack.tool import SlackTool
         from src.tools.asana.tool import AsanaTool
+        from src.tools.ghost.tool import GhostTool
         
         config = cls.get_config()
         
@@ -434,8 +424,97 @@ class AppState:
             # Slack/Asana might need more user-specific setup if they have their own OAuth
             SlackTool(config=config, user_id=user_id),
             cls.get_notion_tool(),
-            AsanaTool(config=config, user_id=user_id)
+            AsanaTool(config=config, user_id=user_id),
+            GhostTool(config=config, user_id=user_id)
         ]
+
+    @classmethod
+    def get_insight_service(cls) -> Optional[Any]:
+        """Get or create InsightService singleton"""
+        if not hasattr(cls, '_insight_service') or cls._insight_service is None:
+            config = cls.get_config()
+            graph_manager = cls.get_knowledge_graph_manager()
+            if graph_manager:
+                from src.services.insights.insight_service import InsightService
+                cls._insight_service = InsightService(config, graph_manager)
+                logger.info("[OK] InsightService initialized")
+            else:
+                cls._insight_service = None
+        return cls._insight_service
+
+    @classmethod
+    def get_deep_work_logic(cls) -> Optional[Any]:
+        """Get or create DeepWorkLogic singleton"""
+        if not hasattr(cls, '_deep_work_logic') or cls._deep_work_logic is None:
+            try:
+                from src.features.protection.deep_work import DeepWorkLogic
+                cls._deep_work_logic = DeepWorkLogic()
+                logger.info("[OK] DeepWorkLogic initialized")
+            except Exception as e:
+                logger.warning(f"Failed to initialize DeepWorkLogic: {e}")
+                cls._deep_work_logic = None
+        return cls._deep_work_logic
+
+    @classmethod
+    def get_cross_stack_context(cls) -> Optional[Any]:
+        """Get or create CrossStackContext singleton"""
+        if not hasattr(cls, '_cross_stack_context') or cls._cross_stack_context is None:
+            try:
+                from src.services.proactive.cross_stack_context import CrossStackContext
+                config = cls.get_config()
+                graph_manager = cls.get_knowledge_graph_manager()
+                rag_engine = cls.get_rag_engine()
+                cls._cross_stack_context = CrossStackContext(config, graph_manager=graph_manager, rag_engine=rag_engine)
+                logger.info("[OK] CrossStackContext initialized")
+            except Exception as e:
+                logger.warning(f"Failed to initialize CrossStackContext: {e}")
+                cls._cross_stack_context = None
+        return cls._cross_stack_context
+
+    @classmethod
+    def get_linear_service(cls, user_id: int) -> Optional[Any]:
+        """Get or create LinearService for a user"""
+        try:
+            from src.integrations.linear.service import LinearService
+            config = cls.get_config()
+            return LinearService(config=config, user_id=user_id)
+        except Exception as e:
+            logger.warning(f"Failed to initialize LinearService: {e}")
+            return None
+
+    @classmethod
+    def get_ghost_tool(cls, user_id: int) -> Any:
+        """Get or create GhostTool for a user"""
+        from src.tools.ghost.tool import GhostTool
+        config = cls.get_config()
+        return GhostTool(config=config, user_id=user_id)
+
+    @classmethod
+    def get_supervisor_agent(cls, user_id: int) -> Optional[Any]:
+        """Get or create SupervisorAgent for a user."""
+        from src.agents.supervisor import SupervisorAgent
+        config = cls.get_config()
+        # Use simple MemoryOrchestrator if available
+        try:
+            from src.memory.orchestrator import MemoryOrchestrator
+            memory_orchestrator = MemoryOrchestrator(
+                config=config,
+                graph_manager=cls.get_knowledge_graph_manager(),
+                rag_engine=cls.get_rag_engine(),
+                semantic_memory=cls.get_insight_service(), # Using insight service as semantic memory provider
+                deep_work_logic=cls.get_deep_work_logic(),
+                cross_stack_context=cls.get_cross_stack_context(),
+                linear_service=cls.get_linear_service(user_id)
+            )
+        except ImportError:
+            memory_orchestrator = None
+            
+        return SupervisorAgent(
+            config=config,
+            tools=cls.get_all_tools(user_id=user_id),
+            user_id=user_id,
+            memory_orchestrator=memory_orchestrator
+        )
 
     @classmethod
     def get_auth_service(cls, db: AsyncSession) -> Any:
@@ -573,8 +652,8 @@ def get_calendar_tool(user_id: Optional[int] = None, request: Optional[Request] 
             # Try to get user from request state if available
             if hasattr(request.state, 'user') and request.state.user:
                 user_id = request.state.user.id
-        except:
-            pass
+        except Exception as e:
+            logger.debug(f"[Dependencies] Failed to extract user_id from request: {e}")
     
     return AppState.get_calendar_tool(user_id=user_id, request=request)
 
@@ -586,8 +665,8 @@ def get_drive_service(user_id: Optional[int] = None, request: Optional[Request] 
         try:
             if hasattr(request.state, 'user') and request.state.user:
                 user_id = request.state.user.id
-        except:
-            pass
+        except Exception as e:
+            logger.debug(f"[Dependencies] Failed to extract user_id from request: {e}")
     return AppState.get_drive_service(user_id=user_id or 1, request=request)
 
 
@@ -660,6 +739,10 @@ def get_current_user(request: Request) -> User:
             detail="Not authenticated"
         )
     return user
+
+
+# Alias for backward compatibility and explicit requirement
+get_current_user_required = get_current_user
 
 
 def get_optional_user(request: Request) -> Optional[User]:

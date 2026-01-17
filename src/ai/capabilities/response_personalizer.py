@@ -182,7 +182,58 @@ class ResponsePersonalizer:
              self.interaction_history[user_id].pop(0)
 
     def _initialize_templates(self) -> Dict[str, Any]:
-        return {} # Placeholder for template logic
+        """Initialize format handlers for different response styles."""
+        return {
+            'concise': self._format_concise,
+            'detailed': self._format_detailed,
+            'structured': self._format_structured,
+            'conversational': self._format_conversational,
+            'technical': self._format_technical,
+        }
+    
+    def _format_concise(self, main_answer: str, **kwargs) -> str:
+        """Format response in minimal style."""
+        return main_answer.strip()
+    
+    def _format_detailed(self, main_answer: str, context: str = "", details: str = "", **kwargs) -> str:
+        """Format response with full context and details."""
+        parts = [main_answer]
+        if context:
+            parts.append(f"\n\n**Context:**\n{context}")
+        if details:
+            parts.append(f"\n\n**Details:**\n{details}")
+        return "".join(parts)
+    
+    def _format_structured(self, main_answer: str, details_list: list = None, **kwargs) -> str:
+        """Format response in markdown structured style."""
+        parts = [f"## Result\n{main_answer}"]
+        if details_list:
+            parts.append("\n\n### Details")
+            for item in details_list[:10]:
+                parts.append(f"\n- {item}")
+        return "".join(parts)
+    
+    def _format_conversational(self, main_answer: str, greeting: str = "", follow_up: str = "", **kwargs) -> str:
+        """Format response in friendly conversational style."""
+        parts = []
+        if greeting:
+            parts.append(f"{greeting} ")
+        parts.append(main_answer)
+        if follow_up:
+            parts.append(f" {follow_up}")
+        return "".join(parts)
+    
+    def _format_technical(self, main_answer: str, code_blocks: list = None, references: list = None, **kwargs) -> str:
+        """Format response for technical content."""
+        parts = [main_answer]
+        if code_blocks:
+            for block in code_blocks[:5]:
+                parts.append(f"\n\n```\n{block}\n```")
+        if references:
+            parts.append("\n\n**References:**")
+            for ref in references[:5]:
+                parts.append(f"\n- {ref}")
+        return "".join(parts)
 
     def get_user_preferences(self, user_id: int) -> Optional[UserPreferences]:
         return self.user_preferences.get(user_id)

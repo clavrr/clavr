@@ -638,7 +638,8 @@ Write a brief, natural summary of what happened during this period."""
                 return start.strftime("%B %d, %Y")
             else:
                 return f"{start.strftime('%B %d')} - {end.strftime('%B %d, %Y')}"
-        except:
+        except Exception as e:
+            logger.debug(f"[EpisodeNarrative] Failed to format time range: {e}")
             return f"{start_time} to {end_time}"
     
     def _calculate_duration_days(self, start_time: str, end_time: str) -> int:
@@ -647,7 +648,8 @@ Write a brief, natural summary of what happened during this period."""
             start = datetime.fromisoformat(start_time.replace("Z", "+00:00"))
             end = datetime.fromisoformat(end_time.replace("Z", "+00:00"))
             return max(1, (end - start).days)
-        except:
+        except Exception as e:
+            logger.debug(f"[EpisodeNarrative] Failed to calculate duration: {e}")
             return 1
 
 

@@ -133,8 +133,8 @@ class TasksCrawler(BaseIndexer):
                 # Google Tasks returns date in RFC 3339 format
                 try:
                     due_date = due_date.split('T')[0]  # Extract just the date part
-                except:
-                    pass
+                except Exception as e:
+                    logger.debug(f"[TasksCrawler] Failed to parse due_date '{due_date}': {e}")
             
             # Build searchable text
             searchable_parts = [title]

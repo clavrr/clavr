@@ -136,6 +136,35 @@ class FlexibleDateParser:
         # 2. Extract specific time if present
         target_time = self._parse_time(query_lower)
         
+        # 2b. Check for relative time offsets ("in 30 mins", "in half an hour")
+        # This overrides target_time if found (as it calculates a specific target time)
+        # We need 'now' for this, so we must initialize it eaerlier if needed
+        # But 'now' is passed in later or defaulted. Let's default it here temporarily for calculation
+        temp_now = now or datetime.now()
+        # If now was passed, use it. If not, use local now.
+        if temp_now.tzinfo is None and self.timezone_name and PYTZ_AVAILABLE:
+            # We need to localize temp_now to interpret relative correctly if we want to be precise,
+            # but usually relative minutes don't depend on TZ unless crossing borders.
+            pass
+
+        relative_offset_time = self._parse_relative_time_offset(query_lower, temp_now)
+        if relative_offset_time:
+             # This returns a datetime. We extract time from it?
+             # Or we return it as a full result immediately?
+             # parse() returns range (start, end).
+             # So if we have relative offset, we return (target, target+1h).
+             start = relative_offset_time
+             # Localize if needed (if temp_now wasn't localized)
+             # But let's integrate with the flow:
+             # If we have relative offset, we can treat it as a result immediately.
+             
+             # Ensure consistency with how parse() expects 'now' logic later
+             # But simpler to return here.
+             
+             # If config has timezone, localize it
+             start = self._localize(start, tz_info)
+             return (start, start + timedelta(hours=1))
+
         # Get base dates
         if now is None:
             now = datetime.now()
@@ -156,9 +185,12 @@ class FlexibleDateParser:
         if not result:
             result = self._parse_day_of_week(query_lower, today)
         
-        # Try month/date patterns if not found
         if not result:
             result = self._parse_month_date(query_lower, now)
+
+        # Try time of day ("this afternoon", "morning")
+        if not result:
+            result = self.get_time_of_day_range(query_lower, today)
         
         if not result and target_time:
             result = (today, today + timedelta(days=1) - timedelta(seconds=1))
@@ -456,6 +488,33 @@ class FlexibleDateParser:
             end = now  # Up to now
             return (start, end)
         
+        return None
+
+    def _parse_relative_time_offset(self, query: str, now: datetime) -> Optional[datetime]:
+        """
+        Parse relative time offsets like "in 10 minutes", "in half an hour".
+        """
+        query_lower = query.lower()
+        
+        # "in half an hour"
+        if "in half an hour" in query_lower or "in half hour" in query_lower:
+            return now + timedelta(minutes=30)
+        
+        # "in an hour"
+        if "in an hour" in query_lower or "in 1 hour" in query_lower:
+            return now + timedelta(hours=1)
+            
+        # "in X minutes/hours"
+        match = re.search(r'in\s+(\d+)\s*(min|minute|hour|hr)s?', query_lower)
+        if match:
+            num = int(match.group(1))
+            unit = match.group(2)
+            
+            if 'min' in unit:
+                return now + timedelta(minutes=num)
+            elif 'hour' in unit or 'hr' in unit:
+                return now + timedelta(hours=num)
+                
         return None
     
     def get_time_of_day_range(

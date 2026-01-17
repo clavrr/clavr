@@ -545,7 +545,8 @@ async def list_blog_posts(
     category: Optional[str] = Query(None, description="Filter by category"),
     published_only: bool = Query(True, description="Only return published posts"),
     search: Optional[str] = Query(None, description="Search in title and content"),
-    db: AsyncSession = Depends(get_async_db)
+    db: AsyncSession = Depends(get_async_db),
+    current_user: User = Depends(get_current_user)
 ):
     """
     List blog posts with pagination and filtering
@@ -636,7 +637,8 @@ async def list_blog_posts(
 @router.get("/posts/{post_id}", response_model=BlogPostResponse)
 async def get_blog_post(
     post_id: int,
-    db: AsyncSession = Depends(get_async_db)
+    db: AsyncSession = Depends(get_async_db),
+    current_user: User = Depends(get_current_user)
 ):
     """
     Get a single blog post by ID
@@ -672,7 +674,8 @@ async def get_blog_post(
 async def get_blog_post_by_slug(
     slug: str,
     published_only: bool = Query(True, description="Only return if published"),
-    db: AsyncSession = Depends(get_async_db)
+    db: AsyncSession = Depends(get_async_db),
+    current_user: User = Depends(get_current_user)
 ):
     """
     Get a blog post by slug (URL-friendly identifier)
@@ -827,7 +830,8 @@ async def delete_blog_post(
 @router.get("/categories", response_model=List[str])
 async def get_categories(
     published_only: bool = Query(True, description="Only count published posts"),
-    db: AsyncSession = Depends(get_async_db)
+    db: AsyncSession = Depends(get_async_db),
+    current_user: User = Depends(get_current_user)
 ):
     """
     Get list of all allowed blog categories
@@ -854,7 +858,9 @@ async def get_categories(
 
 
 @router.get("/categories/info")
-async def get_categories_info():
+async def get_categories_info(
+    current_user: User = Depends(get_current_user)
+):
     """
     Get detailed information about each blog category including descriptions and content guidance
     

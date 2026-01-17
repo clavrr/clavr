@@ -547,8 +547,8 @@ class TaskService:
                                         if days_since_update <= 7:
                                             logger.info(f"[TASK_SERVICE] Including '{t.get('title', 'NO TITLE')[:50]}' as pending (status='completed' but no completed timestamp, updated {days_since_update}d ago - likely uncompleted)")
                                             pending_tasks_filtered.append(t)
-                                    except Exception:
-                                        pass
+                                    except Exception as e:
+                                        logger.debug(f"[TASK_SERVICE] Failed to check recent update for task {t.get('id')}: {e}")
                     
                     tasks = pending_tasks_filtered
                     logger.info(f"[TASK_SERVICE] Filtered to {len(tasks)} pending tasks (raw_status='needsAction') from {original_count} total")
@@ -817,7 +817,8 @@ class TaskService:
                     event_dt = datetime.fromisoformat(event_time.replace('Z', '+00:00'))
                     due_dt = event_dt - timedelta(hours=2)
                     due_date = due_dt.isoformat()
-                except:
+                except Exception as e:
+                    logger.debug(f"[TASK_SERVICE] Failed to parse event_time for preparation: {e}")
                     due_date = None
             else:  # followup
                 title = f"Follow up: {event_title}"
@@ -826,7 +827,8 @@ class TaskService:
                     event_dt = datetime.fromisoformat(event_time.replace('Z', '+00:00'))
                     due_dt = event_dt + timedelta(days=1)
                     due_date = due_dt.isoformat()
-                except:
+                except Exception as e:
+                    logger.debug(f"[TASK_SERVICE] Failed to parse event_time for followup: {e}")
                     due_date = None
             
             task = self.create_task(

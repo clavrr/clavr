@@ -52,13 +52,17 @@ class EmailWorkflowService:
                 try:
                     from ..utils import FlexibleDateParser
                     date_parser = FlexibleDateParser(self.config)
-                except Exception: pass
+                except Exception as e:
+                    logger.debug(f"[EMAIL_WORKFLOW] Date parser init failed: {e}")
+                    pass
             
             if not llm_client:
                 try:
                     from ..ai.llm_factory import LLMFactory
                     llm_client = LLMFactory.get_llm_for_provider(self.config, temperature=0.1)
-                except Exception: pass
+                except Exception as e:
+                    logger.debug(f"[EMAIL_WORKFLOW] LLM client init failed: {e}")
+                    pass
             
             event_title = email_subject
             start_time = None
@@ -111,7 +115,9 @@ Extract the following in JSON format:
                     if date_range:
                         start_time = date_range['start']
                         end_time = date_range.get('end', start_time + timedelta(hours=1))
-                except Exception: pass
+                except Exception as e:
+                    logger.debug(f"[EMAIL_WORKFLOW] Fallback date parsing failed: {e}")
+                    pass
             
             if not start_time:
                 start_time = datetime.now() + timedelta(hours=1)

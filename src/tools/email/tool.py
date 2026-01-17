@@ -39,14 +39,16 @@ class EmailTool(WorkflowEventMixin, BaseTool):
     config: Optional[Config] = Field(default=None)
     rag_engine: Optional[Any] = Field(default=None)
     hybrid_coordinator: Optional[Any] = Field(default=None)
-    user_id: int = Field(default=1)
+    user_id: int = Field(description="User ID - required for multi-tenancy")
     credentials: Optional[Any] = Field(default=None)
     user_first_name: Optional[str] = Field(default=None)
     _service: Optional[Any] = None
     
     def __init__(self, config: Optional[Config] = None, rag_engine: Optional[Any] = None, 
-                 user_id: int = 1, credentials: Optional[Any] = None, user_first_name: Optional[str] = None,
+                 user_id: int = None, credentials: Optional[Any] = None, user_first_name: Optional[str] = None,
                  hybrid_coordinator: Optional[Any] = None, **kwargs):
+        if user_id is None:
+            raise ValueError("user_id is required for EmailTool - cannot default to 1 for multi-tenancy")
         super().__init__(
             config=config,
             rag_engine=rag_engine,
@@ -133,8 +135,8 @@ class EmailTool(WorkflowEventMixin, BaseTool):
                              if "subject" in query.lower():
                                  try:
                                      subject = query.split("subject", 1)[1].strip(": ").split("\n")[0]
-                                 except:
-                                     pass
+                                 except Exception as e:
+                                     logger.debug(f"[EmailTool] Failed to extract subject from query: {e}")
                         
                         storage.create_template(
                             name=template_name,
@@ -414,8 +416,8 @@ class EmailTool(WorkflowEventMixin, BaseTool):
                         if date and 'T' in date:
                              dt = datetime.fromisoformat(date.replace('Z', '+00:00'))
                              date_str = dt.strftime('%I:%M %p') # Just time for today hopefully
-                    except:
-                        pass
+                    except Exception as e:
+                        logger.debug(f"[EmailTool] Date parse failed for '{date}': {e}")
                         
                     lines.append(f"   from _{sender}_")
                     if snippet:

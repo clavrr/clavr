@@ -33,14 +33,16 @@ class FinanceAgent(BaseAgent):
         """
         logger.info(f"[{self.name}] Processing query: {query}")
         
-        # 1. Enrich Query with Memory Context
+        # 1. Enrich Query with Memory Context (handled in _extract_params)
+        # Note: We rely on _extract_params to retrieve memory context
+        # to avoid duplicating context in the query string and bloating the prompt.
         if self.memory_orchestrator:
-             pass 
-             # Optimization: We rely on _extract_params to retrieve memory context
-             # to avoid duplicating context in the query string and bloating the prompt.
+             logger.debug(f"[{self.name}] MemoryOrchestrator active, context will be fetched for extraction.")
 
         query_lower = query.lower()
-        user_id = context.get('user_id') if context else 1
+        user_id = context.get('user_id') if context else None
+        if user_id is None:
+            return "Error: user_id is required for financial queries - cannot default to 1 for multi-tenancy"
         
         # Route based on detected intent
         if any(w in query_lower for w in INTENT_KEYWORDS['finance']['lookup']):

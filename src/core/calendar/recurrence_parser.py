@@ -27,14 +27,16 @@ if not DATEUTIL_AVAILABLE:
         from ...utils import FlexibleDateParser
         _flexible_date_parser = FlexibleDateParser()
         FLEXIBLE_PARSER_AVAILABLE = True
-    except:
+    except ImportError:
+        # FlexibleDateParser not available - will use manual parsing
         FLEXIBLE_PARSER_AVAILABLE = False
 
 # Always import logger
 try:
     from ...utils.logger import setup_logger
     logger = setup_logger(__name__)
-except:
+except ImportError:
+    # Logger not available - will use None checks before logging
     logger = None
 
 

@@ -27,12 +27,6 @@ def deliver_webhook_task(
 ):
     """
     Celery task to deliver webhooks asynchronously
-    
-    Args:
-        event_type: Type of event (e.g., "email.received")
-        event_id: Unique event identifier
-        payload: Event payload data
-        user_id: Optional user ID to filter subscriptions
     """
     with get_db_context() as db:
         try:
@@ -43,33 +37,96 @@ def deliver_webhook_task(
                 event_type_enum = WebhookEventType(event_type)
             except ValueError:
                 logger.error(f"Invalid event type: {event_type}")
-                return {
-                    'status': 'error',
-                    'error': f'Invalid event type: {event_type}'
-                }
+                return {'status': 'error', 'error': f'Invalid event type: {event_type}'}
             
-            # Trigger webhook event (async)
-            result = asyncio.run(
-                webhook_service.trigger_webhook_event(
+            # Unified Async Execution Block
+            async def process_webhook():
+                # 1. Primary Delivery
+                await webhook_service.trigger_webhook_event(
                     event_type=event_type_enum,
                     event_id=event_id,
                     payload=payload,
                     user_id=user_id
                 )
-            )
-            
-            logger.info(f"Delivered webhooks for event {event_type}:{event_id}")
+                
+                # 2. Ghost Internal Dispatch (Isolated)
+                try:
+                    await self._dispatch_to_ghost_agents(db, payload, event_type, event_id, user_id)
+                except Exception as ex:
+                    logger.error(f"[Ghost] Dispatch failed for {event_type}: {ex}")
+
+            # Run everything in a single loop
+            asyncio.run(process_webhook())
             
             return {
                 'status': 'success',
                 'event_type': event_type,
-                'event_id': event_id,
-                'deliveries': result
+                'event_id': event_id
             }
             
         except Exception as e:
-            logger.error(f"Error delivering webhook: {e}")
-            raise
+            logger.error(f"Webhook delivery failed: {e}")
+            return {'status': 'error', 'error': str(e)}
+
+    async def _dispatch_to_ghost_agents(self, db, payload, event_type, event_id, user_id):
+        """Helper to manage Ghost dispatch flow."""
+        from src.agents.perception.agent import PerceptionAgent
+        from src.agents.perception.types import PerceptionEvent
+        from src.features.ghost.meeting_prepper import MeetingPrepper
+        from src.features.ghost.relationship_gardener import RelationshipGardener
+        from src.features.ghost.document_tracker import DocumentTrackerAgent
+        from src.features.ghost.thread_analyzer import ThreadAnalyzerAgent
+        from api.dependencies import AppState
+        
+        config = AppState.get_config()
+        graph_manager = AppState.get_knowledge_graph_manager()
+        
+        # Initialize Agents
+        perception = PerceptionAgent(config)
+        prepper = MeetingPrepper(db, config)
+        gardener = RelationshipGardener(db, config)
+        doc_tracker = DocumentTrackerAgent(db, config)
+        thread_analyzer = ThreadAnalyzerAgent(db, config, graph_manager)
+        
+        # Convert webhook payload to PerceptionEvent
+        perception_event = None
+        if event_type.startswith("email."):
+            perception_event = PerceptionEvent(
+                type="email",
+                source_id=payload.get("id", event_id),
+                content={
+                    "id": payload.get("id"),
+                    "from": payload.get("from") or payload.get("sender"),
+                    "subject": payload.get("subject", ""),
+                },
+                timestamp=datetime.utcnow().isoformat()
+            )
+        elif event_type.startswith("calendar."):
+            perception_event = PerceptionEvent(
+                type="calendar",
+                source_id=payload.get("id", event_id),
+                content={
+                    "id": payload.get("id"),
+                    "summary": payload.get("summary", ""),
+                },
+                timestamp=datetime.utcnow().isoformat()
+            )
+        
+        # Perception filtering
+        trigger = None
+        if perception_event:
+            trigger = await perception.perceive_event(perception_event, user_id)
+        
+        # Dispatch logic
+        if event_type in ["calendar.event.created", "calendar.event.updated"]:
+            if trigger or perception_event is None:
+                await prepper.handle_event(event_type, payload, user_id)
+        elif event_type == "email.sent":
+            await gardener.handle_event(event_type, payload, user_id)
+        elif event_type == "document.indexed":
+            await doc_tracker.handle_event(event_type, payload, user_id)
+        elif event_type in ["slack.thread.updated", "slack.message.created"]:
+            await thread_analyzer.handle_event(event_type, payload, user_id)
 
 
 @celery_app.task(base=IdempotentTask, bind=True)
@@ -136,9 +193,7 @@ def cleanup_old_deliveries_task(self, days: int = 30) -> Dict[str, Any]:
             raise
 
 
-# ============================================================================
 # Helper Functions for Integration
-# ============================================================================
 
 def trigger_email_received_webhook(email_id: str, email_data: Dict[str, Any], user_id: int):
     """
@@ -172,12 +227,52 @@ def trigger_calendar_event_created_webhook(event_id: str, event_data: Dict[str, 
     Returns:
         Celery task result
     """
-    return deliver_webhook_task.delay(
+    # Standard webhook delivery
+    result = deliver_webhook_task.delay(
         event_type=WebhookEventType.CALENDAR_EVENT_CREATED.value,
         event_id=event_id,
         payload=event_data,
         user_id=user_id
     )
+    
+    # Also check for conflicts with Linear deadlines
+    check_calendar_conflicts.delay(
+        event_data=event_data,
+        user_id=user_id
+    )
+    
+    return result
+
+
+@celery_app.task(base=BaseTask, bind=True, name='src.workers.tasks.webhook_tasks.check_calendar_conflicts')
+def check_calendar_conflicts(self, event_data: Dict[str, Any], user_id: int) -> Dict[str, Any]:
+    """
+    Check if a calendar event conflicts with Linear high-priority deadlines.
+    
+    Triggered when a new calendar event is created.
+    Part of Killer Feature #2: Conflict Resolution.
+    """
+    logger.info(f"[ConflictCheck] Checking conflicts for user {user_id}")
+    
+    try:
+        from src.features.detection.conflict_detector import check_calendar_event_for_conflicts
+        from src.utils.config import load_config
+        
+        config = load_config()
+        
+        with get_db_context() as db:
+            result = asyncio.run(
+                check_calendar_event_for_conflicts(event_data, user_id, config, db)
+            )
+        
+        if result.get('status') == 'notified':
+            logger.info(f"[ConflictCheck] Found {result.get('conflicts', 0)} conflict(s) for user {user_id}")
+        
+        return result
+        
+    except Exception as e:
+        logger.error(f"[ConflictCheck] Error: {e}", exc_info=True)
+        return {"status": "error", "error": str(e)}
 
 
 def trigger_task_completed_webhook(task_id: str, task_data: Dict[str, Any], user_id: int):

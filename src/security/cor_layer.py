@@ -79,6 +79,11 @@ class CORLayer:
 
     def sanitize_output(self, response: str, user_id: Optional[int] = None) -> str:
         """Sanitize outgoing agent response for PII."""
+        # 1. Check for massive leaks first
+        if self.data_guard.scan_for_leaks(response):
+             return "[SECURITY_BLOCK] Response blocked due to potential data leakage (massive PII dump detected)."
+
+        # 2. Redact specific PII
         return self.data_guard.sanitize_output(response, user_id)
 
     # =========================================================================

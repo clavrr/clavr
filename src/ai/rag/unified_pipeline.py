@@ -300,8 +300,8 @@ class UnifiedRAGPipeline:
                 fallback = await self.rag_engine.asearch(query, k=k, filters=filters)
                 result.results = fallback
                 result.metadata['fallback'] = True
-            except Exception:
-                pass
+            except Exception as fallback_err:
+                logger.debug(f"Fallback search also failed: {fallback_err}")
         
         result.total_time_ms = (datetime.utcnow() - start_time).total_seconds() * 1000
         

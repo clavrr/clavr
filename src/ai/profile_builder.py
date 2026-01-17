@@ -233,8 +233,8 @@ class ProfileBuilder:
             if date_str:
                 try:
                     dates.append(datetime.fromisoformat(date_str))
-                except:
-                    pass
+                except Exception as e:
+                    logger.debug(f"[ProfileBuilder] Date parse failed for '{date_str}': {e}")
         
         # Extract scheduling preferences
         scheduling_phrases = []

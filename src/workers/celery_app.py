@@ -24,6 +24,7 @@ CRITICAL CONFIGURATION NOTES:
 """
 import os
 from celery import Celery
+from celery.schedules import crontab
 from kombu import Queue, Exchange
 
 from ..utils.logger import setup_logger
@@ -46,9 +47,11 @@ celery_app = Celery(
         'src.workers.tasks.calendar_tasks',
         'src.workers.tasks.indexing_tasks',
         'src.workers.tasks.notification_tasks',
-        'src.workers.tasks.notification_tasks',
         'src.workers.tasks.maintenance_tasks',
         'src.workers.tasks.autonomy_tasks',
+        'src.workers.tasks.consolidation_tasks',
+        'src.workers.tasks.integration_tasks',
+        'src.workers.tasks.ghost_tasks',
     ]
 )
 
@@ -59,6 +62,8 @@ celery_app.conf.update(
         'src.workers.tasks.email_tasks.*': {'queue': 'email'},
         'src.workers.tasks.calendar_tasks.*': {'queue': 'calendar'},
         'src.workers.tasks.indexing_tasks.*': {'queue': 'indexing'},
+        'src.workers.tasks.consolidation_tasks.*': {'queue': 'indexing'},
+        'src.workers.tasks.integration_tasks.*': {'queue': 'indexing'},
         'src.workers.tasks.notification_tasks.*': {'queue': 'notifications'},
     },
     
@@ -110,6 +115,19 @@ celery_app.conf.update(
     # Beat scheduler settings (for periodic tasks)
     # PHASE 3: AUTOMATIC INCREMENTAL EMAIL SYNCING
     beat_schedule={
+        'consolidate-memory-facts-daily': {
+            'task': 'src.workers.tasks.consolidation_tasks.consolidate_all_users_memory',
+            'schedule': 86400.0,  # 24 hours
+            'options': {'queue': 'indexing'}
+        },
+
+        # Global Integration Sync (Slack, Notion, etc.) - every 15 minutes
+        'global-integration-sync-every-15-minutes': {
+            'task': 'src.workers.tasks.integration_tasks.sync_all_integrations',
+            'schedule': 900.0,  # 15 minutes
+            'options': {'queue': 'indexing'}
+        },
+        
         # Incremental email indexing (new emails only) - every 30 minutes
         # Uses optimized parallel fetching for fast updates
         'incremental-email-sync-every-30-minutes': {
@@ -155,6 +173,43 @@ celery_app.conf.update(
         'proactive-think-every-15-minutes': {
             'task': 'src.workers.tasks.autonomy_tasks.proactive_think',
             'schedule': 900.0,  # 15 minutes
+            'options': {'queue': 'default'}
+        },
+
+        # Ghost: Deep Work Shield (Phase 2)
+        'ghost-shield-every-15-minutes': {
+            'task': 'src.workers.tasks.ghost_tasks.run_ghost_checks',
+            'schedule': 900.0,  # 15 minutes
+            'options': {'queue': 'default'}
+        },
+        
+        # Ghost: Email Digest (Daily at 7 AM UTC)
+        'ghost-email-digest-daily': {
+            'task': 'src.workers.tasks.ghost_tasks.send_daily_email_digest',
+            'schedule': crontab(hour=7, minute=0),  # Run at 7:00 AM UTC daily
+            'options': {'queue': 'default'}
+        },
+        
+        # Ghost: Relationship Reconnect (Weekly on Mondays)
+        'ghost-reconnect-weekly': {
+            'task': 'src.workers.tasks.ghost_tasks.send_reconnect_suggestions',
+            'schedule': 604800.0,  # 7 days
+            'options': {'queue': 'default'}
+        },
+        
+        # Deep Work Shield (Killer Feature #1)
+        # Automatically protects users when they have 5+ Linear tickets and free calendar
+        'deep-work-shield-every-30-minutes': {
+            'task': 'src.workers.tasks.ghost_tasks.check_deep_work_shield',
+            'schedule': 1800.0,  # 30 minutes
+            'options': {'queue': 'default'}
+        },
+        
+        # Cycle Planner (Killer Feature #3)
+        # Weekly sprint analysis with GitHub PR status
+        'cycle-planner-weekly': {
+            'task': 'src.workers.tasks.ghost_tasks.run_cycle_planning',
+            'schedule': crontab(hour=10, minute=0, day_of_week=5),  # Friday 10 AM UTC
             'options': {'queue': 'default'}
         },
     },

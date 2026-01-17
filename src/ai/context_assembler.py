@@ -178,7 +178,8 @@ class AssembledContext:
             else:
                 encoding = tiktoken.encoding_for_model(model)
             return len(encoding.encode(self.to_prompt_context()))
-        except:
+        except Exception:
+            # Fallback to character-based approximation if encoding fails
             return len(self.to_prompt_context()) // 4
 
 
@@ -196,7 +197,8 @@ class ContextPruner:
                     self.encoding = tiktoken.get_encoding("cl100k_base")
                 else:
                     self.encoding = tiktoken.encoding_for_model(model)
-            except:
+            except Exception:
+                # Model not recognized, use no encoding (will fallback to char count)
                 pass
 
     def prune(
@@ -325,7 +327,7 @@ class ContextPruner:
         # We prune the rest:
         final_facts = []
         final_graph = []
-        final_cross = {} # TODO
+        final_cross: Dict[str, List[Dict[str, Any]]] = {}
         
         for item in items:
             if current_tokens + item['tokens'] > budget:
@@ -335,12 +337,20 @@ class ContextPruner:
                 final_facts.append(item['data'])
             elif item['type'] == 'graph':
                 final_graph.append(item['data'])
+            elif item['type'] == 'cross_app':
+                # Cross-app items have app_name in data
+                app_name = item['data'].get('source_app', 'unknown')
+                if app_name not in final_cross:
+                    final_cross[app_name] = []
+                final_cross[app_name].append(item['data'])
             
             current_tokens += item['tokens']
             
         context.semantic_facts = final_facts
         if context.graph_context.get('results'):
             context.graph_context['results'] = final_graph
+        if final_cross:
+            context.cross_app_content = final_cross
 
     def _count_tokens(self, text: str) -> int:
         if self.encoding:
@@ -527,7 +537,8 @@ class ContextAssembler:
                 try:
                     enc = tiktoken.get_encoding("cl100k_base")
                     return len(enc.encode(text))
-                except:
+                except Exception:
+                    # Encoding failed, use character approximation
                     pass
             return len(text) // 4
         

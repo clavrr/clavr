@@ -92,16 +92,24 @@ class BaseIndexer(ABC):
     @abstractmethod
     def name(self) -> str:
         """Name of the indexer (e.g. 'slack', 'notion')"""
-        pass
+        raise NotImplementedError("Subclasses must implement the 'name' property")
         
     async def start(self):
         """Start the background indexing loop"""
         if self.is_running:
             return
             
+        # Check if we should use Celery instead of internal loop
+        # We prefer Celery for durability in production
+        import os
+        if os.getenv('USE_CELERY_FOR_INDEXING', 'true').lower() == 'true':
+            logger.info(f"[{self.name}] Indexer durability delegated to Celery for user {self.user_id}")
+            self.is_running = True # Mark as running to indicate it's 'active'
+            return
+
         self.is_running = True
         self._task = asyncio.create_task(self._run_loop())
-        logger.info(f"[{self.name}] Indexer started for user {self.user_id}")
+        logger.info(f"[{self.name}] Internal asyncio loop started for user {self.user_id}")
         
     async def stop(self):
         """Stop the background indexing loop"""

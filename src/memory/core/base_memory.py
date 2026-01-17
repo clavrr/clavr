@@ -50,7 +50,7 @@ except ImportError:
 
 class SimplifiedMemorySystem:
     """
-    Simplified memory system for ClavrAgent learning
+    Simplified memory system for agent learning
     
     Provides basic memory capabilities:
     - Query pattern learning

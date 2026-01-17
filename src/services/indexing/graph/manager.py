@@ -115,11 +115,18 @@ class KnowledgeGraphManager:
         elif self.backend_type == GraphBackend.ARANGODB:
             try:
                 from arango import ArangoClient
-                # ArangoDB connection params
-                arango_uri = getattr(config, 'arango_uri', None) or ARANGO_DEFAULT_URI
-                arango_user = getattr(config, 'arango_user', None) or ARANGO_DEFAULT_USER
-                arango_password = getattr(config, 'arango_password', None) or ARANGO_DEFAULT_PASSWORD
-                arango_db_name = getattr(config, 'arango_db_name', None) or ARANGO_DEFAULT_DB
+                # ArangoDB connection params via new IndexingConfig structure
+                if hasattr(config, 'indexing') and config.indexing:
+                    arango_uri = config.indexing.arango_url
+                    arango_user = config.indexing.arango_user
+                    arango_password = config.indexing.arango_password
+                    arango_db_name = config.indexing.arango_database
+                else:
+                    # Legacy fallback
+                    arango_uri = getattr(config, 'arango_uri', None) or ARANGO_DEFAULT_URI
+                    arango_user = getattr(config, 'arango_user', None) or ARANGO_DEFAULT_USER
+                    arango_password = getattr(config, 'arango_password', None) or ARANGO_DEFAULT_PASSWORD
+                    arango_db_name = getattr(config, 'arango_db_name', None) or ARANGO_DEFAULT_DB
                 
                 self.client = ArangoClient(hosts=arango_uri)
                 # Verify connection and get database
@@ -149,7 +156,7 @@ class KnowledgeGraphManager:
                 # ArangoDB is not available - gracefully fallback to NetworkX
                 logger.warning(
                     f"ArangoDB unavailable ({e}). Falling back to in-memory NetworkX graph. "
-                    f"Start ArangoDB with: docker run -p 8529:8529 -e ARANGO_ROOT_PASSWORD=password arangodb/arangodb:latest"
+                    f"Start ArangoDB with: docker run -p 8529:8529 -e ARANGO_ROOT_PASSWORD=your_password arangodb/arangodb:latest"
                 )
                 # Switch to NetworkX backend
                 self.backend_type = GraphBackend.NETWORKX
@@ -415,6 +422,65 @@ class KnowledgeGraphManager:
         
         elif self.backend_type == GraphBackend.ARANGODB:
             return await self._get_nodes_batch_arangodb(node_ids, node_type)
+
+    
+    async def find_node_by_property(
+        self,
+        node_type: NodeType,
+        property_name: str,
+        property_value: Any
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Find a node by a specific property value within a node type collection.
+        
+        Args:
+            node_type: Type of node to search in
+            property_name: Property name to match
+            property_value: Property value to find
+            
+        Returns:
+            Node properties if found, None otherwise
+        """
+        if self.backend_type == GraphBackend.NETWORKX:
+            for node_id, data in self.graph.nodes(data=True):
+                if (data.get('node_type') == node_type.value and 
+                    data.get(property_name) == property_value):
+                    return {'id': node_id, **data}
+            return None
+        
+        elif self.backend_type == GraphBackend.ARANGODB:
+            return await self._find_node_by_property_arangodb(node_type, property_name, property_value)
+    
+    async def _find_node_by_property_arangodb(
+        self,
+        node_type: NodeType,
+        property_name: str,
+        property_value: Any
+    ) -> Optional[Dict[str, Any]]:
+        """ArangoDB implementation of find_node_by_property."""
+        def _execute():
+            collection_name = node_type.value
+            if not self.db.has_collection(collection_name):
+                return None
+            
+            query = f"""
+            FOR doc IN {collection_name}
+                FILTER doc.@prop_name == @prop_value
+                LIMIT 1
+                RETURN doc
+            """
+            try:
+                cursor = self.db.aql.execute(
+                    query, 
+                    bind_vars={'prop_name': property_name, 'prop_value': property_value}
+                )
+                results = [d for d in cursor]
+                return results[0] if results else None
+            except Exception as e:
+                logger.error(f"Error finding node by property {property_name}={property_value}: {e}")
+                return None
+        
+        return await asyncio.to_thread(_execute)
 
     
     async def query(
@@ -1010,7 +1076,8 @@ class KnowledgeGraphManager:
             try:
                 cursor = self.db.aql.execute(query, bind_vars={'start_id': start_doc['_id'], 'end_id': end_doc['_id']})
                 return [d for d in cursor]
-            except Exception:
+            except Exception as e:
+                logger.debug(f"SHORTEST_PATH AQL failed: {e}")
                 return None
                 
         return await asyncio.to_thread(_execute)

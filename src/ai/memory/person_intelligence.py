@@ -280,8 +280,8 @@ class PersonIntelligenceService:
                         summary += ". Last contact was yesterday."
                     else:
                         summary += f". Last contact was {days_ago} days ago."
-                except:
-                    pass
+                except Exception as e:
+                    logger.debug(f"[PersonIntelligence] Last contact timestamp parse failed: {e}")
             
             return summary
             

@@ -66,11 +66,29 @@ def sync_user_calendar(self, user_id: str) -> Dict[str, Any]:
             end_date=end_date
         )
         
-        logger.info(f"Synced {len(events)} calendar events for user {user_id}")
+        # Trigger webhooks for events (Ghost Piping)
+        from .webhook_tasks import trigger_calendar_event_created_webhook
+        
+        webhook_count = 0
+        for event in events:
+             try:
+                # Trigger for all synced events. 
+                # Ghost listeners must handle idempotency (deduplication)
+                trigger_calendar_event_created_webhook.delay(
+                    event_id=event.get('id'),
+                    event_data=event,
+                    user_id=int(user_id) if str(user_id).isdigit() else user_id
+                )
+                webhook_count += 1
+             except Exception as e:
+                 logger.warning(f"Failed to trigger webhook for event {event.get('id')}: {e}")
+        
+        logger.info(f"Synced {len(events)} calendar events for user {user_id}, triggered {webhook_count} events")
         
         return {
             'user_id': user_id,
             'events_synced': len(events),
+            'events_triggered': webhook_count,
             'sync_time': datetime.utcnow().isoformat(),
             'status': 'success'
         }
@@ -147,6 +165,17 @@ def create_event_with_notification(
                 attendees=attendees,
                 event_summary=summary
             )
+            
+        # Trigger webhook for creation
+        from .webhook_tasks import trigger_calendar_event_created_webhook
+        try:
+             trigger_calendar_event_created_webhook.delay(
+                event_id=event.get('id'),
+                event_data=event,
+                user_id=int(user_id) if str(user_id).isdigit() else user_id
+            )
+        except Exception as e:
+            logger.warning(f"Failed to trigger creation webhook: {e}")
         
         logger.info(f"Created calendar event {event['id']} for user {user_id}")
         

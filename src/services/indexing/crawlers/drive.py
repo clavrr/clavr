@@ -425,7 +425,8 @@ class DriveCrawler(BaseIndexer):
         """Simple fallback decoding"""
         try:
             return content_bytes.decode('utf-8', errors='ignore')
-        except Exception:
+        except Exception as e:
+            logger.debug(f"Fallback text decode failed: {e}")
             return "[Binary Content]"
 
     async def _extract_with_docling(self, data: bytes, filename: str) -> Dict[str, Any]:
@@ -467,5 +468,5 @@ class DriveCrawler(BaseIndexer):
             if temp_path and os.path.exists(temp_path):
                 try:
                     os.unlink(temp_path)
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.debug(f"Failed to cleanup temp file {temp_path}: {e}")

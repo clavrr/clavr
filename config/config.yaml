@@ -40,6 +40,9 @@ ai:
     - Be concise but thorough
     - Ask for clarification when needed
 
+google_maps_api_key: "${GOOGLE_MAPS_API_KEY}"
+linear_api_key: "${LINEAR_API_KEY}"
+
 database:
   # Database URL - supports SQLite and PostgreSQL with pgvector
   # SQLite: sqlite:///./data/emails.db

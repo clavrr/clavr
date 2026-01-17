@@ -171,6 +171,8 @@ class EmailCrawler(BaseIndexer):
                 self._handle_auth_failure(db_session, e)
                 return []
                 
+                return []
+                
             except Exception as e:
                 if "invalid_grant" in str(e).lower():
                     self._handle_auth_failure(db_session, e)
@@ -178,6 +180,68 @@ class EmailCrawler(BaseIndexer):
                     
                 logger.error(f"[EmailCrawler] Error fetching delta: {e}")
                 return []
+
+    async def fetch_recent_sent_messages(self, limit: int = 20) -> List[str]:
+        """
+        Fetch body content of recent SENT messages for style analysis.
+        """
+        if not self.google_client or not self.google_client.is_available():
+            return []
+
+        try:
+            # List messages from 'me'
+            results = self.google_client.service.users().messages().list(
+                userId='me',
+                q="from:me",
+                maxResults=limit
+            ).execute()
+            
+            messages = results.get('messages', [])
+            if not messages:
+                return []
+
+            msg_ids = [m['id'] for m in messages]
+            
+            # Fetch content
+            full_messages = await self._batch_fetch_messages(msg_ids)
+            
+            bodies = []
+            for msg in full_messages:
+                # Use parser helper to get plain text body
+                # We reuse internal logic or parser logic. 
+                # EmailParser._extract_body is internal, let's just use what we have.
+                # Actually, relying on EmailParser is cleaner but it returns a Node.
+                # Let's simple extract snippet or body here to avoid overhead.
+                snippet = msg.get('snippet', '')
+                # Try to get full body if snippet is too short
+                if len(snippet) < 50:
+                    payload = msg.get('payload', {})
+                    parts = [payload]
+                    if 'parts' in payload:
+                        parts.extend(payload['parts'])
+                    
+                    text = ""
+                    import base64
+                    for part in parts:
+                        if part.get('mimeType') == 'text/plain':
+                            data = part.get('body', {}).get('data', '')
+                            if data:
+                                try:
+                                    text += base64.urlsafe_b64decode(data).decode('utf-8')
+                                except Exception as e:
+                                    logger.debug(f"[EmailCrawler] Base64 decode failed: {e}")
+                    if text:
+                        bodies.append(text)
+                    else:
+                        bodies.append(snippet)
+                else:
+                    bodies.append(snippet)
+
+            return bodies
+
+        except Exception as e:
+            logger.warning(f"[EmailCrawler] Failed to fetch sent messages: {e}")
+            return []
 
     def _handle_auth_failure(self, session, error: Exception):
         """Handle authentication failure by creating a user alert."""
@@ -423,7 +487,8 @@ class EmailCrawler(BaseIndexer):
                             if item.due_date:
                                 try:
                                     due_dt = datetime.fromisoformat(item.due_date)
-                                except: pass
+                                except Exception as e:
+                                    logger.debug(f"[EmailCrawler] Failed to parse due_date '{item.due_date}': {e}")
                             
                             # Default to 2 days out if no date (general task)
                             if not due_dt:

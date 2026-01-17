@@ -93,10 +93,9 @@ class DataGuard:
             # Check for high density of email addresses (e.g. contact dump)
             emails = re.findall(self.PATTERNS['EMAIL'], text)
             if len(emails) > 10:
-                pass 
-                # Decision: Do we block? 
-                # For now, just logging warning, not blocking, to avoid breaking valid use cases like "List my contacts"
-                logger.warning(f"Possible data dump detected: {len(emails)} emails in output.")
+                # BLOCK massive data dumps
+                logger.error(f"SECURITY BLOCK: Possible data dump detected. Found {len(emails)} emails in output.")
+                SecurityAudit.log_leak_prevention("massive_data_dump", len(emails), None)
                 return True
                 
         return False

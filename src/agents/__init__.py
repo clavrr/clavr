@@ -12,10 +12,10 @@ Key Components:
 - Capabilities: NLP, Pattern Recognition, Predictive Execution, Personalization
 
 Example Usage:
-    from src.agents import ClavrAgent
+    from src.agents import SupervisorAgent
     from src.tools import EmailTool, CalendarTool, TaskTool
     
-    agent = ClavrAgent(
+    agent = SupervisorAgent(
         tools=[EmailTool(), CalendarTool(), TaskTool()],
         config=config
     )

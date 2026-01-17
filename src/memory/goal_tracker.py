@@ -32,6 +32,7 @@ class GoalStatus(str, Enum):
     COMPLETED = "completed"
     ABANDONED = "abandoned"
     PAUSED = "paused"
+    ARCHIVED = "archived"
 
 
 class GoalPriority(str, Enum):
@@ -278,10 +279,91 @@ class GoalTracker:
                     entities=entities or []
                 )
         
-        # TODO: Use LLM for advanced detection if available
-        # if self.llm:
-        #     return await self._llm_detect_goal(message, entities)
+        # Use LLM for advanced detection if available
+        if self.llm:
+            try:
+                return await self._llm_detect_goal(message, entities)
+            except Exception as e:
+                logger.debug(f"[GoalTracker] LLM goal detection failed: {e}")
         
+        return None
+
+    async def _llm_detect_goal(
+        self, 
+        message: str, 
+        entities: Optional[List[str]] = None
+    ) -> Optional[DetectedGoal]:
+        """
+        Use LLM for advanced goal detection from natural language.
+        """
+        if not self.llm:
+            return None
+            
+        prompt = f"""Analyze this user message and determine if it expresses a goal, project, or long-term objective.
+        
+User Message: "{message}"
+Pre-extracted Entities: {entities or "None"}
+
+If it IS a goal, respond in this format:
+GOAL: [Concise description of the goal]
+PRIORITY: [critical/high/medium/low]
+DUE_DATE: [ISO date if mentioned, else "None"]
+CONFIDENCE: [Score from 0.0 to 1.0]
+
+If it is NOT a goal, respond with: NOT_A_GOAL"""
+
+        try:
+            # Handle different possible LLM client interfaces
+            if hasattr(self.llm, 'agenerate'):
+                response = await self.llm.agenerate([prompt])
+                text = response.generations[0][0].text.strip()
+            elif hasattr(self.llm, 'predict'):
+                text = await self.llm.predict(prompt)
+            else:
+                # Fallback to standard call if it's a simple wrapper
+                text = str(await self.llm(prompt)).strip()
+            
+            if "NOT_A_GOAL" in text:
+                return None
+            
+            # Parse response
+            description = ""
+            priority = GoalPriority.MEDIUM
+            due_date = None
+            confidence = 0.7
+            
+            lines = text.split('\n')
+            for line in lines:
+                line = line.strip()
+                if line.startswith("GOAL:"):
+                    description = line.replace("GOAL:", "").strip()
+                elif line.startswith("PRIORITY:"):
+                    p_val = line.replace("PRIORITY:", "").strip().lower()
+                    try:
+                        priority = GoalPriority(p_val)
+                    except ValueError:
+                        pass
+                elif line.startswith("DUE_DATE:"):
+                    d_val = line.replace("DUE_DATE:", "").strip()
+                    if d_val != "None":
+                        due_date = self._parse_due_date(d_val)
+                elif line.startswith("CONFIDENCE:"):
+                    try:
+                        confidence = float(line.replace("CONFIDENCE:", "").strip())
+                    except ValueError:
+                        pass
+            
+            if description and confidence > 0.6:
+                return DetectedGoal(
+                    description=description,
+                    confidence=confidence,
+                    priority=priority,
+                    due_date=due_date,
+                    entities=entities or []
+                )
+        except Exception as e:
+            logger.debug(f"[GoalTracker] LLM inference failed: {e}")
+            
         return None
     
     def _parse_due_date(self, date_str: str) -> Optional[datetime]:
@@ -471,11 +553,7 @@ class GoalTracker:
         
         return goal
     
-    async def complete_goal(
-        self, 
-        goal_id: str, 
-        user_id: int
-    ) -> Optional[Goal]:
+    async def complete_goal(self, goal_id: str, user_id: int) -> Optional[Goal]:
         """Mark a goal as completed."""
         if user_id not in self._goals or goal_id not in self._goals[user_id]:
             return None
@@ -486,6 +564,19 @@ class GoalTracker:
         goal.progress_percentage = 100.0
         
         logger.info(f"[GoalTracker] Goal completed for user {user_id}: {goal.description[:30]}...")
+        
+        return goal
+    
+    async def archive_goal(self, goal_id: str, user_id: int) -> Optional[Goal]:
+        """Move a goal to archive status."""
+        if user_id not in self._goals or goal_id not in self._goals[user_id]:
+            return None
+            
+        goal = self._goals[user_id][goal_id]
+        goal.status = GoalStatus.ARCHIVED
+        goal.updated_at = datetime.utcnow()
+        
+        logger.info(f"[GoalTracker] Goal archived for user {user_id}: {goal.description[:30]}...")
         
         return goal
     

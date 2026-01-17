@@ -47,11 +47,104 @@ class MapsAgent(BaseAgent):
             return await self._handle_distance(query)
         elif any(w in query_lower for w in ["directions", "how to get", "route", "navigate"]):
             return await self._handle_directions(query)
+        elif any(w in query_lower for w in ["near", "nearby", "closest", "around", "places", "shops", "restaurants", "search"]):
+            # Specific check for simple "where is X" that might be a geocode vs search
+            if "where is" in query_lower and "near" not in query_lower:
+                return await self._handle_geocode(query)
+            return await self._handle_search(query)
         elif any(w in query_lower for w in ["where is", "location of", "find", "coordinates"]):
             return await self._handle_geocode(query)
         else:
             # Default to geocoding for general location queries
             return await self._handle_geocode(query)
+
+    async def _handle_search(self, query: str) -> str:
+        """Handle place search queries (e.g. 'coffee near office')."""
+        try:
+            # Resolve location aliases (e.g., 'office' -> actual address) via Semantic Memory
+            resolved_query = await self._resolve_location_aliases(query)
+            
+            maps_service = self._get_maps_service()
+            places = await maps_service.search_nearby_places_async(resolved_query)
+            
+            if not places:
+                return f"I couldn't find any places matching '{query}'."
+            
+            summary = f"📍 **Found {len(places)} places for '{query}':**\n\n"
+            for i, p in enumerate(places, 1):
+                rating_str = f" ({p['rating']}★)" if p.get('rating') else ""
+                summary += f"{i}. **{p['name']}**{rating_str}\n   {p['address']}\n"
+                
+            return summary
+
+        except Exception as e:
+            logger.error(f"[{self.name}] Search failed: {e}")
+            return f"I encountered an error searching for places: {str(e)}"
+    
+    async def _resolve_location_aliases(self, query: str) -> str:
+        """
+        Resolve location aliases like 'office', 'home', 'gym' to actual addresses
+        using Semantic Memory facts.
+        
+        Args:
+            query: Original query containing potential aliases
+            
+        Returns:
+            Query with aliases replaced by actual addresses
+        """
+        # Common location aliases to check 
+        LOCATION_ALIASES = ['office', 'home', 'work', 'gym', 'school', 'apartment']
+        
+        query_lower = query.lower()
+        
+        # Check if query contains any aliases
+        found_aliases = [alias for alias in LOCATION_ALIASES if alias in query_lower]
+        if not found_aliases:
+            return query
+        
+        # Try to resolve via Semantic Memory
+        try:
+            from ...ai.memory.semantic_memory import SemanticMemory
+            from ...utils.config import load_config
+            
+            config = load_config()
+            semantic_memory = SemanticMemory(config)
+            
+            # Get user_id from domain_context if available
+            user_id = getattr(self.domain_context, 'user_id', None) if self.domain_context else None
+            if not user_id:
+                return query
+            
+            # Search for location facts
+            for alias in found_aliases:
+                facts = await semantic_memory.search_facts(
+                    query=f"{alias} address location",
+                    user_id=user_id,
+                    limit=3
+                )
+                
+                if facts:
+                    for fact in facts:
+                        content = fact.get('content', '').lower()
+                        # Look for patterns like "office is at 123 Main St" or "home address: 123 Main St"
+                        if alias in content and any(word in content for word in ['at', 'is', 'address', 'located']):
+                            # Extract the address portion (simple heuristic)
+                            # More sophisticated extraction could use LLM or regex
+                            for separator in ['is at', 'address is', 'located at', 'is:', ':', 'is ']:
+                                if separator in content:
+                                    parts = content.split(separator, 1)
+                                    if len(parts) > 1:
+                                        address = parts[1].strip().rstrip('.').strip()
+                                        if len(address) > 5:  # Sanity check
+                                            logger.info(f"[MapsAgent] Resolved '{alias}' to '{address}'")
+                                            query = query.replace(alias, address)
+                                            break
+                            break
+                            
+        except Exception as e:
+            logger.debug(f"[MapsAgent] Semantic memory lookup failed: {e}")
+        
+        return query
     
     async def _handle_distance(self, query: str) -> str:
         """Handle distance queries between two locations."""

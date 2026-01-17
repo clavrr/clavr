@@ -312,4 +312,5 @@ class ElevenLabsLiveClient(BaseVoiceClient):
                 }
                 async with self._ws_lock:
                     await ws.send(json.dumps(error_payload))
-            except: pass
+            except Exception as send_err:
+                logger.debug(f"[ELEVENLABS] Failed to send error payload: {send_err}")

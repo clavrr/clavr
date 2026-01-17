@@ -60,9 +60,14 @@ class GraphObserverService:
         self.graph = graph_manager
         self.is_running = False
         self._stop_event = asyncio.Event()
-        self.llm = None
         self.last_run_time = datetime.utcnow() - timedelta(hours=24) # Start looking at last 24h
         self._notify_callback = None
+        self.cross_stack_context = None # Will be set by Indexer
+        self.llm = None
+        
+    def set_cross_stack_context(self, context_service):
+        """Link the cross-stack context service for proactive sync triggers."""
+        self.cross_stack_context = context_service
         
     def set_notification_callback(self, callback):
         """Register a callback to push alerts to the client."""
@@ -123,7 +128,10 @@ class GraphObserverService:
         
         logger.info(f"[GraphObserver] Fetching changes since {start_time_iso}")
         
-        # Native AQL Query for recent changes
+        # Native AQL Query for recent changes (filtered by user context)
+        # Note: In a production multi-user system, we should iterate over active users
+        # or structure the query to process all users but attribute correctly.
+        # For now, we fetch recent changes and will group them by user_id.
         query = """
         FOR n IN UNION(
             (FOR x IN Message RETURN x),
@@ -134,11 +142,12 @@ class GraphObserverService:
         )
             FILTER n.created_at != null
             SORT n.created_at DESC
-            LIMIT 20
+            LIMIT 50
             RETURN {
                 id: n.id,
                 type: [PARSE_IDENTIFIER(n._id).collection],
-                props: n
+                props: n,
+                user_id: n.user_id
             }
         """
 
@@ -198,7 +207,8 @@ class GraphObserverService:
                     "confidence": float(insight['confidence']),
                     "actionable": insight.get('actionable', False),
                     "created_at": datetime.utcnow().isoformat(),
-                    "source": "GraphObserver"
+                    "source": "GraphObserver",
+                    "user_id": record.get('user_id') # Propagate user_id from source
                 }
                 
                 insight_id = await self.graph.create_node(NodeType.INSIGHT, props)
@@ -221,6 +231,10 @@ class GraphObserverService:
                          logger.warning(f"Could not link insight to node {rel_id}: {e}")
                          
                 count += 1
+            
+            # 3. Proactive Semantic Sync (Autonomous Glue Trigger)
+            if self.cross_stack_context:
+                await self._trigger_proactive_semantic_sync(results)
                 
             if count > 0:
                 logger.info(f"[GraphObserver] Generated {count} new insights")
@@ -511,6 +525,8 @@ class GraphObserverService:
             # LEAD nodes created > 3 days ago with no FOLLOWS relationship in the last 7 days
             stale_leads_query = """
             FOR l IN Lead
+                // Filter by recent changes if we had a user_id context, 
+                // but watchdog often runs globally. We MUST ensure it returns user_id.
                 FILTER l.created_at < DATE_SUBTRACT(DATE_NOW(), 3, "days")
                 
                 // Check for recent interactions (RELATED_TO from Email)
@@ -525,17 +541,17 @@ class GraphObserverService:
                 )
                 
                 FILTER recent_interactions == 0
-                LIMIT 10
+                LIMIT 20
                 RETURN {
                     id: l.id,
                     name: l.name,
                     level: l.interest_level,
-                    topic: l.topic
+                    topic: l.topic,
+                    user_id: l.user_id
                 }
             """
             
-            # Assuming ArangoDB specific syntax might differ, let's use a simpler one if needed.
-            # For now, let's use the graph manager's abstraction if it exists.
+            # Execute AQL query directly against ArangoDB
             
             leads = await self.graph.execute_query(stale_leads_query)
             for lead in leads or []:
@@ -696,7 +712,7 @@ class GraphObserverService:
                     "draft_body": insight.get('draft_body'),
                     "created_at": datetime.utcnow().isoformat(),
                     "source": "GraphObserver_Watchdog",
-                    "user_id": user_id
+                    "user_id": user_id or insight.get('user_id')
                 })
                         
             logger.info(f"[GraphObserver] Enhanced observation complete: {stats}")
@@ -705,4 +721,55 @@ class GraphObserverService:
         except Exception as e:
             logger.error(f"[GraphObserver] Enhanced observation failed: {e}")
             return stats
+
+    async def _trigger_proactive_semantic_sync(self, recent_nodes: List[Dict[str, Any]]):
+        """
+        Detect mentioned projects/IDs in recent activity and trigger a 360-degree summary.
+        This provides the "Semantic Sync" proactively.
+        """
+        from src.ai.capabilities.nlp_processor import NLPProcessor
+        processor = NLPProcessor()
+        
+        detected_topics = [] # List of tuples (topic, user_id)
+        
+        for node in recent_nodes:
+            props = node.get('props', {})
+            content = (props.get('subject') or props.get('text') or props.get('title') or "")
+            if not content: continue
+            
+            node_user_id = props.get('user_id') or node.get('user_id')
+            if not node_user_id: continue
+            
+            # Extract topics using NLP patterns (Linear IDs, Projects)
+            nlp_res = processor.process_query(content)
+            for entity in nlp_res.get('entities', []):
+                if entity.entity_type in ['linear_id', 'project_name']:
+                    detected_topics.append((entity.resolved_value, node_user_id))
+        
+        # Trigger sync for each new topic detected
+        processed_pairs = set()
+        for topic, u_id in detected_topics:
+            if (topic, u_id) in processed_pairs: continue
+            processed_pairs.add((topic, u_id))
+            
+            try:
+                logger.info(f"[GraphObserver] Proactive Semantic Sync triggered for {topic} (User {u_id})")
+                # Build the rich 360-degree context
+                context = await self.cross_stack_context.build_topic_context(topic, u_id)
+                
+                # Save as a premium INSIGHT node
+                summary = context.get('summary', 'Synthesis failed.')
+                await self.graph.create_node(NodeType.INSIGHT, {
+                    "content": f"360° Perspective on '{topic}': {summary}",
+                    "type": "semantic_sync",
+                    "subtype": "autonomous_glue",
+                    "topic": topic,
+                    "confidence": 0.95,
+                    "actionable": len(context.get('action_items', [])) > 0,
+                    "created_at": datetime.utcnow().isoformat(),
+                    "source": "AutonomousGlue_Proactive",
+                    "user_id": u_id
+                })
+            except Exception as e:
+                logger.warning(f"Failed to trigger proactive sync for {topic}: {e}")
 

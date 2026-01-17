@@ -20,7 +20,8 @@ Clavr understands natural language queries and executes actions across your prod
 - **Calendar Management**: Schedule meetings, check availability, detect conflicts, manage events
 - **Task Management**: Create, track, complete tasks with email and calendar integration
 - **Notion Integration**: Search knowledge base, create pages, update databases autonomously
-- **Slack Integration**: Execute actions from Slack conversations with contact resolution
+- **Slack & Ghost Integration**: Proactive issue drafting (Ghost Collaborator) from Slack conversations
+- **Proactive Intelligence**: Situational awareness, morning briefings, and 360° cross-stack topic synthesis
 
 ### Autonomous Workflows
 
@@ -183,6 +184,7 @@ See [docs/IMPORT_GUIDELINES.md](docs/IMPORT_GUIDELINES.md) for detailed guidelin
 
 ### Technical Documentation
 - [API Reference](docs/API.md) - Complete API documentation
+- [Voice API](docs/VOICE_API_ENDPOINTS.md) - Real-time Voice interface (Gemini Live)
 - [Architecture](docs/engineering_docs/END_TO_END_QUERY_FLOW.md) - System architecture and design
 - [RAG Architecture](docs/engineering_docs/RAG_ARCHITECTURE.md) - Retrieval-Augmented Generation system
 - [Parser Architecture](docs/engineering_docs/PARSER_ARCHITECTURE.md) - Query parsing system

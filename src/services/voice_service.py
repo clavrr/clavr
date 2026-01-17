@@ -331,12 +331,21 @@ class VoiceService:
                                 "chunk": clean_chunk,
                                 "done": False
                             })
+                    elif response.get("type") == "user_transcript":
+                        user_transcript = response.get("text")
+                        if user_transcript:
+                            await self._save_to_memory(user.id, session_id, user_transcript, role='user')
+                            await websocket.send_json({"type": "user_transcript", "text": user_transcript})
                     elif response.get("type") == "turn_complete":
                         if assistant_response_buffer.strip():
-                            await self._save_to_memory(user.id, session_id, assistant_response_buffer.strip())
+                            await self._save_to_memory(user.id, session_id, assistant_response_buffer.strip(), role='assistant')
                             assistant_response_buffer = ""
                         await websocket.send_json({"type": "turn_complete"})
                     elif response.get("type") == "interrupted":
+                        if assistant_response_buffer.strip():
+                            # Save partial response before clearing
+                            await self._save_to_memory(user.id, session_id, assistant_response_buffer.strip() + "... [interrupted]", role='assistant')
+                            assistant_response_buffer = ""
                         await websocket.send_json({"type": "interrupted"})
                     elif response.get("type") == "error":
                         error_msg = response.get("message", "Unknown error")
@@ -364,8 +373,8 @@ class VoiceService:
                     return
                 # Continue loop
 
-    async def _save_to_memory(self, user_id: int, session_id: str, content: str):
-        """Save assistant response to conversation memory."""
+    async def _save_to_memory(self, user_id: int, session_id: str, content: str, role: str = 'assistant'):
+        """Save a message to conversation memory."""
         try:
             from src.database import get_async_db_context
             async with get_async_db_context() as fresh_db:
@@ -373,10 +382,10 @@ class VoiceService:
                 await memory.add_message(
                     user_id=user_id,
                     session_id=session_id,
-                    role='assistant',
+                    role=role,
                     content=content,
                     intent='voice_interaction'
                 )
-            logger.info(f"Saved voice response for user {user_id}")
+            logger.info(f"Saved voice {role} message for user {user_id}")
         except Exception as e:
             logger.error(f"Failed to save voice response to memory: {e}")

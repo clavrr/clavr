@@ -92,8 +92,8 @@ class SlackEventHandler:
                 thread_ts = event.get('ts')
                 error_msg = "Sorry, I encountered an error processing your request. Please try again."
                 self.slack_client.post_message(channel_id, error_msg, thread_ts=thread_ts)
-            except:
-                pass
+            except Exception as notify_err:
+                logger.debug(f"[SLACK] Failed to send error message to channel: {notify_err}")
     
     async def _process_query_async(
         self,

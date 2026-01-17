@@ -48,20 +48,72 @@ class MapsCrawler(BaseIndexer):
         """
         Geocode an address string to a Location node.
         
+        Uses Google Maps Geocoding API if configured, falls back to mock data.
+        
         Args:
             address_query: "123 Main St, San Francisco"
             
         Returns:
             Location node properties or None
         """
-        # Placeholder for Geocoding API call
-        # Mocking for now to avoid external dependencies in this MVP
         if not address_query:
             return None
             
         logger.info(f"[{self.name}] Resolving location: {address_query}")
         
-        # Mock result
+        # Try Google Maps Geocoding API if available
+        api_key = self.config.google_maps_api_key if hasattr(self.config, 'google_maps_api_key') else None
+        
+        if api_key:
+            try:
+                import httpx
+                
+                url = "https://maps.googleapis.com/maps/api/geocode/json"
+                params = {
+                    "address": address_query,
+                    "key": api_key
+                }
+                
+                async with httpx.AsyncClient(timeout=10.0) as client:
+                    response = await client.get(url, params=params)
+                    data = response.json()
+                
+                if data.get("status") == "OK" and data.get("results"):
+                    result = data["results"][0]
+                    geometry = result.get("geometry", {}).get("location", {})
+                    
+                    # Parse address components
+                    components = {}
+                    for component in result.get("address_components", []):
+                        types = component.get("types", [])
+                        if "locality" in types:
+                            components["city"] = component.get("long_name")
+                        elif "administrative_area_level_1" in types:
+                            components["state"] = component.get("short_name")
+                        elif "country" in types:
+                            components["country"] = component.get("long_name")
+                    
+                    return {
+                        "address": result.get("formatted_address", address_query),
+                        "city": components.get("city", "Unknown"),
+                        "state": components.get("state"),
+                        "country": components.get("country", "Unknown"),
+                        "coordinates": {
+                            "lat": geometry.get("lat", 0.0),
+                            "lng": geometry.get("lng", 0.0)
+                        },
+                        "name": result.get("formatted_address", address_query),
+                        "place_id": result.get("place_id")
+                    }
+                else:
+                    logger.warning(f"[{self.name}] Geocoding API returned: {data.get('status')}")
+                    
+            except ImportError:
+                logger.debug("[{self.name}] httpx not available, using mock geocoding")
+            except Exception as e:
+                logger.warning(f"[{self.name}] Geocoding API failed: {e}")
+        
+        # Fallback: Mock result for development/testing
         return {
             "address": address_query,
             "city": "Unknown City",

@@ -110,6 +110,46 @@ class GapAnalysisAgent(ReasoningAgent):
         """
         Verify a specific gap/hypothesis.
         For gaps, 'verification' effectively means checking if the gap still exists.
+        
+        Args:
+            hypothesis_id: The event ID or insight ID to verify
+            
+        Returns:
+            True if the gap still exists (unresolved), False if resolved
         """
-        # Placeholder implementation
-        return True
+        try:
+            # Check if the event still has no related documents
+            two_days_ago = (datetime.utcnow() - timedelta(days=2)).isoformat()
+            
+            query = """
+            FOR e IN CalendarEvent
+                FILTER e.id == @event_id
+                
+                LET recent_docs = (
+                    FOR edge IN RELATED_TO
+                        FILTER edge._from == e._id OR edge._to == e._id
+                        LET doc = edge._from == e._id ? DOCUMENT(edge._to) : DOCUMENT(edge._from)
+                        FILTER (doc.node_type == 'Document' OR doc.node_type == 'Email')
+                           AND doc.timestamp > @two_days_ago
+                        RETURN doc
+                )
+                
+                RETURN { has_docs: LENGTH(recent_docs) > 0 }
+            """
+            
+            result = await self.graph.query(query, {
+                "event_id": hypothesis_id,
+                "two_days_ago": two_days_ago
+            })
+            
+            if result and len(result) > 0:
+                # If has_docs is True, gap is resolved
+                return not result[0].get('has_docs', False)
+            
+            # If event not found, consider gap resolved
+            return False
+            
+        except Exception as e:
+            logger.warning(f"[{self.name}] Verification failed for {hypothesis_id}: {e}")
+            # On error, assume gap still exists
+            return True

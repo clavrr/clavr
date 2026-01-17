@@ -21,6 +21,7 @@ import time
 
 from src.utils.logger import setup_logger
 from src.utils.config import Config
+from src.ai.capabilities.nlp_processor import NLPProcessor
 
 logger = setup_logger(__name__)
 
@@ -52,6 +53,11 @@ class AssembledContext:
     
     # Proactive insights
     proactive_insights: List[Dict[str, Any]] = field(default_factory=list)
+    
+    # New Context Layers
+    protection_level: str = "normal"
+    linear_context: Dict[str, Any] = field(default_factory=dict)
+    cross_stack_summary: str = ""
     
     # Metadata
     retrieval_time_ms: float = 0.0
@@ -149,7 +155,28 @@ class AssembledContext:
                 people_lines.append(f"- {label}: {context[:50]}" if context else f"- {label}")
             sections.append("\n".join(people_lines))
         
-        # 8. Cross-session context
+        # 8. Protection Status (Deep Work)
+        if self.protection_level and self.protection_level != "normal":
+            protection_lines = ["PROTECTION STATUS:"]
+            status_text = {
+                "meeting_heavy": "In back-to-back meetings. Use brevity.",
+                "deep_work": "Currently in DEEP WORK mode. Do not interrupt unless urgent."
+            }.get(self.protection_level, self.protection_level)
+            protection_lines.append(f"● {status_text}")
+            sections.append("\n".join(protection_lines))
+
+        # 9. Linear Context
+        if self.linear_context and self.linear_context.get("issues"):
+            linear_lines = ["LINEAR WORKSPACE:"]
+            for issue in self.linear_context.get("issues", [])[:3]:
+                linear_lines.append(f"- [{issue.get('id')}] {issue.get('title')} ({issue.get('state')})")
+            sections.append("\n".join(linear_lines))
+
+        # 10. Cross-Stack Summary (Autonomous Glue)
+        if self.cross_stack_summary:
+            sections.append(f"CROSS-STACK SUMMARY:\n{self.cross_stack_summary}")
+
+        # 11. Cross-session context
         if self.cross_session_context:
             cross_lines = ["FROM PREVIOUS SESSIONS:"]
             for item in self.cross_session_context[:2]:
@@ -180,6 +207,9 @@ class AssembledContext:
             "related_events": self.related_events,
             "cross_session_context": self.cross_session_context,
             "proactive_insights": self.proactive_insights,
+            "protection_level": self.protection_level,
+            "linear_context": self.linear_context,
+            "cross_stack_summary": self.cross_stack_summary,
             "retrieval_time_ms": self.retrieval_time_ms,
             "sources_queried": self.sources_queried,
             "confidence": self.confidence
@@ -210,7 +240,11 @@ class MemoryOrchestrator:
         conversation_memory: Optional[Any] = None,
         working_memory_manager: Optional[Any] = None,
         salience_scorer: Optional[Any] = None,
-        goal_tracker: Optional[Any] = None
+        goal_tracker: Optional[Any] = None,
+        deep_work_logic: Optional[Any] = None,
+        cross_stack_context: Optional[Any] = None,
+        linear_service: Optional[Any] = None,
+        nlp_processor: Optional[NLPProcessor] = None
     ):
         """
         Initialize the Memory Orchestrator.
@@ -250,6 +284,12 @@ class MemoryOrchestrator:
             if goal_tracker is None:
                 goal_tracker = init_goal_tracker()
         self.goal_tracker = goal_tracker
+        
+        # New features
+        self.deep_work_logic = deep_work_logic
+        self.cross_stack_context = cross_stack_context
+        self.linear_service = linear_service
+        self.nlp_processor = nlp_processor or NLPProcessor()
         
         # Caches for performance
         self._graph_rag_service = None
@@ -302,7 +342,10 @@ class MemoryOrchestrator:
         
         # Default to all layers
         if include_layers is None:
-            include_layers = ["working", "semantic", "graph", "conversation", "insights"]
+            include_layers = [
+                "working", "semantic", "graph", "conversation", 
+                "insights", "protection", "linear", "cross_stack"
+            ]
         
         context = AssembledContext()
         tasks = []
@@ -358,31 +401,63 @@ class MemoryOrchestrator:
             tasks.append(self._retrieve_proactive_insights(user_id, query, context.active_entities))
         
         # Execute all async retrievals in parallel
-        if tasks:
+        retrieval_tasks = {}
+        if "semantic" in include_layers and self.semantic_memory:
+            retrieval_tasks["semantic"] = self._retrieve_semantic_context(user_id, query)
+        
+        if "graph" in include_layers and self.graph_manager:
+            retrieval_tasks["graph"] = self._retrieve_graph_context(user_id, query, task_type)
+        
+        if "conversation" in include_layers and self.conversation_memory:
+            retrieval_tasks["conversation"] = self._retrieve_conversation_context(user_id, query, session_id)
+        
+        if "insights" in include_layers:
+            retrieval_tasks["insights"] = self._retrieve_proactive_insights(user_id, query, context.active_entities)
+            
+        if "protection" in include_layers:
+            retrieval_tasks["protection"] = self._retrieve_protection_status(user_id)
+            
+        if "linear" in include_layers:
+            retrieval_tasks["linear"] = self._retrieve_linear_context(user_id, query)
+            
+        if "cross_stack" in include_layers:
+            retrieval_tasks["cross_stack"] = self._retrieve_cross_stack_context(user_id, query)
+            
+        if retrieval_tasks:
             try:
-                results = await asyncio.gather(*tasks, return_exceptions=True)
+                task_names = list(retrieval_tasks.keys())
+                task_coros = list(retrieval_tasks.values())
+                results = await asyncio.gather(*task_coros, return_exceptions=True)
                 
-                # Process results
-                for i, result in enumerate(results):
+                # Process results with keyed mapping
+                for name, result in zip(task_names, results):
                     if isinstance(result, Exception):
-                        logger.warning(f"[MemoryOrchestrator] Retrieval task {i} failed: {result}")
+                        logger.warning(f"[MemoryOrchestrator] {name} retrieval failed: {result}")
                         continue
                     
                     if result is None:
                         continue
                         
-                    # Merge results based on type
-                    if "semantic" in include_layers and i == 0:
+                    if name == "semantic":
                         self._merge_semantic_results(context, result)
-                    elif "graph" in include_layers:
-                        if "semantic" in include_layers and i == 1:
-                            self._merge_graph_results(context, result)
-                        elif "semantic" not in include_layers and i == 0:
-                            self._merge_graph_results(context, result)
-                        # Handle conversation and insights similarly
+                    elif name == "graph":
+                        self._merge_graph_results(context, result)
+                    elif name == "conversation":
+                        self._merge_conversation_results(context, result)
+                    elif name == "insights":
+                        self._merge_insight_results(context, result)
+                    elif name == "protection":
+                        context.protection_level = result
+                        context.sources_queried.append("deep_work_shield")
+                    elif name == "linear":
+                        context.linear_context = result
+                        context.sources_queried.append("linear")
+                    elif name == "cross_stack":
+                        context.cross_stack_summary = result.get("summary", "") if isinstance(result, dict) else ""
+                        context.sources_queried.append("autonomous_glue")
                             
             except Exception as e:
-                logger.error(f"[MemoryOrchestrator] Parallel retrieval failed: {e}")
+                logger.error(f"[MemoryOrchestrator] Context assembly failed: {e}", exc_info=True)
         
         # Calculate retrieval time
         context.retrieval_time_ms = (time.time() - start_time) * 1000
@@ -521,6 +596,62 @@ class MemoryOrchestrator:
         except Exception as e:
             logger.debug(f"[MemoryOrchestrator] Insight retrieval failed: {e}")
             return None
+
+    async def _retrieve_protection_status(self, user_id: int) -> str:
+        """Fetch current protection (Deep Work) status for the user."""
+        if not self.deep_work_logic:
+            return "normal"
+        
+        try:
+            # In a real impl, this would query the DB for the current user's protection state
+            # or analyze the calendar on the fly.
+            # For now, let's assume it has access to a service that provides this.
+            if hasattr(self.deep_work_logic, "get_current_status"):
+                return await self.deep_work_logic.get_current_status(user_id)
+            return "normal"
+        except Exception as e:
+            logger.debug(f"[MemoryOrchestrator] Protection status retrieval failed: {e}")
+            return "normal"
+
+    async def _retrieve_linear_context(self, user_id: int, query: str) -> Dict[str, Any]:
+        """Retrieve relevant Linear context."""
+        if not self.linear_service:
+            return {}
+        
+        try:
+            # Search for issues relevant to the current query
+            issues = await self.linear_service.search(query, limit=3)
+            return {"issues": issues}
+        except Exception as e:
+            logger.debug(f"[MemoryOrchestrator] Linear context retrieval failed: {e}")
+            return {}
+
+    async def _retrieve_cross_stack_context(self, user_id: int, query: str) -> Dict[str, Any]:
+        """Retrieve synthesized cross-stack context."""
+        if not self.cross_stack_context:
+            return {}
+        
+        try:
+            # 1. Extract the core topic/ID if possible for cleaner search
+            topic = query
+            if self.nlp_processor:
+                nlp_results = self.nlp_processor.process_query(query)
+                entities = nlp_results.get("entities", [])
+                
+                # Prioritize Linear IDs then Project Names
+                linear_ids = [e.resolved_value for e in entities if e.entity_type == "linear_id"]
+                project_names = [e.resolved_value for e in entities if e.entity_type == "project_name"]
+                
+                if linear_ids:
+                    topic = linear_ids[0]
+                elif project_names:
+                    topic = project_names[0]
+            
+            # 2. Use the "Autonomous Glue" to build context for the specific topic
+            return await self.cross_stack_context.build_topic_context(topic, user_id)
+        except Exception as e:
+            logger.debug(f"[MemoryOrchestrator] Cross-stack context retrieval failed: {e}")
+            return {}
     
     def _merge_semantic_results(self, context: AssembledContext, results: Dict[str, Any]):
         """Merge semantic memory results into context."""
@@ -577,6 +708,102 @@ class MemoryOrchestrator:
         
         context.sources_queried.append("knowledge_graph")
     
+    def _merge_conversation_results(self, context: AssembledContext, results: List[Dict[str, Any]]):
+        """Merge conversation memory results into context."""
+        if results:
+            context.cross_session_context = results
+            context.sources_queried.append("conversation_memory")
+
+    def _merge_insight_results(self, context: AssembledContext, results: List[Any]):
+        """Merge proactive insights into context."""
+        if results:
+            for insight in results:
+                if isinstance(insight, dict):
+                    context.proactive_insights.append(insight)
+                else:
+                    context.proactive_insights.append({"content": str(insight), "type": "suggestion"})
+            context.sources_queried.append("insight_service")
+    
+    async def _create_memory_node(
+        self,
+        user_id: int,
+        content: str,
+        category: str,
+        source: str,
+        confidence: float
+    ) -> bool:
+        """
+        Create a graph node for high-importance memories.
+        
+        Maps categories to appropriate node types and creates
+        nodes in the knowledge graph for persistent storage.
+        
+        Args:
+            user_id: User ID
+            content: Memory content
+            category: Category (preference, contact, project, etc.)
+            source: Origin of the memory
+            confidence: Importance/confidence score
+            
+        Returns:
+            True if node was created successfully
+        """
+        try:
+            from src.services.indexing.graph.schema import NodeType
+            from datetime import datetime
+            
+            # Map categories to node types
+            category_to_node_type = {
+                "preference": NodeType.INSIGHT,
+                "contact": NodeType.PERSON,
+                "project": NodeType.PROJECT,
+                "topic": NodeType.TOPIC,
+                "fact": NodeType.FACT,
+                "work": NodeType.FACT,
+                "personal": NodeType.FACT,
+                "commitment": NodeType.ACTION_ITEM,
+            }
+            
+            node_type = category_to_node_type.get(category, NodeType.FACT)
+            
+            # Build node properties
+            properties = {
+                "content": content,
+                "category": category,
+                "source": source,
+                "confidence": confidence,
+                "user_id": user_id,
+                "created_at": datetime.utcnow().isoformat(),
+                "memory_source": "orchestrator"
+            }
+            
+            # Add category-specific properties
+            if category == "contact" or node_type == NodeType.PERSON:
+                # Try to extract name from content
+                properties["name"] = content.split(":")[0] if ":" in content else content[:50]
+            elif category == "project" or node_type == NodeType.PROJECT:
+                properties["name"] = content[:100]
+                properties["status"] = "active"
+            elif node_type == NodeType.TOPIC:
+                properties["name"] = content[:50]
+            
+            # Create the node
+            await self.graph_manager.create_node(node_type, properties)
+            
+            logger.info(
+                f"[MemoryOrchestrator] Created graph node ({node_type.value}) "
+                f"for memory: '{content[:30]}...'"
+            )
+            
+            return True
+            
+        except ImportError as e:
+            logger.debug(f"[MemoryOrchestrator] Graph schema not available: {e}")
+            return False
+        except Exception as e:
+            logger.warning(f"[MemoryOrchestrator] Failed to create memory node: {e}")
+            return False
+    
     async def remember(
         self,
         user_id: int,
@@ -631,8 +858,13 @@ class MemoryOrchestrator:
             
             # 3. High importance: also consider graph storage
             if importance >= 0.8 and self.graph_manager:
-                # TODO: Implement graph node creation for high-importance memories
-                pass
+                await self._create_memory_node(
+                    user_id=user_id,
+                    content=content,
+                    category=category,
+                    source=source,
+                    confidence=importance
+                )
             
             logger.debug(
                 f"[MemoryOrchestrator] Stored memory for user {user_id}: "
@@ -780,7 +1012,10 @@ def init_memory_orchestrator(
     graph_manager: Optional[Any] = None,
     rag_engine: Optional[Any] = None,
     semantic_memory: Optional[Any] = None,
-    conversation_memory: Optional[Any] = None
+    conversation_memory: Optional[Any] = None,
+    deep_work_logic: Optional[Any] = None,
+    cross_stack_context: Optional[Any] = None,
+    linear_service: Optional[Any] = None
 ) -> MemoryOrchestrator:
     """
     Initialize the global MemoryOrchestrator.
@@ -793,7 +1028,10 @@ def init_memory_orchestrator(
         graph_manager=graph_manager,
         rag_engine=rag_engine,
         semantic_memory=semantic_memory,
-        conversation_memory=conversation_memory
+        conversation_memory=conversation_memory,
+        deep_work_logic=deep_work_logic,
+        cross_stack_context=cross_stack_context,
+        linear_service=linear_service
     )
     logger.info("[MemoryOrchestrator] Global instance initialized")
     return _memory_orchestrator

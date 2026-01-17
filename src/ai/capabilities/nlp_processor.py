@@ -66,6 +66,12 @@ class NLPProcessor:
         'name_patterns': r'\b([A-Z][a-z]+ [A-Z][a-z]+)\b' 
     }
     
+    PROJECT_PATTERNS = {
+        'linear_id': r'\b([A-Z]+-[0-9]+)\b',
+        'project_explicit': r'\b(project|topic|plan)\s+([A-Z][a-z0-9]+(?:\s+[A-Z][a-z0-9]+)*)\b',
+        'project_tag': r'#([a-zA-Z0-9_-]+)'
+    }
+    
     def __init__(self):
         self.stats = {
             'queries_processed': 0,
@@ -177,6 +183,29 @@ class NLPProcessor:
                 if not any(e.text == text and e.entity_type == 'person_name' for e in entities):
                     entities.append(entity)
         
+        # Extract Projects and Linear IDs
+        # Linear IDs
+        linear_matches = re.finditer(self.PROJECT_PATTERNS['linear_id'], query)
+        for match in linear_matches:
+            entities.append(EntityLink(
+                text=match.group(0),
+                entity_type='linear_id',
+                confidence=0.9,
+                resolved_value=match.group(1),
+                metadata={'id': match.group(1)}
+            ))
+            
+        # Explicit projects
+        project_matches = re.finditer(self.PROJECT_PATTERNS['project_explicit'], query, re.IGNORECASE)
+        for match in project_matches:
+            entities.append(EntityLink(
+                text=match.group(0),
+                entity_type='project_name',
+                confidence=0.8,
+                resolved_value=match.group(2),
+                metadata={'raw_name': match.group(2)}
+            ))
+            
         return entities
     
     @staticmethod

@@ -82,6 +82,7 @@ class PatternRecognition:
                 suggestions.append("Would you like to check your emails now? (It's your usual time)")
                 
         if 'top_collaborator' in patterns:
-            pass # functional placeholder for future logic
+            person = patterns['top_collaborator']
+            suggestions.append(f"Would you like me to prepare a briefing for your next interaction with {person}?")
             
         return suggestions

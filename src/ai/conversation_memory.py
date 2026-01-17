@@ -161,7 +161,8 @@ class ConversationMemory:
             # 3. Each add_message should be its own atomic transaction anyway
             try:
                 await self.db.rollback()
-            except Exception:
+            except Exception as e:
+                logger.debug(f"{LOG_INFO} Database rollback before message add failed: {e}")
                 pass  # Ignore errors - rollback is best-effort cleanup
             
             message = ConversationMessage(

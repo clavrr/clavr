@@ -7,16 +7,18 @@ Responsible for handling all email-related queries:
 - Drafting emails
 - Managing emails (mark as read, archive, etc.)
 """
+import asyncio
 from typing import Dict, Any, Optional
 from src.utils.logger import setup_logger
 from ..base import BaseAgent
 from ..constants import (
     TOOL_ALIASES_EMAIL,
     INTENT_KEYWORDS,
-    ERROR_NO_RECIPIENT
+    ERROR_NO_RECIPIENT,
+    ERROR_TOOL_NOT_AVAILABLE
 )
 from .schemas import (
-    SEARCH_SCHEMA, SEND_SCHEMA, MANAGEMENT_SCHEMA
+    SEARCH_SCHEMA, SEND_SCHEMA, MANAGEMENT_SCHEMA, REPLY_SCHEMA 
 )
 from .constants import (
     COUNT_KEYWORDS, ACTION_DESCRIPTIONS
@@ -80,6 +82,8 @@ class EmailAgent(BaseAgent):
 
         if is_send:
             return await self._handle_send(query, context)
+        elif any(w in query_lower for w in ["reply", "follow up", "respond", "answer"]):
+             return await self._handle_reply(query, context)
         elif any(w in query_lower for w in INTENT_KEYWORDS['email']['manage']):
             return await self._handle_management(query, context)
         elif any(w in query_lower for w in COUNT_KEYWORDS):
@@ -236,5 +240,156 @@ class EmailAgent(BaseAgent):
             tool_input, 
             description
         )
+        
+    async def _handle_reply(self, query: str, context: Optional[Dict[str, Any]] = None) -> str:
+        """
+        Handle persistent reply/follow-up flows.
+        - Resolves target thread (Inbox or Sent)
+        - Drafts context-aware response
+        - Executes reply
+        """
+        user_id = context.get('user_id') if context else None
+        
+        # 1. Extract intent
+        params = await self._extract_params(
+            query, REPLY_SCHEMA,
+            user_id=user_id,
+            task_type="complex", # Needs smarter extraction
+            use_fast_model=False # Use smart model for context drafting
+        )
+        
+        target = params.get("target_person")
+        intent = params.get("intent_instruction", "Follow up")
+        is_follow_up = params.get("is_follow_up", False)
+        
+        if not target:
+             return "I'm not sure who you want to reply to or follow up with. Please specify a name."
+             
+        # 2. Find the Thread
+        # For 'Follow up', we look for SENT emails to that person (to follow up on OUR message).
+        # For 'Reply', we look for RECEIVED emails from that person.
+        
+        search_kwargs = {"limit": 1}
+        search_desc = ""
+        
+        if is_follow_up:
+            search_kwargs["to_email"] = target
+            search_kwargs["folder"] = "sent" # or search "to:target"
+            search_desc = f"last email to {target}"
+        else:
+            search_kwargs["from_email"] = target
+            search_desc = f"last email from {target}"
+            
+        # Get Tool to access Service
+        email_tool = self._get_tool("email")
+        if not email_tool:
+            return ERROR_TOOL_NOT_AVAILABLE
+            
+        # Ensure service is available through the tool interface
+        service = getattr(email_tool, "service", None) or getattr(email_tool, "_service", None)
+        if not service:
+            return "[INTEGRATION_REQUIRED] Access to Gmail is required to find the email."
+            
+        try:
+            # Execute Search
+            results = await asyncio.to_thread(service.search_emails, **search_kwargs)
+            
+            if not results:
+                return f"I couldn't find any recent {search_desc} to follow up on."
+                
+            email = results[0]
+            thread_id = email.get("threadId")
+            msg_id = email.get("id")
+            subject = email.get("subject", "No Subject")
+            snippet = email.get("snippet", "")
+            
+            # 3. generate Draft Body
+            # Check availability if needed
+            calendar_context = ""
+            check_keywords = ["when", "free", "time", "availab", "schedule", "calendar", "meet", "meeting", "week", "tomorrow", "day"]
+            if any(w in snippet.lower() for w in check_keywords) or any(w in intent.lower() for w in check_keywords):
+                # Fetch calendar availability
+                try:
+                    cal_tool = self._get_tool("calendar")
+                    if cal_tool and hasattr(cal_tool, "_service"):
+                        if hasattr(cal_tool, "_initialize_service"):
+                             cal_tool._initialize_service()
+                        if cal_tool._service:
+                             # Find free time for next 3 days
+                             from datetime import datetime
+                             slots = cal_tool._service.find_free_time(
+                                 duration_minutes=30,
+                                 max_suggestions=5,
+                                 start_datetime=datetime.now(),
+                                 days_ahead=3
+                             )
+                             if slots:
+                                 formatted_slots = []
+                                 for s in slots:
+                                     start = s.get('start')
+                                     if start:
+                                         try:
+                                              dt = datetime.fromisoformat(start.replace('Z', '+00:00'))
+                                              formatted_slots.append(dt.strftime('%A at %I:%M %p'))
+                                         except Exception:
+                                              formatted_slots.append(start)
+                                 
+                                 calendar_context = "\n[CALENDAR AVAILABILITY]: " + ", ".join(formatted_slots)
+                                 logger.info(f"[{self.name}] Injected calendar availability into draft context.")
+                except Exception as e:
+                    logger.warning(f"[{self.name}] Failed to fetch calendar availability for reply: {e}")
+
+            # We use the LLM to write the email based on user style (which is in Context)
+            draft_prompt = f"""
+            Write a email reply.
+            Context: Following up on thread '{subject}'.
+            Original Snippet: "{snippet}"
+            User Intent: {intent}
+            {calendar_context}
+            
+            Constraint: Write ONLY the body text. No subject. No salutations if informal.
+            If [CALENDAR AVAILABILITY] is provided and the email asks for time, suggest a few of those times.
+            """
+            
+            # Use param extraction LLM or generating one?
+            # self._extract_params is for JSON. We need text.
+            # BaseAgent.llm is available.
+            
+            from langchain_core.messages import SystemMessage, HumanMessage
+            if self.llm:
+                # Add style guidelines from system prompt? 
+                # They are implicit in the specialized agent if using conversational, 
+                # but here we are in a function.
+                # Actually, the 'context' passed to run() has user prefs.
+                # We should include that.
+                
+                # Simple generation
+                msgs = [
+                    SystemMessage(content="You are an expert email writer. Adapt to the user's style."),
+                    HumanMessage(content=draft_prompt + f"\n\nUser Context:\n{query}") # query has enriched context
+                ]
+                resp = await asyncio.to_thread(self.llm.invoke, msgs)
+                body = resp.content
+            else:
+                body = f"Hi {target},\n\nJust wanted to follow up on this.\n\nBest,\nMe"
+
+            # Clean body
+            body = body.replace("Subject:", "").strip()
+            
+            # 4. Execute Reply
+            # Use tool to execute so events are emitted
+            tool_input = {
+                "action": "reply",
+                "thread_id": thread_id,
+                "body": body
+            }
+            
+            return await self._safe_tool_execute(
+                TOOL_ALIASES_EMAIL, tool_input, f"replying to {target}"
+            )
+            
+        except Exception as e:
+            logger.error(f"[{self.name}] Reply flow failed: {e}")
+            return f"I ran into an issue finding or replying to the email: {e}"
 
 

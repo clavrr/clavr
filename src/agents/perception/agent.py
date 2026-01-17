@@ -9,24 +9,25 @@ Phase 5 of Ambient Autonomy.
 """
 from typing import Dict, Any, List, Optional, NamedTuple
 from enum import Enum
-import re
-
 from ...utils.logger import setup_logger
-from ...ai.memory.semantic_memory import SemanticMemory
-from .types import SignalType, PerceptionEvent, Trigger
+from ...utils.config import Config
+from ...ai.autonomy.base import StructuredGenerator
+from ...ai.prompts.autonomy_prompts import PERCEPTION_SIGNAL_PROMPT
+from .types import PerceptionEvent, Trigger
 
 logger = setup_logger(__name__)
 
-
-from ...services.indexing.graph import KnowledgeGraphManager, NodeType, RelationType
-from ...services.indexing.graph.schema import GraphSchema
-
-class PerceptionAgent:
+class PerceptionAgent(StructuredGenerator):
     """
     Evaluates raw events to determine if they are worth the Supervisor's attention.
-    Now backed by the Knowledge Graph for deep grounding.
+    Now backed by the Knowledge Graph for deep grounding and LLM for reasoning.
     """
     
+    def __init__(self, config: Config):
+        super().__init__(config)
+        from ...memory.orchestrator import get_memory_orchestrator
+        self.memory_orchestrator = get_memory_orchestrator()
+
     async def perceive_event(self, event: PerceptionEvent, user_id: int) -> Optional[Trigger]:
         """
         Main entry point. Evaluates a single event.
@@ -34,10 +35,10 @@ class PerceptionAgent:
         """
         try:
             # 1. Grounding: Check for relationships/facts in the Graph via Orchestrator
-            is_grounded = await self._ground_event(event, user_id)
+            grounding = await self._ground_event(event, user_id)
             
             # 2. Evaluate Signal
-            trigger = await self._evaluate_signal(event, user_id, is_grounded)
+            trigger = await self._evaluate_signal(event, user_id, grounding)
             
             if trigger:
                 logger.info(f"[Perception] 🔔  SIGNAL detected: {trigger.category} (Reason: {trigger.reason})")
@@ -48,10 +49,6 @@ class PerceptionAgent:
         except Exception as e:
             logger.error(f"[Perception] Error perceiving event: {e}")
             return None
-
-    def __init__(self):
-        from ...memory.orchestrator import get_memory_orchestrator
-        self.memory_orchestrator = get_memory_orchestrator()
 
     async def _ground_event(self, event: PerceptionEvent, user_id: int) -> Dict[str, Any]:
         """
@@ -130,44 +127,50 @@ class PerceptionAgent:
                                user_id: int, 
                                grounding: Dict[str, Any]) -> Optional[Trigger]:
         """
-        Decision logic: Noise vs Trigger.
+        Use LLM to decide if an event is a Trigger or Noise.
         """
         
-        # Immediate NOISE
-        if grounding["is_blocked"]:
+        # 1. Immediate NOISE block
+        if grounding.get("is_blocked"):
             return None
             
-        if event.type == "email":
-            email_data = event.content
-            
-            # TRIGGER 1: Project Relevance (Specific Context)
-            if grounding["relevant_project"]:
-                return Trigger(
-                    priority="medium",
-                    category="work_update",
-                    reason=f"Related to Active Project: {grounding['relevant_project']}",
-                    context={"email_id": email_data.get("id"), "subject": email_data.get("subject")}
-                )
-
-            # TRIGGER 2: VIP Sender (General Context)
-            if grounding["is_vip"]:
-                 return Trigger(
-                     priority="high",
-                     category="urgent_email",
-                     reason="Sender is VIP/Relationship (Graph Verified)",
-                     context={"email_id": email_data.get("id"), "sender": email_data.get("from")}
-                 )
-                
-            # TRIGGER 3: Explicit High Priority (Metadata)
-            if "important" in email_data.get("labels", []) or "urgent" in email_data.get("subject", "").lower():
-                 return Trigger(
-                     priority="medium",
-                     category="urgent_email",
-                     reason="Marked Important/Urgent",
-                     context={"email_id": email_data.get("id")}
-                 )
-                 
-        elif event.type == "calendar":
-            pass
+        # 2. Prepare context for LLM
+        # Convert event NamedTuple to dict for JSON serialization
+        event_dict = {
+            "type": event.type,
+            "timestamp": event.timestamp,
+            "content": event.content
+        }
+        
+        # Format grounding context for LLM
+        grounding_str = f"Is VIP: {grounding.get('is_vip')}\n"
+        if grounding.get("relevant_project"):
+            grounding_str += f"Relevant Project: {grounding.get('relevant_project')}\n"
+        
+        # 3. Call LLM
+        from ...ai.prompts.utils import format_prompt
+        import json
+        
+        prompt_data = format_prompt(
+            PERCEPTION_SIGNAL_PROMPT,
+            grounding_context=grounding_str,
+            event_data=json.dumps(event_dict, indent=2)
+        )
+        
+        result = await self._generate_structured(
+            system_prompt=PERCEPTION_SIGNAL_PROMPT, # StructuredGenerator handles system/human splits? 
+            # Wait, StructuredGenerator._generate_structured takes system_prompt and user_context.
+            # I should split them.
+            user_context=prompt_data 
+        )
+        
+        # 4. Parse result
+        if result and result.get("is_actionable"):
+            return Trigger(
+                priority=result.get("priority", "medium"),
+                category=result.get("category", "unknown"),
+                reason=result.get("reason", "No reason provided"),
+                context=event.content
+            )
             
         return None

@@ -36,15 +36,25 @@ class ContextEvaluator:
         """
         Check current context and return a proposed plan/action.
         """
-        # Always work in UTC internally for logic, but be aware of local hour for user habits
-        # For MVP, we presume server time or simple hours. Ideally we fetch user timezone.
-        now_utc = datetime.now(timezone.utc)
+        # Robust timezone handling
+        try:
+            from src.utils.config import get_timezone, load_config
+            import pytz
+            
+            # Use cached config or load fresh
+            if not hasattr(self, '_cached_config'):
+                self._cached_config = load_config()
+                
+            tz_name = get_timezone(self._cached_config)
+            user_tz = pytz.timezone(tz_name)
+            now_local = datetime.now(user_tz)
+            logger.debug(f"[ContextEvaluator] Using timezone: {tz_name}")
+        except Exception as e:
+            logger.debug(f"[ContextEvaluator] Timezone fetch failed, using UTC: {e}")
+            now_local = datetime.now(timezone.utc)
         
-        # TODO: Fetch user timezone from settings. For now, rely on system local time for "Morning/Evening" logic
-        # strictly for the hour check.
-        now_local = datetime.now() 
         hour_local = now_local.hour
-        weekday = now_local.weekday() # 0=Mon, 6=Sun
+        weekday = now_local.weekday()
         
         # 0. Check User Preferences (Async Semantic Memory)
         if self.memory:
@@ -100,7 +110,12 @@ class ContextEvaluator:
                     
                     # Logic: If meeting starts within POSITIVE prep window (e.g. 0 to 15 mins)
                     if 0 < delta_minutes <= MEETING_PREP_MINUTES:
-                         # Check if we already briefed? (Requires state, skipping for MVP)
+                         # State Tracking: Prevent double-briefing
+                         # We check if we've already generated a brief for this event_id
+                         already_briefed = await self._check_briefing_state(user_id, event.get("id"))
+                         if already_briefed:
+                             continue
+
                          return {
                             "action_needed": True,
                             "reason": f"Meeting '{event.get('summary', 'Unknown')}' starts in {int(delta_minutes)}m",
@@ -139,3 +154,45 @@ class ContextEvaluator:
             "proposed_action": None,
             "priority": "none"
         }
+
+    async def _check_briefing_state(self, user_id: int, event_id: str) -> bool:
+        """
+        Check if an event has already been briefed for the user.
+        Uses SemanticMemory to store/retrieve briefing history.
+        """
+        if not self.memory or not event_id:
+            return False
+            
+        try:
+            # Check for a specific fact about this event
+            query = f"Already prepared brief for event {event_id}"
+            facts = await self.memory.search_facts(query, user_id, limit=1)
+            
+            for fact in facts:
+                if event_id in fact.get('content', '') and fact.get('confidence', 0) > 0.8:
+                    logger.debug(f"[Evaluator] Event {event_id} already briefed.")
+                    return True
+            return False
+        except Exception as e:
+            logger.warning(f"[Evaluator] State check failed: {e}")
+            return False
+
+    async def mark_event_as_briefed(self, user_id: int, event_id: str):
+        """
+        Record that an event brief was successfully generated.
+        """
+        if not self.memory or not event_id:
+            return
+            
+        try:
+            content = f"Already prepared brief for event {event_id}"
+            await self.memory.learn_fact(
+                user_id=user_id,
+                content=content,
+                category="internal_state",
+                source="context_evaluator",
+                validate=True
+            )
+            logger.info(f"[Evaluator] Event {event_id} marked as briefed.")
+        except Exception as e:
+            logger.error(f"[Evaluator] Failed to mark event as briefed: {e}")

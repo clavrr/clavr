@@ -26,8 +26,6 @@ from src.integrations.google_calendar.service import CalendarService
 
 logger = setup_logger(__name__)
 
-print("DEBUG: MODULE LOADED: dashboard.py")
-
 router = APIRouter(prefix="/api/dashboard", tags=["dashboard"])
 
 

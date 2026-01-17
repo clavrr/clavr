@@ -262,7 +262,8 @@ class IncrementalLearner:
                 return None
                 
             return match.group(0)
-        except Exception:
+        except Exception as e:
+            logger.debug(f"Fact content building failed: {e}")
             return None
     
     def _extract_entities(self, text: str) -> List[str]:
@@ -288,7 +289,8 @@ class IncrementalLearner:
                 for fact in extracted
                 if fact.get('content')
             ]
-        except Exception:
+        except Exception as e:
+            logger.debug(f"NLP fact extraction failed: {e}")
             return []
     
     async def _learn_fact(self, user_id: int, fact: ExtractedFact) -> str:
@@ -377,9 +379,7 @@ class IncrementalLearner:
             return False
 
 
-# ============================================================================
 # Singleton
-# ============================================================================
 
 _learner_instance: Optional[IncrementalLearner] = None
 

@@ -193,3 +193,49 @@ class SlackClient:
         )
         logger.info(f"Registered event handler for {event_type}")
 
+    
+    def set_user_status(
+        self,
+        user_id: str,
+        status_text: str,
+        status_emoji: str = "",
+        expiration: int = 0
+    ) -> Dict[str, Any]:
+        """
+        Set a user's Slack status.
+        
+        Args:
+            user_id: Slack user ID
+            status_text: Status message
+            status_emoji: Status emoji code (e.g. :house:)
+            expiration: Expiration timestamp (0 for no expiration)
+            
+        Returns:
+            API response dictionary
+        """
+        try:
+            # Note: This requires the users.profile:write scope and a User Token
+            # For now we attempt with the bot token, but in production this likely
+            # needs a user-specific token from OAuth
+            profile = {
+                "status_text": status_text,
+                "status_emoji": status_emoji,
+                "status_expiration": expiration
+            }
+            
+            response = self.web_client.users_profile_set(
+                user=user_id,
+                profile=profile
+            )
+            
+            if response.get('ok'):
+                logger.info(f"Updated status for user {user_id}: {status_emoji} {status_text}")
+                return response
+            else:
+                error = response.get('error', 'Unknown error')
+                logger.warning(f"Failed to update status for user {user_id}: {error}")
+                return response
+                
+        except Exception as e:
+            logger.error(f"Error setting user status: {e}", exc_info=True)
+            return {"ok": False, "error": str(e)}

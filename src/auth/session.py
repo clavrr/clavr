@@ -124,9 +124,7 @@ async def create_session(
     # Since we expunged the object, this change won't be saved to DB
     db_session.session_token = raw_token
     
-    logger.warning(f"🎫 Created session - RAW TOKEN for client: {raw_token}")
-    logger.warning(f"🔒 Stored HASHED token in DB: {hashed_token}")
-    logger.info(f"Created session for user_id: {user_id} (tokens encrypted and hashed)")
+    logger.debug(f"Session created for user_id: {user_id}, token: {raw_token[:8]}... (tokens encrypted and hashed)")
     return db_session
 
 

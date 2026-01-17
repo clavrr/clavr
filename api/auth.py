@@ -141,6 +141,7 @@ def require_role(role: str):
                         break
             
             if not user:
+                logger.warning(f"Auth warning: User not found in request state/args for role check ({role})")
                 raise AuthenticationError("User not found in request")
             
             # Note: Role checking will be implemented when user roles are added
@@ -187,6 +188,7 @@ def require_resource_ownership(resource_user_id: int):
             user = kwargs.get('user')
             
             if not user:
+                logger.warning(f"Auth warning: User not found in request state for ownership check (ResUser: {resource_user_id})")
                 raise AuthenticationError("User not found in request")
             
             if not check_resource_ownership(user, resource_user_id):

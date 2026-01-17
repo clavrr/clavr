@@ -148,6 +148,44 @@ class ServiceConstants:
     INSIGHT_MAX_AGE_HOURS = 48  # Don't show insights older than 48 hours
     
     # ===================================================================
+    # HALLUCINATION CHECKER CONSTANTS
+    # ===================================================================
+    
+    HALLUCINATION_BLOCK_THRESHOLD_NORMAL = 0.8
+    HALLUCINATION_WARN_THRESHOLD_NORMAL = 0.5
+    
+    HALLUCINATION_BLOCK_THRESHOLD_STRICT = 0.6
+    HALLUCINATION_WARN_THRESHOLD_STRICT = 0.3
+    
+    HALLUCINATION_BLOCK_THRESHOLD_LENIENT = 0.9
+    HALLUCINATION_WARN_THRESHOLD_LENIENT = 0.7
+    
+    HALLUCINATION_NUMERICAL_TOLERANCE = 0.05
+    
+    # ===================================================================
+    # VOICE SERVICE CONSTANTS
+    # ===================================================================
+    
+    VOICE_ENERGY_THRESHOLD = 100  # Minimum RMS energy to process chunk
+    
+    # ===================================================================
+    # CONFLICT DETECTOR CONSTANTS
+    # ===================================================================
+    
+    CONFLICT_CALENDAR_OVERLAP_CONFIDENCE_BASE = 0.6
+    CONFLICT_CALENDAR_OVERLAP_CONFIDENCE_MAX = 0.95
+    CONFLICT_MAX_OVERLAP_MINUTES = 120
+    
+    CONFLICT_ATTENDEE_CONFIDENCE = 0.9
+    
+    CONFLICT_DEADLINE_CLUSTER_CONFIDENCE_BASE = 0.5
+    CONFLICT_DEADLINE_CLUSTER_CONFIDENCE_MAX = 0.9
+    
+    CONFLICT_WORKLOAD_CONFIDENCE = 0.8
+    CONFLICT_WORKLOAD_MEETING_HOURS = 5
+    CONFLICT_WORKLOAD_TASK_COUNT = 2
+
+    # ===================================================================
     # CONTEXT SERVICE CONSTANTS
     # ===================================================================
     

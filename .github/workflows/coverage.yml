@@ -1,0 +1,165 @@
+# Code Coverage Reporting
+name: Coverage
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main, develop ]
+  workflow_dispatch:
+
+env:
+  PYTHON_VERSION: '3.9'
+
+jobs:
+  # Job 1: Generate Coverage Report
+  coverage:
+    name: Code Coverage Analysis
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+    
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: ${{ env.PYTHON_VERSION }}
+        cache: 'pip'
+    
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install pytest pytest-cov pytest-asyncio pytest-mock coverage
+        pip install -r requirements.txt
+    
+    - name: Run tests with coverage
+      run: |
+        pytest tests/ -v \
+          --cov=src \
+          --cov=api \
+          --cov-report=term-missing \
+          --cov-report=xml:coverage.xml \
+          --cov-report=html:htmlcov \
+          --cov-report=json:coverage.json
+    
+    - name: Generate coverage badge
+      run: |
+        coverage_percent=$(python -c "import json; data=json.load(open('coverage.json')); print(f\"{data['totals']['percent_covered']:.1f}\")")
+        echo "COVERAGE_PERCENT=${coverage_percent}" >> $GITHUB_ENV
+        echo "Coverage: ${coverage_percent}%"
+    
+    - name: Coverage comment
+      if: github.event_name == 'pull_request'
+      run: |
+        echo "## Code Coverage Report" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "Coverage: ${{ env.COVERAGE_PERCENT }}%" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        coverage report --format=markdown >> $GITHUB_STEP_SUMMARY || true
+    
+    - name: Upload coverage to Codecov
+      uses: codecov/codecov-action@v4
+      with:
+        file: ./coverage.xml
+        flags: full-suite
+        name: codecov-umbrella
+        fail_ci_if_error: false
+      continue-on-error: true
+    
+    - name: Upload coverage reports
+      uses: actions/upload-artifact@v4
+      with:
+        name: coverage-reports
+        path: |
+          coverage.xml
+          coverage.json
+          htmlcov/
+        retention-days: 30
+    
+    - name: Check coverage threshold
+      run: |
+        coverage_percent=$(python -c "import json; data=json.load(open('coverage.json')); print(data['totals']['percent_covered'])")
+        echo "Current coverage: ${coverage_percent}%"
+        
+        # Set minimum coverage threshold (e.g., 70%)
+        threshold=70
+        if (( $(echo "$coverage_percent < $threshold" | bc -l) )); then
+          echo "Warning: Coverage ${coverage_percent}% is below threshold ${threshold}%"
+          # Don't fail the build, just warn
+        else
+          echo "Coverage ${coverage_percent}% meets threshold ${threshold}%"
+        fi
+
+  # Job 2: Coverage Diff (PR only)
+  coverage-diff:
+    name: Coverage Diff Analysis
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    
+    steps:
+    - name: Checkout PR branch
+      uses: actions/checkout@v4
+      with:
+        ref: ${{ github.event.pull_request.head.sha }}
+    
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: ${{ env.PYTHON_VERSION }}
+        cache: 'pip'
+    
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install pytest pytest-cov coverage
+        pip install -r requirements.txt
+    
+    - name: Run tests on PR branch
+      run: |
+        pytest tests/ -v --cov=src --cov=api --cov-report=json:pr-coverage.json
+      continue-on-error: true
+    
+    - name: Checkout base branch
+      uses: actions/checkout@v4
+      with:
+        ref: ${{ github.event.pull_request.base.ref }}
+    
+    - name: Run tests on base branch
+      run: |
+        pip install -r requirements.txt
+        pytest tests/ -v --cov=src --cov=api --cov-report=json:base-coverage.json
+      continue-on-error: true
+    
+    - name: Compare coverage
+      run: |
+        python << 'EOF'
+        import json
+        
+        try:
+            with open('pr-coverage.json') as f:
+                pr_data = json.load(f)
+            pr_coverage = pr_data['totals']['percent_covered']
+        except:
+            pr_coverage = 0
+        
+        try:
+            with open('base-coverage.json') as f:
+                base_data = json.load(f)
+            base_coverage = base_data['totals']['percent_covered']
+        except:
+            base_coverage = 0
+        
+        diff = pr_coverage - base_coverage
+        
+        print(f"Base coverage: {base_coverage:.2f}%")
+        print(f"PR coverage: {pr_coverage:.2f}%")
+        print(f"Difference: {diff:+.2f}%")
+        
+        if diff >= 0:
+            print("Coverage improved or maintained")
+        else:
+            print("Coverage decreased")
+        EOF

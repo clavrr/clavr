@@ -18,7 +18,7 @@ import logging
 
 from api.auth import get_current_user_required as get_current_user
 from api.dependencies import get_config
-from src.database import get_async_db as get_db_session
+from src.database import get_async_db as get_db
 from src.database.models import User
 from src.features.data_export import generate_export_for_user
 from src.utils.config import Config
@@ -38,7 +38,7 @@ async def request_data_export(
     include_vectors: bool = Query(default=False, description="Include vector embeddings (large!)"),
     include_email_content: bool = Query(default=True, description="Include full email content"),
     current_user: User = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db_session),
+    db: AsyncSession = Depends(get_db),
     config: Config = Depends(get_config),
     background_tasks: BackgroundTasks = BackgroundTasks()
 ):

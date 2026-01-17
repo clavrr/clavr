@@ -8,7 +8,11 @@ from abc import ABC, abstractmethod
 from typing import List, Dict, Any, Optional
 from datetime import datetime
 
-from ...indexing.graph import KnowledgeGraphManager, NodeType, RelationType
+from ..indexing.graph import KnowledgeGraphManager, NodeType, RelationType
+from ...utils.logger import setup_logger
+
+logger = setup_logger(__name__)
+
 
 class BaseIngestor(ABC):
     """
@@ -24,14 +28,14 @@ class BaseIngestor(ABC):
         """
         Fetch items that have changed since the last sync.
         """
-        pass
+        raise NotImplementedError("Subclasses must implement fetch_delta()")
         
     @abstractmethod
     async def ingest_item(self, item: Any) -> None:
         """
         Process a single item (Task, Page, etc.) and write Nodes/Relationships to the Graph.
         """
-        pass
+        raise NotImplementedError("Subclasses must implement ingest_item()")
         
     async def run_sync(self, last_sync_time: Optional[datetime] = None) -> Dict[str, int]:
         """
@@ -46,9 +50,8 @@ class BaseIngestor(ABC):
                 await self.ingest_item(item)
                 stats["processed"] += 1
             except Exception as e:
-                # Log error but continue
                 stats["errors"] += 1
-                # In a real system, use logger here
-                print(f"[Ingest] Error processing item: {e}")
+                logger.warning(f"[Ingest] Error processing item: {e}")
                 
         return stats
+

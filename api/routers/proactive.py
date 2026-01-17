@@ -4,17 +4,18 @@ Proactive Insights API
 Endpoints for proactive intelligence delivery:
 - On login: Show urgent insights (conflicts, OOO notifications, important updates)
 - Before meetings: Surface attendee context (recent interactions, topics discussed)
-- Periodic: Highlight important connections and suggestions
 
+Now properly integrates with:
+- ContextService: Data gathering and context building
+- BriefingGenerator: LLM-powered narratives
+- PerceptionAgent: Event filtering and signal detection
 """
-from fastapi import APIRouter, Depends, HTTPException, status
-from typing import Dict, Any, List, Optional
 from datetime import datetime, timedelta
+from typing import Dict, Any, List, Optional
+from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel
 
-from api.dependencies import get_config
-from api.auth import get_current_user_required
-from src.database import get_db
+from api.dependencies import get_current_user_required, get_db, get_config
 from src.database.models import User
 from src.utils.logger import setup_logger
 from sqlalchemy.orm import Session
@@ -24,7 +25,8 @@ logger = setup_logger(__name__)
 router = APIRouter(prefix="/proactive", tags=["proactive"])
 
 
-# Response Models
+# ==================== Response Models ====================
+
 class AttendeeContext(BaseModel):
     email: str
     name: str
@@ -32,6 +34,7 @@ class AttendeeContext(BaseModel):
     topics_discussed: List[str] = []
     is_ooo: bool = False
     relationship_strength: float = 0.0
+    last_interaction: Optional[str] = None
 
 
 class MeetingPrepContext(BaseModel):
@@ -41,6 +44,7 @@ class MeetingPrepContext(BaseModel):
     attendees: List[AttendeeContext] = []
     related_documents: List[Dict[str, Any]] = []
     suggested_topics: List[str] = []
+    narrative: Optional[str] = None  # LLM-generated summary
 
 
 class InsightResponse(BaseModel):
@@ -54,17 +58,73 @@ class InsightResponse(BaseModel):
     source_node_id: Optional[str] = None
 
 
+class TopicContextResponse(BaseModel):
+    """360° cross-stack context for a topic/project - Semantic Sync."""
+    topic: str
+    summary: str
+    key_facts: List[str] = []
+    sources: Dict[str, Any] = {}
+    people_involved: List[str] = []
+    action_items: List[Dict[str, Any]] = []
+    upcoming_events: List[Dict[str, Any]] = []
+    generated_at: str
+
+
 class ProactiveInsightsResponse(BaseModel):
     urgent: List[InsightResponse] = []
     meeting_prep: List[MeetingPrepContext] = []
     connections: List[Dict[str, Any]] = []
     suggestions: List[Dict[str, Any]] = []
+    briefing_narrative: Optional[str] = None
     timestamp: str
 
+
+# ==================== Service Factory ====================
+
+class ProactiveServiceFactory:
+    """Factory for lazily loading proactive services."""
+    
+    _context_service = None
+    _briefing_generator = None
+    _meeting_brief_generator = None
+    
+    @classmethod
+    def get_context_service(cls, config, db=None):
+        """Get or create ContextService singleton."""
+        if cls._context_service is None:
+            from src.services.proactive.context_service import ContextService
+            cls._context_service = ContextService(config, db)
+        return cls._context_service
+    
+    @classmethod
+    def get_briefing_generator(cls, config):
+        """Get or create BriefingGenerator singleton."""
+        if cls._briefing_generator is None:
+            try:
+                from src.ai.autonomy import BriefingGenerator
+                cls._briefing_generator = BriefingGenerator(config)
+            except Exception as e:
+                logger.warning(f"[Proactive] Could not init BriefingGenerator: {e}")
+        return cls._briefing_generator
+    
+    @classmethod
+    def get_meeting_brief_generator(cls, config):
+        """Get or create MeetingBriefGenerator singleton."""
+        if cls._meeting_brief_generator is None:
+            try:
+                from src.ai.autonomy import MeetingBriefGenerator
+                cls._meeting_brief_generator = MeetingBriefGenerator(config)
+            except Exception as e:
+                logger.warning(f"[Proactive] Could not init MeetingBriefGenerator: {e}")
+        return cls._meeting_brief_generator
+
+
+# ==================== API Endpoints ====================
 
 @router.get("/insights", response_model=ProactiveInsightsResponse)
 async def get_proactive_insights(
     hours_ahead: int = 4,
+    include_narrative: bool = False,
     current_user: User = Depends(get_current_user_required),
     config=Depends(get_config),
     db: Session = Depends(get_db)
@@ -72,11 +132,16 @@ async def get_proactive_insights(
     """
     Get proactive insights for the current user.
     
+    Args:
+        hours_ahead: Hours to look ahead for meetings
+        include_narrative: Generate LLM briefing narrative
+    
     Returns:
-    - urgent: High-priority insights (conflicts, OOO, etc.)
-    - meeting_prep: Context for upcoming meetings
-    - connections: Notable connections to explore
-    - suggestions: Actionable suggestions
+        - urgent: High-priority insights (conflicts, OOO, etc.)
+        - meeting_prep: Context for upcoming meetings
+        - connections: Notable connections to explore
+        - suggestions: Actionable suggestions
+        - briefing_narrative: LLM-generated morning briefing (optional)
     """
     user_id = current_user.id
     
@@ -89,44 +154,28 @@ async def get_proactive_insights(
     )
     
     try:
+        context_service = ProactiveServiceFactory.get_context_service(config, db)
+        
         # 1. Get urgent insights from InsightService
-        from src.services.insights import get_insight_service
+        await _gather_urgent_insights(response, user_id)
         
-        insight_service = get_insight_service()
-        if insight_service:
-            urgent_insights = await insight_service.get_urgent_insights(
-                user_id=user_id,
-                max_insights=5
-            )
-            
-            for insight in urgent_insights:
-                response.urgent.append(InsightResponse(
-                    id=insight.get('id', ''),
-                    type=insight.get('type', 'info'),
-                    title=insight.get('title', 'Insight'),
-                    description=insight.get('content', ''),
-                    urgency=insight.get('urgency', 'medium'),
-                    confidence=insight.get('confidence', 0.5),
-                    timestamp=insight.get('timestamp', datetime.utcnow().isoformat()),
-                    source_node_id=insight.get('source_node_id')
-                ))
-        
-        # 2. Get meeting preparation context
-        meeting_preps = await _get_meeting_prep_context(
-            user_id=user_id,
-            hours_ahead=hours_ahead,
-            config=config,
-            db=db
+        # 2. Get meeting preparation context via ContextService
+        meeting_preps = await _gather_meeting_prep(
+            context_service, user_id, hours_ahead, config, db, current_user
         )
         response.meeting_prep = meeting_preps
         
-        # 3. Get notable connections
-        connections = await _get_notable_connections(user_id, config)
-        response.connections = connections[:5]
+        # 3. Get notable connections via ContextService
+        response.connections = await _gather_connections(context_service, user_id)
         
-        # 4. Get suggestions based on recent activity
-        suggestions = await _get_actionable_suggestions(user_id, config)
-        response.suggestions = suggestions[:3]
+        # 4. Get suggestions via ContextService
+        response.suggestions = await _gather_suggestions(context_service, user_id)
+        
+        # 5. Optional: Generate LLM narrative
+        if include_narrative:
+            response.briefing_narrative = await _generate_briefing_narrative(
+                config, user_id, db, current_user
+            )
         
     except Exception as e:
         logger.error(f"[Proactive] Failed to get insights for user {user_id}: {e}")
@@ -137,6 +186,7 @@ async def get_proactive_insights(
 @router.get("/meeting-prep/{meeting_id}")
 async def get_meeting_preparation(
     meeting_id: str,
+    include_narrative: bool = True,
     current_user: User = Depends(get_current_user_required),
     config=Depends(get_config),
     db: Session = Depends(get_db)
@@ -144,17 +194,13 @@ async def get_meeting_preparation(
     """
     Get detailed preparation context for a specific meeting.
     
-    Returns comprehensive context including:
-    - Attendee relationship history
-    - Related documents and emails
-    - Topics discussed with attendees
-    - Suggested talking points
+    Uses:
+    - ContextService for data gathering
+    - MeetingBriefGenerator for LLM narrative
     """
     user_id = current_user.id
     
     try:
-        # Get the meeting details
-        from api.dependencies import AppState
         from src.core.async_credential_provider import AsyncCredentialFactory
         
         factory = AsyncCredentialFactory(config, db, current_user)
@@ -175,14 +221,54 @@ async def get_meeting_preparation(
                 detail="Meeting not found"
             )
         
-        # Build detailed context
-        context = await _build_detailed_meeting_context(
-            event=event,
-            user_id=user_id,
-            config=config
+        # Build context via ContextService
+        context_service = ProactiveServiceFactory.get_context_service(config, db)
+        raw_context = await context_service.build_meeting_context(event, user_id)
+        
+        # Convert to response model
+        attendees = [
+            AttendeeContext(
+                email=a.get('email', ''),
+                name=a.get('name', ''),
+                recent_interactions=a.get('history', []),
+                topics_discussed=a.get('topics', []),
+                is_ooo=a.get('is_ooo', False),
+                relationship_strength=a.get('strength', 0.0),
+                last_interaction=a.get('last_interaction')
+            )
+            for a in raw_context.get('attendees', [])
+        ]
+        
+        result = MeetingPrepContext(
+            meeting_id=meeting_id,
+            meeting_title=event.get('summary', 'Untitled'),
+            start_time=event.get('start', {}).get('dateTime', ''),
+            attendees=attendees,
+            related_documents=raw_context.get('related_documents', []),
+            suggested_topics=raw_context.get('suggested_topics', [])
         )
         
-        return context
+        # Generate LLM narrative if requested
+        if include_narrative:
+            brief_generator = ProactiveServiceFactory.get_meeting_brief_generator(config)
+            if brief_generator:
+                try:
+                    email_service = await factory.get_email_service()
+                    from src.ai.memory.semantic_memory import SemanticMemory
+                    semantic_memory = SemanticMemory(config)
+                    
+                    brief = await brief_generator.generate_brief(
+                        user_id=user_id,
+                        event_id=meeting_id,
+                        calendar_service=calendar_service,
+                        email_service=email_service,
+                        semantic_memory=semantic_memory
+                    )
+                    result.narrative = brief.get('narrative') if isinstance(brief, dict) else str(brief)
+                except Exception as e:
+                    logger.warning(f"[Proactive] Narrative generation failed: {e}")
+        
+        return result
         
     except HTTPException:
         raise
@@ -191,6 +277,130 @@ async def get_meeting_preparation(
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to prepare meeting context"
+        )
+
+
+@router.get("/briefing")
+async def get_morning_briefing(
+    current_user: User = Depends(get_current_user_required),
+    config=Depends(get_config),
+    db: Session = Depends(get_db)
+):
+    """
+    Get a full morning briefing with LLM-generated narrative.
+    
+    Uses BriefingGenerator from src.ai.autonomy.
+    """
+    user_id = current_user.id
+    
+    try:
+        from src.core.async_credential_provider import AsyncCredentialFactory
+        
+        factory = AsyncCredentialFactory(config, db, current_user)
+        calendar_service = await factory.get_calendar_service()
+        email_service = await factory.get_email_service()
+        task_service = await factory.get_task_service()
+        
+        brief_generator = ProactiveServiceFactory.get_briefing_generator(config)
+        
+        if brief_generator:
+            briefing = await brief_generator.generate_briefing(
+                user_id=user_id,
+                calendar_service=calendar_service,
+                email_service=email_service,
+                task_service=task_service,
+                fast_mode=False
+            )
+            return briefing
+        
+        # Fallback to basic briefing via ContextService
+        context_service = ProactiveServiceFactory.get_context_service(config, db)
+        return await context_service.get_briefing_summary(user_id)
+        
+    except Exception as e:
+        logger.error(f"[Proactive] Briefing generation failed for user {user_id}: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to generate briefing"
+        )
+
+
+@router.get("/topic-context/{topic}", response_model=TopicContextResponse)
+async def get_topic_context(
+    topic: str,
+    include_sources: Optional[str] = None,
+    current_user: User = Depends(get_current_user_required),
+    config=Depends(get_config),
+    db: Session = Depends(get_db)
+):
+    """
+    Semantic Sync: Get 360° cross-stack context for a topic/project.
+    
+    When a user mentions a project in Gmail, this endpoint pulls:
+    - Linear: Issue status, sprint position
+    - Gmail: Recent emails about this topic
+    - Slack: Team discussions
+    - Notion: Related documents
+    - Drive: Related files
+    - Calendar: Related events
+    - Keep: Notes
+    - Tasks: Related tasks
+    
+    This is the "Autonomous Glue" - not just finding data but synthesizing
+    it into actionable intelligence.
+    
+    Args:
+        topic: The topic/project to search for (e.g., "Project Alpha", "ENG-402")
+        include_sources: Comma-separated list of sources (default: all)
+    
+    Returns:
+        TopicContextResponse with synthesized 360° context
+    """
+    user_id = current_user.id
+    
+    try:
+        from src.services.proactive.cross_stack_context import CrossStackContext
+        from src.services.indexing.graph.manager import KnowledgeGraphManager
+        from src.ai.rag.core.rag_engine import RAGEngine
+        
+        # Parse include_sources
+        sources = None
+        if include_sources:
+            sources = [s.strip().lower() for s in include_sources.split(",")]
+        
+        # Initialize services
+        graph_manager = KnowledgeGraphManager(config=config)
+        rag_engine = RAGEngine(config)
+        
+        cross_stack = CrossStackContext(
+            config=config,
+            graph_manager=graph_manager,
+            rag_engine=rag_engine
+        )
+        
+        # Build topic context
+        context = await cross_stack.build_topic_context(
+            topic=topic,
+            user_id=user_id,
+            include_sources=sources
+        )
+        
+        return TopicContextResponse(
+            topic=context.get("topic", topic),
+            summary=context.get("summary", ""),
+            key_facts=context.get("key_facts", []),
+            sources=context.get("sources", {}),
+            people_involved=context.get("people_involved", []),
+            action_items=context.get("action_items", []),
+            upcoming_events=context.get("upcoming_events", []),
+            generated_at=context.get("generated_at", datetime.utcnow().isoformat())
+        )
+        
+    except Exception as e:
+        logger.error(f"[Proactive] Topic context failed for '{topic}': {e}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to build topic context: {str(e)}"
         )
 
 
@@ -224,277 +434,165 @@ async def mark_insight_shown(
     return {"status": "marked_shown", "insight_id": insight_id}
 
 
-# Helper Functions
+# ==================== Internal Helpers ====================
 
-async def _get_meeting_prep_context(
-    user_id: int,
-    hours_ahead: int,
-    config,
-    db: Session
+async def _gather_urgent_insights(response: ProactiveInsightsResponse, user_id: int):
+    """Gather urgent insights from InsightService."""
+    try:
+        from src.services.insights import get_insight_service
+        
+        insight_service = get_insight_service()
+        if insight_service:
+            urgent_insights = await insight_service.get_urgent_insights(
+                user_id=user_id,
+                max_insights=5
+            )
+            
+            for insight in urgent_insights:
+                response.urgent.append(InsightResponse(
+                    id=insight.get('id', ''),
+                    type=insight.get('type', 'info'),
+                    title=insight.get('title', 'Insight'),
+                    description=insight.get('content', ''),
+                    urgency=insight.get('urgency', 'medium'),
+                    confidence=insight.get('confidence', 0.5),
+                    timestamp=insight.get('timestamp', datetime.utcnow().isoformat()),
+                    source_node_id=insight.get('source_node_id')
+                ))
+    except Exception as e:
+        logger.warning(f"[Proactive] InsightService failed: {e}")
+
+
+async def _gather_meeting_prep(
+    context_service, 
+    user_id: int, 
+    hours_ahead: int, 
+    config, 
+    db: Session,
+    current_user: User
 ) -> List[MeetingPrepContext]:
-    """Get meeting preparation context for upcoming meetings."""
+    """Gather meeting prep using ContextService."""
     preps = []
     
     try:
-        from api.dependencies import AppState
-        from src.database.models import User, Session as DBSession
         from src.core.async_credential_provider import AsyncCredentialFactory
         
-        # Get user for credential factory
-        user = db.query(User).filter(User.id == user_id).first()
-        if not user:
-            return []
-        
-        factory = AsyncCredentialFactory(config, db, user)
+        factory = AsyncCredentialFactory(config, db, current_user)
         calendar_service = await factory.get_calendar_service()
         
         if not calendar_service:
-            return []
+            return preps
         
         # Get upcoming events
-        upcoming = await calendar_service.get_upcoming_events(limit=5)
-        
-        # Filter to events within hours_ahead
         now = datetime.utcnow()
-        cutoff = now + timedelta(hours=hours_ahead)
+        end_time = now + timedelta(hours=hours_ahead)
         
-        for event in upcoming or []:
-            start_str = event.get('start', {}).get('dateTime', '')
-            if not start_str:
-                continue
+        events = await calendar_service.get_events(
+            time_min=now.isoformat() + 'Z',
+            time_max=end_time.isoformat() + 'Z',
+            max_results=5
+        )
+        
+        for event in (events or []):
+            # Use ContextService for rich context
+            ctx = await context_service.build_meeting_context(event, user_id)
             
-            try:
-                start_time = datetime.fromisoformat(start_str.replace('Z', '+00:00'))
-                if start_time.replace(tzinfo=None) > cutoff:
-                    continue
-            except:
-                continue
-            
-            # Build context for this meeting
-            attendee_contexts = await _build_attendee_contexts(
-                attendees=event.get('attendees', []),
-                user_id=user_id,
-                config=config
-            )
-            
-            # Get related documents
-            related_docs = await _find_related_documents(
-                meeting_title=event.get('summary', ''),
-                attendee_emails=[a.get('email', '') for a in event.get('attendees', [])],
-                user_id=user_id,
-                config=config
-            )
+            attendees = [
+                AttendeeContext(
+                    email=a.get('email', ''),
+                    name=a.get('name', ''),
+                    recent_interactions=a.get('history', []),
+                    topics_discussed=a.get('topics', []),
+                    is_ooo=a.get('is_ooo', False),
+                    relationship_strength=a.get('strength', 0.0)
+                )
+                for a in ctx.get('attendees', [])
+            ]
             
             prep = MeetingPrepContext(
                 meeting_id=event.get('id', ''),
-                meeting_title=event.get('summary', 'Untitled Meeting'),
-                start_time=start_str,
-                attendees=attendee_contexts,
-                related_documents=related_docs[:5],
-                suggested_topics=_extract_suggested_topics(attendee_contexts)
+                meeting_title=event.get('summary', 'Untitled'),
+                start_time=event.get('start', {}).get('dateTime', ''),
+                attendees=attendees,
+                related_documents=ctx.get('related_documents', []),
+                suggested_topics=ctx.get('suggested_topics', [])
             )
-            
             preps.append(prep)
-        
+            
     except Exception as e:
-        logger.warning(f"[Proactive] Failed to get meeting prep: {e}")
+        logger.warning(f"[Proactive] Meeting prep failed: {e}")
     
     return preps
 
 
-async def _build_attendee_contexts(
-    attendees: List[Dict[str, Any]],
-    user_id: int,
-    config
-) -> List[AttendeeContext]:
-    """Build context for each meeting attendee."""
-    contexts = []
-    
-    try:
-        from api.dependencies import AppState
-        from src.ai.memory.person_unification import PersonUnificationService
-        
-        graph_manager = AppState.get_graph_manager()
-        if not graph_manager:
-            return contexts
-        
-        person_service = PersonUnificationService(config, graph_manager)
-        
-        for attendee in attendees[:10]:  # Limit to 10 attendees
-            email = attendee.get('email', '').lower()
-            name = attendee.get('displayName', email.split('@')[0])
-            
-            ctx = AttendeeContext(
-                email=email,
-                name=name,
-                recent_interactions=[],
-                topics_discussed=[],
-                is_ooo=False,
-                relationship_strength=0.0
-            )
-            
-            try:
-                # Find person in graph
-                person_ids = await person_service.find_all_identities(email=email)
-                
-                if person_ids:
-                    person_id = person_ids[0].get('node', {}).get('id')
-                    
-                    if person_id:
-                        # Get relationship summary
-                        summary = await person_service.get_relationship_summary(
-                            user_id=user_id,
-                            person_id=person_id
-                        )
-                        
-                        ctx.recent_interactions = summary.get('recent_interactions', [])[:3]
-                        ctx.topics_discussed = summary.get('common_topics', [])[:5]
-                        ctx.relationship_strength = summary.get('relationship_strength', 0.0)
-                        
-                        # Check OOO status
-                        ctx.is_ooo = await _check_ooo_status(email, graph_manager)
-                
-            except Exception as e:
-                logger.debug(f"[Proactive] Failed to get context for {email}: {e}")
-            
-            contexts.append(ctx)
-    
-    except Exception as e:
-        logger.warning(f"[Proactive] Failed to build attendee contexts: {e}")
-    
-    return contexts
-
-
-async def _check_ooo_status(email: str, graph_manager) -> bool:
-    """Check if a person is out of office."""
-    try:
-        query = """
-        MATCH (p:Person {email: $email})
-        RETURN p.is_ooo as is_ooo
-        """
-        result = await graph_manager.execute_query(query, {'email': email.lower()})
-        if result and len(result) > 0:
-            return result[0].get('is_ooo', False)
-    except:
-        pass
-    return False
-
-
-async def _find_related_documents(
-    meeting_title: str,
-    attendee_emails: List[str],
-    user_id: int,
-    config
-) -> List[Dict[str, Any]]:
-    """Find documents/emails related to the meeting."""
-    documents = []
-    
-    try:
-        from api.dependencies import AppState
-        
-        rag_engine = AppState.get_rag_engine()
-        if not rag_engine:
-            return []
-        
-        # Search for content related to meeting title
-        results = await rag_engine.search(
-            query=meeting_title,
-            filters={'user_id': str(user_id)},
-            top_k=5
-        )
-        
-        for result in results or []:
-            documents.append({
-                'id': result.get('id'),
-                'type': result.get('node_type', 'Document'),
-                'title': result.get('title') or result.get('subject', 'Untitled'),
-                'source': result.get('source', 'unknown'),
-                'timestamp': result.get('timestamp'),
-                'relevance_score': result.get('score', 0.0)
-            })
-        
-    except Exception as e:
-        logger.debug(f"[Proactive] Document search failed: {e}")
-    
-    return documents
-
-
-def _extract_suggested_topics(attendee_contexts: List[AttendeeContext]) -> List[str]:
-    """Extract suggested discussion topics based on attendee history."""
-    topic_counts = {}
-    
-    for ctx in attendee_contexts:
-        for topic in ctx.topics_discussed:
-            topic_counts[topic] = topic_counts.get(topic, 0) + 1
-    
-    # Sort by frequency
-    sorted_topics = sorted(topic_counts.items(), key=lambda x: x[1], reverse=True)
-    return [topic for topic, _ in sorted_topics[:5]]
-
-
-async def _get_notable_connections(user_id: int, config) -> List[Dict[str, Any]]:
-    """Get notable connections worth highlighting."""
+async def _gather_connections(context_service, user_id: int) -> List[Dict[str, Any]]:
+    """Gather notable connections using graph queries (AQL)."""
     connections = []
     
     try:
-        from api.dependencies import AppState
-        
-        graph_manager = AppState.get_graph_manager()
-        if not graph_manager:
+        if not context_service.graph_manager:
             return []
         
-        # Find strong relationships that haven't been surfaced recently
+        # AQL query for strong relationships
         query = """
-        MATCH (p1:Person)-[r:COMMUNICATES_WITH]->(p2:Person)
-        WHERE p1.user_id = $user_id
-          AND r.strength > 0.7
-          AND (r.last_surfaced IS NULL OR r.last_surfaced < datetime() - duration('P7D'))
-        RETURN p1.name as person1, p2.name as person2, 
-               r.strength as strength, r.interaction_count as interactions
-        ORDER BY r.strength DESC
-        LIMIT 5
+        FOR r IN COMMUNICATES_WITH
+            LET from_user = DOCUMENT(r._from)
+            LET to_person = DOCUMENT(r._to)
+            FILTER from_user.id == @user_id
+               AND r.strength > 0.7
+               AND (r.last_surfaced == null OR DATE_DIFF(r.last_surfaced, DATE_NOW(), 'd') > 7)
+            SORT r.strength DESC
+            LIMIT 5
+            RETURN {
+                person: to_person.name,
+                email: to_person.email,
+                strength: r.strength,
+                interactions: r.interaction_count
+            }
         """
         
-        result = await graph_manager.execute_query(query, {'user_id': user_id})
+        result = await context_service.graph_manager.execute_query(query, {'user_id': user_id})
         
         for row in result or []:
             connections.append({
                 'type': 'strong_relationship',
-                'title': f"Strong connection with {row.get('person2', 'Unknown')}",
+                'title': f"Strong connection with {row.get('person', 'Unknown')}",
+                'email': row.get('email'),
                 'description': f"You've had {row.get('interactions', 0)} interactions",
                 'strength': row.get('strength', 0.5)
             })
-        
+            
     except Exception as e:
         logger.debug(f"[Proactive] Connection search failed: {e}")
     
     return connections
 
 
-async def _get_actionable_suggestions(user_id: int, config) -> List[Dict[str, Any]]:
-    """Get actionable suggestions based on graph analysis."""
+async def _gather_suggestions(context_service, user_id: int) -> List[Dict[str, Any]]:
+    """Gather actionable suggestions using graph queries (AQL)."""
     suggestions = []
     
     try:
-        from api.dependencies import AppState
-        
-        graph_manager = AppState.get_graph_manager()
-        if not graph_manager:
+        if not context_service.graph_manager:
             return []
         
-        # Find overdue tasks
-        query = """
-        MATCH (t:ActionItem)
-        WHERE t.user_id = $user_id
-          AND t.status = 'pending'
-          AND t.due_date IS NOT NULL
-          AND t.due_date < date()
-        RETURN t.description as title, t.due_date as due_date, t.source as source
-        ORDER BY t.due_date ASC
-        LIMIT 3
+        # AQL: Find overdue tasks
+        overdue_query = """
+        FOR t IN ActionItem
+            FILTER t.user_id == @user_id
+               AND t.status == 'pending'
+               AND t.due_date != null
+               AND t.due_date < DATE_ISO8601(DATE_NOW())
+            SORT t.due_date ASC
+            LIMIT 3
+            RETURN {
+                title: t.description,
+                due_date: t.due_date,
+                source: t.source
+            }
         """
         
-        result = await graph_manager.execute_query(query, {'user_id': user_id})
+        result = await context_service.graph_manager.execute_query(overdue_query, {'user_id': user_id})
         
         for row in result or []:
             suggestions.append({
@@ -504,30 +602,35 @@ async def _get_actionable_suggestions(user_id: int, config) -> List[Dict[str, An
                 'action': 'complete_or_reschedule',
                 'source': row.get('source', 'unknown')
             })
-        
-        # Find topics with high activity that might need attention
-        query2 = """
-        MATCH (t:Topic)-[:DISCUSSES]-(content)
-        WHERE t.user_id = $user_id
-        WITH t, count(content) as activity, max(content.timestamp) as last_activity
-        WHERE activity > 5
-          AND last_activity > datetime() - duration('P7D')
-        RETURN t.name as topic, activity, last_activity
-        ORDER BY activity DESC
-        LIMIT 2
-        """
-        
-        result2 = await graph_manager.execute_query(query2, {'user_id': user_id})
-        
-        for row in result2 or []:
-            suggestions.append({
-                'type': 'active_topic',
-                'title': f"Active topic: {row.get('topic', 'Unknown')}",
-                'description': f"This topic has {row.get('activity', 0)} recent mentions",
-                'action': 'explore'
-            })
-        
+            
     except Exception as e:
         logger.debug(f"[Proactive] Suggestion generation failed: {e}")
     
     return suggestions
+
+
+async def _generate_briefing_narrative(config, user_id: int, db: Session, current_user: User) -> Optional[str]:
+    """Generate LLM briefing narrative using BriefingGenerator."""
+    try:
+        from src.core.async_credential_provider import AsyncCredentialFactory
+        
+        factory = AsyncCredentialFactory(config, db, current_user)
+        calendar_service = await factory.get_calendar_service()
+        email_service = await factory.get_email_service()
+        task_service = await factory.get_task_service()
+        
+        brief_generator = ProactiveServiceFactory.get_briefing_generator(config)
+        
+        if brief_generator:
+            result = await brief_generator.generate_briefing(
+                user_id=user_id,
+                calendar_service=calendar_service,
+                email_service=email_service,
+                task_service=task_service,
+                fast_mode=True  # Fast mode for inline narrative
+            )
+            return result.get('narrative') if isinstance(result, dict) else str(result)
+    except Exception as e:
+        logger.warning(f"[Proactive] Briefing narrative failed: {e}")
+    
+    return None
