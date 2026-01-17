@@ -227,31 +227,102 @@ class BehaviorLearner:
         pattern_type: str,
         observation_count: int
     ) -> Optional[Dict[str, Any]]:
-        """Create a PATTERN node."""
+        """Create or update a PATTERN node with proper upsert logic."""
+        
+        # Check for existing pattern with same trigger/action/user
+        existing_pattern = await self._find_existing_pattern(user_id, trigger, action)
+        
+        if existing_pattern:
+            # Update existing pattern with accumulated observation count
+            return await self._update_pattern(existing_pattern, observation_count, confidence)
         
         # Schema-compliant properties for GRAPH_PATTERN
         properties = {
-            "description": f"Pattern: {name}", # Required: description
-            "pattern_type": pattern_type,      # Required: pattern_type (e.g. 'sequential')
-            "confidence": confidence,          # Required: confidence
+            "description": f"Pattern: {name}",
+            "pattern_type": pattern_type,
+            "confidence": confidence,
             "trigger": trigger,
             "action": action,
-            "frequency": float(observation_count), # Required: frequency (float)
-            "observation_count": observation_count, # Required: observation_count (int)
+            "frequency": float(observation_count),
+            "observation_count": observation_count,
             "user_id": user_id,
             "source": "behavior_learner",
             "last_observed": datetime.now(timezone.utc).isoformat()
         }
         
         try:
-            # Upsert logic logic would be better here (e.g. update count if exists), 
-            # but for MVP we create. Assuming graph manager handles IDs or we blindly create.
-            # Ideally we check existence first.
-            
-            # Use GRAPH_PATTERN node type
             await self.graph.create_node(NodeType.GRAPH_PATTERN, properties)
-            logger.info(f"[BehaviorLearner] Learned pattern: {name} (Count: {observation_count})")
+            logger.info(f"[BehaviorLearner] Created new pattern: {name} (Count: {observation_count})")
             return properties
         except Exception as e:
             logger.error(f"[BehaviorLearner] Failed to create pattern node: {e}")
             return None
+
+    async def _find_existing_pattern(
+        self, 
+        user_id: int, 
+        trigger: str, 
+        action: str
+    ) -> Optional[Dict[str, Any]]:
+        """Find an existing pattern by trigger/action/user combination."""
+        query = """
+        FOR p IN GRAPH_PATTERN
+            FILTER p.user_id == @user_id 
+               AND p.trigger == @trigger 
+               AND p.action == @action
+            LIMIT 1
+            RETURN p
+        """
+        try:
+            results = await self.graph.execute_query(query, {
+                "user_id": user_id, 
+                "trigger": trigger, 
+                "action": action
+            })
+            return results[0] if results else None
+        except Exception as e:
+            logger.debug(f"[BehaviorLearner] Pattern lookup failed: {e}")
+            return None
+
+    async def _update_pattern(
+        self, 
+        existing: Dict[str, Any], 
+        new_observations: int,
+        new_confidence: float
+    ) -> Optional[Dict[str, Any]]:
+        """Update an existing pattern with new observation data."""
+        pattern_id = existing.get('id') or existing.get('_key')
+        old_count = existing.get('observation_count', 0)
+        updated_count = old_count + new_observations
+        
+        # Recalculate confidence based on total observations
+        updated_confidence = min(0.5 + (updated_count * 0.1), 0.95)
+        
+        query = """
+        FOR p IN GRAPH_PATTERN
+            FILTER p.id == @pattern_id OR p._key == @pattern_id
+            UPDATE p WITH {
+                observation_count: @count,
+                frequency: @frequency,
+                confidence: @confidence,
+                last_observed: @last_observed
+            } IN GRAPH_PATTERN
+            RETURN NEW
+        """
+        try:
+            results = await self.graph.execute_query(query, {
+                "pattern_id": pattern_id,
+                "count": updated_count,
+                "frequency": float(updated_count),
+                "confidence": updated_confidence,
+                "last_observed": datetime.now(timezone.utc).isoformat()
+            })
+            if results:
+                logger.info(f"[BehaviorLearner] Updated pattern: {existing.get('description')} "
+                           f"(Count: {old_count} -> {updated_count})")
+                return results[0]
+            return existing
+        except Exception as e:
+            logger.warning(f"[BehaviorLearner] Pattern update failed: {e}")
+            return existing
+

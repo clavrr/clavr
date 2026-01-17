@@ -649,3 +649,203 @@ class ActionableItem(Base):
         return f"<ActionableItem(id={self.id}, title='{self.title[:30]}...', type={self.item_type})>"
 
 
+class AutonomySettings(Base):
+    """
+    User's autonomy preferences per action type.
+    
+    Controls how the ActionExecutor handles different action types:
+    - HIGH: Execute immediately, notify after
+    - MEDIUM: Execute immediately, notify before  
+    - LOW: Queue for user approval
+    """
+    __tablename__ = 'autonomy_settings'
+    
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey('users.id'), nullable=False, index=True)
+    
+    # Action configuration
+    action_type = Column(String(50), nullable=False)  # 'calendar_event', 'email_send', etc.
+    autonomy_level = Column(String(20), default='low')  # 'high', 'medium', 'low'
+    
+    # Optional overrides
+    require_notification = Column(Boolean, default=True)
+    require_confirmation = Column(Boolean, default=False)
+    
+    # Timestamps
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+    
+    # Relationship
+    user = relationship("User", backref="autonomy_settings")
+    
+    __table_args__ = (
+        Index('idx_autonomy_user_action', 'user_id', 'action_type', unique=True),
+    )
+    
+    def __repr__(self):
+        return f"<AutonomySettings(user_id={self.user_id}, action_type='{self.action_type}', level='{self.autonomy_level}')>"
+
+
+class AutonomousAction(Base):
+    """
+    Audit log of all autonomous actions (executed, pending, rejected).
+    
+    Tracks every autonomous action taken by the system for:
+    - Audit trail and compliance
+    - User approval workflow
+    - Undo functionality (5-minute window)
+    """
+    __tablename__ = 'autonomous_actions'
+    
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey('users.id'), nullable=False, index=True)
+    
+    # Action details
+    action_type = Column(String(50), nullable=False, index=True)  # 'calendar_block', 'email_send', etc.
+    plan_data = Column(JSON, nullable=False)  # ActionPlan serialized
+    goal_id = Column(Integer, ForeignKey('agent_goals.id'), nullable=True)  # Associated goal if any
+    
+    # Status tracking
+    status = Column(String(20), default='pending', index=True)  # pending, executed, rejected, failed, undone
+    autonomy_level_used = Column(String(20))  # high/medium/low at execution time
+    
+    # Execution details
+    executed_at = Column(DateTime, nullable=True, index=True)
+    result = Column(JSON, nullable=True)  # Service response
+    error_message = Column(Text, nullable=True)
+    
+    # Approval workflow (for LOW autonomy)
+    requires_approval = Column(Boolean, default=False)
+    approved_by = Column(String(100), nullable=True)  # 'user' or 'auto' (for high)
+    approved_at = Column(DateTime, nullable=True)
+    rejection_reason = Column(Text, nullable=True)
+    
+    # Undo support (5-minute window)
+    is_undoable = Column(Boolean, default=False)
+    undo_data = Column(JSON, nullable=True)  # Data needed to reverse action (e.g., event_id)
+    undone_at = Column(DateTime, nullable=True)
+    undo_expires_at = Column(DateTime, nullable=True)  # When undo window closes
+    
+    # Notification tracking
+    notification_sent = Column(Boolean, default=False)
+    notification_channel = Column(String(50), nullable=True)  # 'email', 'push', 'in_app'
+    notification_sent_at = Column(DateTime, nullable=True)
+    
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False, index=True)
+    
+    # Relationships
+    user = relationship("User", backref="autonomous_actions")
+    goal = relationship("AgentGoal", backref="autonomous_actions")
+    
+    __table_args__ = (
+        Index('idx_action_user_status', 'user_id', 'status'),
+        Index('idx_action_pending_approval', 'user_id', 'status', 'requires_approval'),
+        Index('idx_action_undoable', 'user_id', 'is_undoable', 'undo_expires_at'),
+    )
+    
+    def __repr__(self):
+        return f"<AutonomousAction(id={self.id}, type='{self.action_type}', status='{self.status}')>"
+    
+    def is_undo_available(self) -> bool:
+        """Check if this action can still be undone."""
+        if not self.is_undoable or self.status != 'executed':
+            return False
+        if not self.undo_expires_at:
+            return False
+        return datetime.utcnow() < self.undo_expires_at
+
+
+class InAppNotification(Base):
+    """
+    In-app notifications for users.
+    
+    Stores notifications that are displayed in the app UI, including:
+    - Action execution notifications
+    - Approval requests
+    - System alerts
+    """
+    __tablename__ = 'in_app_notifications'
+    
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey('users.id'), nullable=False, index=True)
+    
+    # Notification content
+    title = Column(String(255), nullable=False)
+    message = Column(Text, nullable=False)
+    notification_type = Column(String(50), nullable=False, index=True)  # 'action_executed', 'approval_needed', 'action_undone', 'system'
+    
+    # Priority and display
+    priority = Column(String(20), default='normal')  # 'low', 'normal', 'high', 'urgent'
+    icon = Column(String(50), nullable=True)  # Icon identifier (e.g., 'calendar', 'email', 'task')
+    
+    # Action link (for actionable notifications)
+    action_url = Column(String(500), nullable=True)  # Deep link or URL
+    action_label = Column(String(100), nullable=True)  # e.g., "View Event", "Approve", "Undo"
+    
+    # Related entities
+    related_action_id = Column(Integer, ForeignKey('autonomous_actions.id'), nullable=True)
+    
+    # Status
+    is_read = Column(Boolean, default=False, index=True)
+    is_dismissed = Column(Boolean, default=False, index=True)
+    read_at = Column(DateTime, nullable=True)
+    dismissed_at = Column(DateTime, nullable=True)
+    
+    # Timestamps
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False, index=True)
+    expires_at = Column(DateTime, nullable=True)  # Auto-dismiss after this time
+    
+    # Relationships
+    user = relationship("User", backref="notifications")
+    related_action = relationship("AutonomousAction", backref="notifications")
+    
+    __table_args__ = (
+        Index('idx_notification_user_unread', 'user_id', 'is_read', 'is_dismissed'),
+        Index('idx_notification_type', 'user_id', 'notification_type'),
+    )
+    
+    def __repr__(self):
+        return f"<InAppNotification(id={self.id}, user_id={self.user_id}, type='{self.notification_type}', read={self.is_read})>"
+    
+    def mark_read(self):
+        """Mark notification as read."""
+        self.is_read = True
+        self.read_at = datetime.utcnow()
+    
+    def dismiss(self):
+        """Dismiss notification."""
+        self.is_dismissed = True
+        self.dismissed_at = datetime.utcnow()
+
+
+class GhostDraft(Base):
+    """
+    Persistent storage for Ghost drafts (Proactive suggestions).
+    Allows user to review/approve/edit before posting to Linear/Asana.
+    """
+    __tablename__ = 'ghost_drafts'
+    
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey('users.id'), nullable=False, index=True)
+    
+    # Draft Content
+    title = Column(String(255), nullable=False)
+    description = Column(Text)
+    status = Column(String(50), default='draft', index=True) # draft, approved, dismissed, posted
+    
+    # Metadata
+    source_channel = Column(String(100))
+    source_thread_ts = Column(String(100), index=True)
+    integration_type = Column(String(50), default='linear') # linear, asana, github
+    
+    # Synthesis metadata
+    confidence = Column(Float, default=0.0)
+    summary = Column(Text)
+    
+    # Resulting entity (if posted)
+    resolved_entity_id = Column(String(255), nullable=True)
+    
+    created_at = Column(DateTime, default=datetime.utcnow, index=True)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    
+    user = relationship("User", backref="ghost_drafts")

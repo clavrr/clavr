@@ -11,8 +11,10 @@ from dataclasses import dataclass, field
 from enum import Enum
 import re
 from datetime import datetime
+from dateutil import parser as date_parser
 
 from ....utils.logger import setup_logger
+from src.services.service_constants import ServiceConstants
 
 logger = setup_logger(__name__)
 
@@ -88,11 +90,14 @@ class HallucinationChecker:
         
         # Adjust thresholds based on strictness
         if strictness == "strict":
-            self.BLOCK_THRESHOLD = 0.6
-            self.WARN_THRESHOLD = 0.3
+            self.BLOCK_THRESHOLD = ServiceConstants.HALLUCINATION_BLOCK_THRESHOLD_STRICT
+            self.WARN_THRESHOLD = ServiceConstants.HALLUCINATION_WARN_THRESHOLD_STRICT
         elif strictness == "lenient":
-            self.BLOCK_THRESHOLD = 0.9
-            self.WARN_THRESHOLD = 0.7
+            self.BLOCK_THRESHOLD = ServiceConstants.HALLUCINATION_BLOCK_THRESHOLD_LENIENT
+            self.WARN_THRESHOLD = ServiceConstants.HALLUCINATION_WARN_THRESHOLD_LENIENT
+        else:
+            self.BLOCK_THRESHOLD = ServiceConstants.HALLUCINATION_BLOCK_THRESHOLD_NORMAL
+            self.WARN_THRESHOLD = ServiceConstants.HALLUCINATION_WARN_THRESHOLD_NORMAL
         
         logger.info(
             f"HallucinationChecker initialized (strictness={strictness}, "
@@ -313,9 +318,16 @@ class HallucinationChecker:
                 claim_num = self._parse_number(claim_value)
                 fact_num = self._parse_number(fact_value)
                 
-                if claim_num and fact_num and claim_num != fact_num:
-                    # Allow 5% tolerance for rounding
-                    if abs(claim_num - fact_num) / max(claim_num, fact_num) > 0.05:
+                if claim_num is not None and fact_num is not None and claim_num != fact_num:
+                    # Allow tolerance for rounding
+                    tolerance = ServiceConstants.HALLUCINATION_NUMERICAL_TOLERANCE
+                    denominator = max(abs(claim_num), abs(fact_num))
+                    
+                    # Handle zero case
+                    if denominator == 0:
+                         # Both are zero (covered by claim_num != fact_num check above, but safe to check)
+                         pass
+                    elif abs(claim_num - fact_num) / denominator > tolerance:
                         return Contradiction(
                             type=ContradictionType.NUMERICAL,
                             response_claim=claim.get('text', ''),
@@ -325,9 +337,26 @@ class HallucinationChecker:
                         )
             
             elif claim_type == 'temporal':
-                # Date contradiction checking would need date parsing
-                # For now, flag if dates look very different
-                pass
+                # Date contradiction checking
+                try:
+                    search_dt = date_parser.parse(claim_value, fuzzy=True, default=datetime.utcnow())
+                    fact_dt = date_parser.parse(fact_value, fuzzy=True, default=datetime.utcnow())
+                    
+                    # Compare only if we have high confidence they are the same type of date (ignoring time for now)
+                    if search_dt.date() != fact_dt.date():
+                        # Basic check: if they are wildly different (more than 2 days)
+                        diff_days = abs((search_dt.date() - fact_dt.date()).days)
+                        if diff_days > 2:
+                             return Contradiction(
+                                type=ContradictionType.TEMPORAL,
+                                response_claim=claim.get('text', ''),
+                                graph_fact=f"Date in context: {fact['value']}",
+                                entity='date',
+                                confidence=0.7
+                            )
+                except Exception:
+                    # Date parsing failed, skip
+                    pass
         
         return None
     

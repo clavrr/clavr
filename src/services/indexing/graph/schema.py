@@ -120,6 +120,10 @@ class NodeType(str, Enum):
     
     # NEW: Business Intelligence types
     LEAD = "Lead"  # Potential business opportunity
+    
+    # NEW: Third-party integration types
+    LINEAR_ISSUE = "LinearIssue"
+    GOOGLE_TASK = "GoogleTask"
 
 
 class RelationType(str, Enum):
@@ -223,6 +227,9 @@ class RelationType(str, Enum):
     
     # NEW: Business Intelligence relationships
     INTERESTED_IN = "INTERESTED_IN"  # Lead INTERESTED_IN Topic/Project
+    
+    # NEW: Relationship Intelligence (for RelationshipGardener)
+    COMMUNICATES_WITH = "COMMUNICATES_WITH"  # User COMMUNICATES_WITH Person (tracks interaction strength)
 
 
 class ValidationResult(BaseModel):
@@ -288,6 +295,9 @@ class GraphSchema:
         NodeType.IDENTITY: {"type", "value"},  # type: email, phone, slack; value: the actual address/number
         # NEW: Business Intelligence
         NodeType.LEAD: {"name", "source"},
+        # NEW: Third-party integrations
+        NodeType.LINEAR_ISSUE: {"id", "identifier", "title", "state", "user_id"},
+        NodeType.GOOGLE_TASK: {"id", "title", "status", "user_id"},
     }
     
     # Optional properties for each node type
@@ -348,7 +358,7 @@ class GraphSchema:
             "description", "status", "created_at", "updated_at"
         },
         NodeType.INSIGHT: {
-            "created_at", "source", "actionable"
+            "created_at", "source", "actionable", "user_id", "subtype", "topic", "reasoning_chain"
         },
         NodeType.SUMMARY: {
             "created_at", "user_id", "source", "item_count", "key_topics",
@@ -373,10 +383,11 @@ class GraphSchema:
         # NEW: Reasoning types
         NodeType.GRAPH_PATTERN: {
             "pattern_type", "trigger", "action", "last_observed", "observation_count", 
-            "user_id", "source"
+            "user_id", "source", "description", "confidence", "frequency", "created_at"
         },
         NodeType.HYPOTHESIS: {
-            "confidence", "reasoning", "created_at", "verified_at", "user_id", "source_agent"
+            "confidence", "reasoning", "created_at", "verified_at", "user_id", "source_agent",
+            "statement", "status"
         },
         # NEW: Identity resolution
         NodeType.IDENTITY: {
@@ -386,6 +397,13 @@ class GraphSchema:
         NodeType.LEAD: {
             "interest_level", "potential_value", "last_contacted", "user_id", "email",
             "company", "notes", "last_email_id", "created_at"
+        },
+        # NEW: Third-party integrations
+        NodeType.LINEAR_ISSUE: {
+            "description", "priority", "dueDate", "url", "synced_at", "labels"
+        },
+        NodeType.GOOGLE_TASK: {
+            "notes", "due", "completed", "updated", "tasklist_id", "synced_at"
         },
     }
     
@@ -530,7 +548,7 @@ class GraphSchema:
         # Insight properties
         "content": PropertyType.STRING,
         "type": PropertyType.STRING,
-        "type": PropertyType.STRING,
+        "subtype": PropertyType.STRING,
         "actionable": PropertyType.BOOLEAN,
         "reasoning_chain": PropertyType.STRING,  # Explanation for why this insight exists
         
@@ -673,6 +691,8 @@ class GraphSchema:
             RelationType.LOCATED_AT: {NodeType.LOCATION},
             # Identity resolution - User KNOWS Person (with aliases property)
             RelationType.KNOWS: {NodeType.PERSON, NodeType.CONTACT},
+            # Relationship tracking (for RelationshipGardener)
+            RelationType.COMMUNICATES_WITH: {NodeType.PERSON, NodeType.CONTACT},
         },
         NodeType.CALENDAR_EVENT: {
             RelationType.ATTENDED_BY: {NodeType.PERSON, NodeType.CONTACT},

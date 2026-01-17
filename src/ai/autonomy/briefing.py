@@ -96,10 +96,29 @@ class BriefingGenerator:
             try:
                 # Wrap sync calls
                 overdue_future = asyncio.to_thread(task_service.get_overdue_tasks, limit=5, fast_mode=fast_mode)
-                # TODO: add pending high priority if API supports it
-                # For now just overdue is critical
+                
+                # Fetch high priority pending tasks if API supports it
+                high_priority_future = None
+                if hasattr(task_service, 'get_high_priority_tasks'):
+                    high_priority_future = asyncio.to_thread(
+                        task_service.get_high_priority_tasks, 
+                        limit=5, 
+                        status='pending'
+                    )
+                
+                # Await overdue first
                 overdue = await overdue_future or []
                 tasks.extend(overdue)
+                
+                # Await high priority if available
+                if high_priority_future:
+                    high_priority = await high_priority_future or []
+                    # Deduplicate by task ID
+                    existing_ids = {t.get('id') for t in tasks if isinstance(t, dict)}
+                    for t in high_priority:
+                        if isinstance(t, dict) and t.get('id') not in existing_ids:
+                            tasks.append(t)
+                            
             except Exception as e:
                 logger.warning(f"Briefing context - Tasks failed: {e}")
 
@@ -119,11 +138,42 @@ class BriefingGenerator:
             except Exception as e:
                 logger.warning(f"Briefing context - Emails failed: {e}")
             
+        # --- 4. Ghost drafts ---
+        ghost_drafts = []
+        try:
+            from api.dependencies import AppState
+            brief_svc = AppState.get_brief_service()
+            if brief_svc:
+                ghost_drafts = await brief_svc._get_ghost_drafts(user_id)
+        except Exception as e:
+            logger.debug(f"Briefing context - Ghost drafts failed: {e}")
+
+        # --- 5. Project Synthesis (Cross-Stack) ---
+        project_narratives = []
+        try:
+            from api.dependencies import AppState
+            cross_stack = AppState.get_cross_stack_context()
+            if cross_stack:
+                # Use the new advanced heuristic to find active projects
+                active_projects = await cross_stack.get_active_projects(user_id, limit=2)
+                for project_name in active_projects:
+                    # Build a full 360-degree context for each active project
+                    synthesis = await cross_stack.build_topic_context(project_name, user_id)
+                    if synthesis and synthesis.get("summary"):
+                        project_narratives.append({
+                            "project": project_name,
+                            "summary": synthesis["summary"]
+                        })
+        except Exception as e:
+            logger.debug(f"Briefing context - Project synthesis failed: {e}")
+
         return {
             "datetime": now_utc.isoformat(), # Use UTC in context
             "events": events,
             "tasks": tasks,
-            "emails": emails
+            "emails": emails,
+            "ghost_drafts": ghost_drafts,
+            "project_narratives": project_narratives
         }
         
     async def _generate_narrative(self, context: Dict[str, Any]) -> str:
@@ -163,6 +213,12 @@ class BriefingGenerator:
             
             EMAILS (Unread Important):
             {emails_msg}
+            
+            GHOST SUGGESTIONS (Action needed):
+            {chr(10).join([f"- [DRAFT] {d['title']} (Source: {d.get('source_channel', 'Slack')})" for d in context.get('ghost_drafts', [])]) or "None"}
+
+            PROJECT SYNTHESIS (Recent activity & context):
+            {chr(10).join([f"### {p['project']}\n{p['summary']}" for p in context.get('project_narratives', [])]) or "No active project narratives found."}
             """
             
             # Use centralized Prompt
@@ -246,11 +302,12 @@ class MeetingBriefGenerator:
             facts = []
             if semantic_memory:
                  try:
-                     # Inefficient scan for MVP; ideally vector search
-                     user_facts = await semantic_memory.get_facts(user_id, limit=50)
-                     facts = [f['content'] for f in user_facts if email in f['content'] or att.get('displayName', '') in f['content']]
-                 except Exception:
-                     pass
+                     # Use targeted search instead of full scan
+                     search_query = f"Context about {att.get('displayName', email)} ({email})"
+                     user_facts = await semantic_memory.search_facts(search_query, user_id, limit=10)
+                     facts = [f['content'] for f in user_facts]
+                 except Exception as e:
+                     logger.debug(f"Briefing context - Semantic Memory search failed for {email}: {e}")
             
             # B. Search Emails (Sync Call Wrapped)
             recent_emails = []

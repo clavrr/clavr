@@ -9,52 +9,59 @@ import logging
 
 from .base import BaseIngestor
 from ...indexing.graph import NodeType, RelationType
+from ...integrations.asana.service import AsanaService
 
 logger = logging.getLogger(__name__)
 
 class AsanaIngestor(BaseIngestor):
     
+    def __init__(self, graph_manager, config, asana_service: Optional[AsanaService] = None):
+        super().__init__(graph_manager, config)
+        self.asana_service = asana_service
+
     async def fetch_delta(self, last_sync_time: Optional[datetime]) -> List[Any]:
         """
-        Fetch changed tasks from Asana API.
-        
-        NOTE: In this MVP, we will mock the API call or use the existing 
-        AsanaService if available. For safety, we'll return a mocked list 
-        demonstrating the data structure.
+        Fetch changed tasks and projects from Asana API.
         """
-        # In real impl: application_service.get_tasks_modified_since(last_sync_time)
-        
-        # Mock Data Structure
-        mock_tasks = [
-            {
-                "gid": "1200", 
-                "name": "Finalize Q4 Strategy", 
-                "assignee": {"gid": "user_1", "email": "me@company.com", "name": "Me"},
-                "projects": [{"gid": "proj_1", "name": "Strategy 2025"}],
-                "completed": False,
-                "due_on": "2025-12-20"
-            },
-            {
-                "gid": "1205", 
-                "name": "Design New Homepage", 
-                "assignee": {"gid": "user_2", "email": "designer@company.com", "name": "Alice Design"},
-                "projects": [{"gid": "proj_2", "name": "Website Redesign"}],
-                "completed": True,
-                "due_on": "2025-12-15"
-            }
-        ]
-        return mock_tasks
+        if not self.asana_service:
+            logger.warning("[AsanaIngestor] AsanaService not provided. Ensure it is initialized with user credentials.")
+            return []
+            
+        try:
+            # Fetch recently modified tasks
+            tasks = await asyncio.to_thread(
+                self.asana_service.list_tasks,
+                limit=100
+            )
+            
+            # Enrich tasks with project info
+            enriched_items = []
+            for task in tasks:
+                task['_item_type'] = 'task'
+                enriched_items.append(task)
+                
+            # Fetch projects
+            projects = await asyncio.to_thread(
+                self.asana_service.list_projects,
+                limit=50
+            )
+            for project in projects:
+                project['_item_type'] = 'project'
+                enriched_items.append(project)
+                
+            return enriched_items
+        except Exception as e:
+            logger.error(f"[AsanaIngestor] Failed to fetch data: {e}")
+            return []
 
     async def ingest_item(self, item: Any) -> None:
-        """
-        Maps an Asana Task to Graph Nodes:
-        Task -> (:ActionItem)
-        Assignee -> (:Person)
-        Project -> (:Project)
-        """
-        task_id = f"asana:{item['gid']}"
-        task_name = item['name']
-        is_completed = item['completed']
+        if item.get('_item_type') == 'project':
+            await self._ingest_project(item)
+            return
+
+        task_id = f"asana:{item.get('gid', item.get('id'))}"
+        task_name = item.get('name', item.get('title'))
+        is_completed = item.get('status') == 'completed' or item.get('completed', False)
         status = "completed" if is_completed else "active"
         
         # 1. Create ActionItem Node
@@ -107,8 +114,8 @@ class AsanaIngestor(BaseIngestor):
 
         # 3. Link Project
         for proj in item.get('projects', []):
-            proj_id = f"asana_proj:{proj['gid']}"
-            proj_name = proj['name']
+            proj_id = f"asana_proj:{proj.get('gid', proj.get('id'))}"
+            proj_name = proj.get('name')
             
             # Create Project Node (Idempotent)
             await self.graph.add_node(
@@ -116,16 +123,15 @@ class AsanaIngestor(BaseIngestor):
                 node_type=NodeType.PROJECT,
                 properties={
                     "name": proj_name,
-                    "status": "active" # Assume active if task is attached
+                    "status": "active"
                 }
             )
             
             # Link: ActionItem -[PART_OF]-> Project
-            # Schema checking: Task PART_OF Project
             await self.graph.add_relationship(
                 source_id=task_id,
                 target_id=proj_id,
-                rel_type=RelationType.PART_OF, # Assuming PART_OF exists in schema for Task->Project
+                rel_type=RelationType.PART_OF,
                 properties={}
             )
             
@@ -137,3 +143,16 @@ class AsanaIngestor(BaseIngestor):
                     rel_type=RelationType.WORKS_ON,
                     properties={}
                 )
+
+    async def _ingest_project(self, item: Any) -> None:
+        """Process Asana Project node."""
+        proj_id = f"asana_proj:{item.get('gid', item.get('id'))}"
+        await self.graph.add_node(
+            node_id=proj_id,
+            node_type=NodeType.PROJECT,
+            properties={
+                "name": item.get('name'),
+                "status": "active",
+                "source": "asana"
+            }
+        )

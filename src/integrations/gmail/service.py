@@ -55,12 +55,14 @@ class EmailService:
         try:
             from ..utils import FlexibleDateParser
             self.date_parser = FlexibleDateParser(self.config)
-        except Exception: pass
+        except Exception as e:
+            logger.debug(f"[EMAIL_SERVICE] FlexibleDateParser not available: {e}")
         
         try:
             from ..ai.llm_factory import LLMFactory
             self.llm_client = LLMFactory.get_llm_for_provider(self.config, temperature=0.1)
-        except Exception: pass
+        except Exception as e:
+            logger.debug(f"[EMAIL_SERVICE] LLM client not available: {e}")
 
     def _init_gmail_client(self):
         try:

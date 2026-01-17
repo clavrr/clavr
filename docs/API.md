@@ -23,12 +23,15 @@ Complete API reference for the Clavr Intelligent Email AI Agent platform.
    - [Admin Endpoints](#admin-endpoints)
    - [Data Export (GDPR)](#data-export-gdpr)
    - [Webhooks](#webhooks)
-   - [Knowledge Graph](#knowledge-graph)
-   - [Gmail Push Notifications](#gmail-push-notifications)
-   - [Voice Interactions](#voice-interactions-disabled)
-4. [Request/Response Models](#requestresponse-models)
-5. [Error Handling](#error-handling)
-6. [Rate Limiting](#rate-limiting)
+4. [Ghost Collaborator](#ghost-collaborator)
+5. [Proactive Insights](#proactive-insights)
+6. [Relationship Analytics](#relationship-analytics)
+7. [Knowledge Graph](#knowledge-graph)
+8. [Gmail Push Notifications](#gmail-push-notifications)
+9. [Voice Interactions](#voice-interactions)
+10. [Request/Response Models](#requestresponse-models)
+11. [Error Handling](#error-handling)
+12. [Rate Limiting](#rate-limiting)
 
 ---
 
@@ -1634,6 +1637,165 @@ Get webhook delivery history.
 
 ---
 
+### Ghost Collaborator
+
+The Ghost Collaborator proactively drafts issues and tasks based on your conversations in Slack and other integrations.
+
+#### `GET /api/ghost/drafts`
+
+List all pending drafts for the Ghost Collaborator.
+
+**Authentication:** Required
+
+**Response:**
+```json
+[
+  {
+    "id": 1,
+    "title": "[Integrate] Draft Title",
+    "description": "Draft description from Slack thread...",
+    "status": "draft",
+    "integration_type": "linear",
+    "confidence": 0.95,
+    "source": "#project-alpha",
+    "created_at": "2024-01-01T12:00:00Z"
+  }
+]
+```
+
+---
+
+#### `POST /api/ghost/drafts/{draft_id}/approve`
+
+Approve a draft and post it to the respective integration (e.g., Linear).
+
+**Authentication:** Required
+
+**Response:**
+```json
+{
+  "status": "success",
+  "entity_id": "LNR-123",
+  "message": "Issue posted to Linear"
+}
+```
+
+---
+
+#### `POST /api/ghost/drafts/{draft_id}/dismiss`
+
+Dismiss a draft suggestion.
+
+**Authentication:** Required
+
+**Response:**
+```json
+{
+  "status": "success",
+  "message": "Draft dismissed"
+}
+```
+
+---
+
+### Proactive Insights
+
+Real-time intelligent situational awareness and cross-stack synthesis.
+
+#### `GET /api/proactive/insights`
+
+Get urgent insights, meeting preparation, and connection suggestions.
+
+**Authentication:** Required
+
+**Query Parameters:**
+- `hours_ahead` (int, default: 4) - Lookahead window for meetings.
+- `include_narrative` (bool, default: false) - Generate a rich LLM briefing.
+
+**Response:**
+```json
+{
+  "urgent": [...],
+  "meeting_prep": [...],
+  "connections": [...],
+  "suggestions": [...],
+  "briefing_narrative": "Good morning John...",
+  "timestamp": "2024-01-01T12:00:00Z"
+}
+```
+
+---
+
+#### `GET /api/proactive/meeting-prep/{meeting_id}`
+
+Get detailed preparation context for a specific meeting, including attendee history and related docs.
+
+**Authentication:** Required
+
+---
+
+#### `GET /api/proactive/briefing`
+
+Get a full morning briefing with AI-generated narrative and unified reminders (including Ghost drafts).
+
+**Authentication:** Required
+
+---
+
+#### `GET /api/proactive/topic-context/{topic}`
+
+**Semantic Sync**: Get 360° cross-stack context for a project or topic. Synthesizes data from Linear, Gmail, Slack, Notion, and Drive.
+
+**Authentication:** Required
+
+**Example Request:** `GET /api/proactive/topic-context/Project-Alpha`
+
+**Response:**
+```json
+{
+  "topic": "Project Alpha",
+  "summary": "Project Alpha is currently in phase 2...",
+  "key_facts": ["Deadline: Friday", "Lead: Jane Doe"],
+  "sources": {
+    "linear": [...],
+    "gmail": [...],
+    "notion": [...]
+  },
+  "action_items": [...],
+  "generated_at": "2024-01-01T12:00:00Z"
+}
+```
+
+---
+
+### Relationship Analytics
+
+Graph-driven communication and network analysis.
+
+#### `GET /api/analytics/relationships`
+
+Get top contacts by interaction frequency and relationship strength.
+
+**Authentication:** Required
+
+---
+
+#### `GET /api/analytics/topics`
+
+Get trending topics, clusters, and activity velocity.
+
+**Authentication:** Required
+
+---
+
+#### `GET /api/analytics/report`
+
+Comprehensive full analytics report (Relationships + Topics + Temporal + Cross-App).
+
+**Authentication:** Required
+
+---
+
 ### Knowledge Graph
 
 Knowledge graph and GraphRAG endpoints for advanced analytics.
@@ -1880,18 +2042,6 @@ Health check endpoint for Gmail push notifications.
 
 ---
 
-### Voice Interactions (Disabled)
-
-Voice functionality is currently disabled but will be re-enabled in a future update. The following endpoints are not available:
-
-- `GET /api/voice/status`
-- `POST /api/voice/introduction`
-- `POST /api/voice/chat`
-- `POST /api/voice/text-to-speech`
-- `GET /api/voice/voices`
-- `POST /api/voice/config`
-- `GET /api/voice/sessions/{session_id}`
-- `DELETE /api/voice/sessions/{session_id}`
 - `WebSocket /api/voice/ws/{session_id}`
 
 When re-enabled, these endpoints will provide:

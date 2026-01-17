@@ -151,19 +151,26 @@ class ContextService:
             return ""
 
         # Execute parallel tasks
-        fetch_results = await asyncio.gather(
-            fetch_history(),
-            fetch_entities(),
-            fetch_prefs(),
-            fetch_graph_context(),
-            return_exceptions=True
-        )
+        retrieval_tasks = {
+            "conversation_context": fetch_history(),
+            "entity_context": fetch_entities(),
+            "semantic_context": fetch_prefs(),
+            "graph_context": fetch_graph_context()
+        }
         
-        # Unwrap results
-        if not isinstance(fetch_results[0], Exception): results["conversation_context"] = fetch_results[0]
-        if not isinstance(fetch_results[1], Exception): results["entity_context"] = fetch_results[1]
-        if not isinstance(fetch_results[2], Exception): results["semantic_context"] = fetch_results[2]
-        if not isinstance(fetch_results[3], Exception): results["graph_context"] = fetch_results[3]
+        task_names = list(retrieval_tasks.keys())
+        task_coros = list(retrieval_tasks.values())
+        
+        fetch_results = await asyncio.gather(*task_coros, return_exceptions=True)
+        
+        # Process results with keyed mapping
+        for name, result in zip(task_names, fetch_results):
+            if isinstance(result, Exception):
+                logger.warning(f"[ContextService] {name} fetch failed: {result}")
+                continue
+            
+            if result:
+                results[name] = result
         
         return results
 

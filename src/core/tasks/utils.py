@@ -14,9 +14,7 @@ from ...utils.logger import setup_logger
 logger = setup_logger(__name__)
 
 
-# ============================================================================
 # JSON STORAGE UTILITIES
-# ============================================================================
 
 def load_json_file(file_path: Path, default_value: List = None) -> List[Dict[str, Any]]:
     """

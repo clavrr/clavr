@@ -10,6 +10,8 @@ import sys
 # Add project root to path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
+import argparse
+
 # Load environment variables
 from dotenv import load_dotenv
 load_dotenv()
@@ -18,9 +20,9 @@ from src.utils.logger import setup_logger
 
 logger = setup_logger(__name__)
 
-async def diagnose():
+async def diagnose(user_id: int = 7):
     print("\n" + "="*60)
-    print("EMAIL SEARCH DIAGNOSTIC")
+    print(f"EMAIL SEARCH DIAGNOSTIC (User ID: {user_id})")
     print("="*60)
     
     # ============================================================
@@ -83,18 +85,18 @@ async def diagnose():
         from src.database.database import SessionLocal
         from src.database.models import User, UserIntegration
         from src.core.credential_provider import CredentialProvider
-        from src.integrations.gmail.client import GoogleGmailClient
+        from src.core.email.google_client import GoogleGmailClient
         
         db = SessionLocal()
         
-        # Get user 7's Gmail credentials
+        # Get user's Gmail credentials
         integration = db.query(UserIntegration).filter(
-            UserIntegration.user_id == 7,
+            UserIntegration.user_id == user_id,
             UserIntegration.provider == 'gmail'
         ).first()
         
         if integration:
-            print(f"   ✓ Gmail integration found for user 7")
+            print(f"   ✓ Gmail integration found for user {user_id}")
             
             # Get credentials
             cred_provider = CredentialProvider(config, integration.user_id)
@@ -208,7 +210,7 @@ async def diagnose():
         
         db = SessionLocal()
         
-        states = db.query(IndexState).filter(IndexState.user_id == 7).all()
+        states = db.query(IndexState).filter(IndexState.user_id == user_id).all()
         for state in states:
             print(f"   {state.provider}: last_sync={state.last_sync_at}, cursor={state.cursor_value}")
             
@@ -222,4 +224,8 @@ async def diagnose():
     print("="*60)
 
 if __name__ == "__main__":
-    asyncio.run(diagnose())
+    parser = argparse.ArgumentParser(description="Diagnose email search issues")
+    parser.add_argument("--user-id", type=int, default=7, help="User ID to diagnose (default: 7)")
+    args = parser.parse_args()
+    
+    asyncio.run(diagnose(user_id=args.user_id))

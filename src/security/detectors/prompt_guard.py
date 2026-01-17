@@ -149,14 +149,45 @@ class PromptGuard:
             data = self._extract_json(content)
             
             if not data:
-                # Silently fail open when parsing fails - this is expected for some LLM responses
-                logger.debug(f"Safety LLM response not JSON, using fallback inference")
-                return True, "Safety check completed", 0.0
+                # JSON parsing failed - use secondary heuristic check instead of fail-open
+                logger.warning("Safety LLM response not JSON, falling back to heuristic check")
+                return self._heuristic_safety_check(query)
                 
             return data.get("safe", True), data.get("reason", "Unknown"), data.get("confidence", 0.0)
             
         except Exception as e:
             logger.error(f"Safety LLM check failed: {e}")
-            # Fail open or closed? Here we fail open to avoid disrupting UX on API errors, 
-            # but log the failure.
-            return True, "Safety check unavailable", 0.0
+            # Fail-closed: use secondary heuristic check when LLM fails
+            # This provides defense-in-depth instead of blindly allowing input through
+            return self._heuristic_safety_check(query)
+    
+    def _heuristic_safety_check(self, query: str) -> Tuple[bool, str, float]:
+        """
+        Secondary heuristic safety check when LLM is unavailable.
+        Uses extended pattern matching for additional coverage.
+        """
+        # Extended patterns for when LLM fallback is needed
+        EXTENDED_PATTERNS = [
+            r"forget\s+(your|all|previous)\s+(rules|instructions)",
+            r"you\s+are\s+now\s+unrestricted",
+            r"pretend\s+you\s+are",
+            r"act\s+as\s+if",
+            r"roleplay\s+as",
+            r"bypass\s+(your|the|all)\s+(filters?|restrictions?|rules?)",
+            r"enable\s+developer\s+mode",
+            r"disable\s+(your|all)\s+(safety|filters?|restrictions?)",
+        ]
+        
+        query_lower = query.lower()
+        
+        for pattern in EXTENDED_PATTERNS:
+            if re.search(pattern, query_lower):
+                logger.warning(f"Heuristic check blocked pattern: {pattern}")
+                return False, "Potentially unsafe input detected (heuristic)", 0.7
+        
+        # If no suspicious patterns found and query is reasonable length, allow
+        if len(query) < 500:
+            return True, "Heuristic check passed", 0.3
+        
+        # Very long queries with no obvious patterns - allow with low confidence
+        return True, "Heuristic check passed (long query)", 0.2

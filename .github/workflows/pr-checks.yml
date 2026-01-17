@@ -1,0 +1,207 @@
+# Pull Request Checks
+name: PR Checks
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+
+env:
+  PYTHON_VERSION: '3.9'
+
+jobs:
+  # Job 1: PR Validation
+  pr-validation:
+    name: PR Validation
+    runs-on: ubuntu-latest
+    if: github.event.pull_request.draft == false
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+    
+    - name: Check PR title
+      run: |
+        PR_TITLE="${{ github.event.pull_request.title }}"
+        echo "PR Title: $PR_TITLE"
+        
+        # Check if PR title follows conventional commits
+        if [[ "$PR_TITLE" =~ ^(feat|fix|docs|style|refactor|perf|test|chore|ci|build|revert)(\(.+\))?: .+ ]]; then
+          echo "PR title follows conventional commits format"
+        else
+          echo "PR title should follow conventional commits format"
+          echo "Examples: feat: add webhook support, fix: resolve import error"
+        fi
+    
+    - name: Check for breaking changes
+      run: |
+        if git diff origin/${{ github.base_ref }}...HEAD --name-only | grep -E '(models|database|api/routers)'; then
+          echo "Changes detected in critical files - ensure backward compatibility"
+          echo "Modified files:"
+          git diff origin/${{ github.base_ref }}...HEAD --name-only | grep -E '(models|database|api/routers)' || true
+        fi
+    
+    - name: Check file sizes
+      run: |
+        # Check for large files (>1MB)
+        large_files=$(find . -type f -size +1M -not -path "./.git/*" -not -path "./venv/*" -not -path "./.venv/*" 2>/dev/null || true)
+        if [ -n "$large_files" ]; then
+          echo "Large files detected:"
+          echo "$large_files"
+        else
+          echo "No large files detected"
+        fi
+    
+    - name: Check for secrets
+      run: |
+        # Basic check for common secret patterns
+        if git diff origin/${{ github.base_ref }}...HEAD | grep -iE '(api[_-]?key|password|secret|token|auth[_-]?token).*=.*["\047][^"\047]{20,}["\047]'; then
+          echo "Potential secrets detected in diff - please review"
+        else
+          echo "No obvious secrets detected"
+        fi
+
+  # Job 2: Changed Files Analysis
+  changed-files:
+    name: Analyze Changed Files
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+    
+    - name: Get changed files
+      id: changed-files
+      run: |
+        echo "## 📝 Changed Files" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        
+        # Count changes by type
+        python_files=$(git diff --name-only origin/${{ github.base_ref }}...HEAD | grep '\.py$' | wc -l)
+        test_files=$(git diff --name-only origin/${{ github.base_ref }}...HEAD | grep 'test_.*\.py$' | wc -l)
+        doc_files=$(git diff --name-only origin/${{ github.base_ref }}...HEAD | grep -E '\.(md|rst|txt)$' | wc -l)
+        config_files=$(git diff --name-only origin/${{ github.base_ref }}...HEAD | grep -E '\.(yml|yaml|toml|ini|json)$' | wc -l)
+        
+        echo "| Type | Count |" >> $GITHUB_STEP_SUMMARY
+        echo "|------|-------|" >> $GITHUB_STEP_SUMMARY
+        echo "| Python Files | $python_files |" >> $GITHUB_STEP_SUMMARY
+        echo "| Test Files | $test_files |" >> $GITHUB_STEP_SUMMARY
+        echo "| Documentation | $doc_files |" >> $GITHUB_STEP_SUMMARY
+        echo "| Config Files | $config_files |" >> $GITHUB_STEP_SUMMARY
+        
+        # List all changed files
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "### Changed Files:" >> $GITHUB_STEP_SUMMARY
+        echo '```' >> $GITHUB_STEP_SUMMARY
+        git diff --name-only origin/${{ github.base_ref }}...HEAD >> $GITHUB_STEP_SUMMARY
+        echo '```' >> $GITHUB_STEP_SUMMARY
+
+  # Job 3: Quick Tests
+  quick-tests:
+    name: Quick Test Suite
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: ${{ env.PYTHON_VERSION }}
+        cache: 'pip'
+    
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install pytest pytest-xdist pytest-timeout
+        pip install -r requirements.txt
+    
+    - name: Run quick tests (parallel)
+      run: |
+        pytest tests/ -v \
+          -m "unit or not integration" \
+          -n auto \
+          --timeout=30 \
+          --maxfail=5
+      timeout-minutes: 5
+
+  # Job 4: Code Complexity Check
+  complexity:
+    name: Code Complexity Analysis
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: ${{ env.PYTHON_VERSION }}
+    
+    - name: Install radon
+      run: |
+        pip install radon
+    
+    - name: Check cyclomatic complexity
+      run: |
+        echo "## Code Complexity Analysis" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "### Cyclomatic Complexity" >> $GITHUB_STEP_SUMMARY
+        echo '```' >> $GITHUB_STEP_SUMMARY
+        radon cc src/ api/ -a -s >> $GITHUB_STEP_SUMMARY || true
+        echo '```' >> $GITHUB_STEP_SUMMARY
+    
+    - name: Check maintainability index
+      run: |
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "### Maintainability Index" >> $GITHUB_STEP_SUMMARY
+        echo '```' >> $GITHUB_STEP_SUMMARY
+        radon mi src/ api/ -s >> $GITHUB_STEP_SUMMARY || true
+        echo '```' >> $GITHUB_STEP_SUMMARY
+
+  # Job 5: Dependency Check
+  dependencies:
+    name: Check Dependencies
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Check for requirements changes
+      run: |
+        if git diff --name-only origin/${{ github.base_ref }}...HEAD | grep -E '(requirements\.txt|pyproject\.toml)'; then
+          echo "Dependency changes detected"
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "## Dependency Changes" >> $GITHUB_STEP_SUMMARY
+          echo '```diff' >> $GITHUB_STEP_SUMMARY
+          git diff origin/${{ github.base_ref }}...HEAD requirements.txt pyproject.toml >> $GITHUB_STEP_SUMMARY || true
+          echo '```' >> $GITHUB_STEP_SUMMARY
+        else
+          echo "No dependency changes"
+        fi
+
+  # Job 6: PR Summary
+  pr-summary:
+    name: PR Summary
+    runs-on: ubuntu-latest
+    needs: [pr-validation, changed-files, quick-tests, complexity, dependencies]
+    if: always()
+    
+    steps:
+    - name: Generate summary
+      run: |
+        echo "## 🎯 PR Check Summary" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "| Check | Status |" >> $GITHUB_STEP_SUMMARY
+        echo "|-------|--------|" >> $GITHUB_STEP_SUMMARY
+        echo "| PR Validation | ${{ needs.pr-validation.result }} |" >> $GITHUB_STEP_SUMMARY
+        echo "| Changed Files | ${{ needs.changed-files.result }} |" >> $GITHUB_STEP_SUMMARY
+        echo "| Quick Tests | ${{ needs.quick-tests.result }} |" >> $GITHUB_STEP_SUMMARY
+        echo "| Complexity | ${{ needs.complexity.result }} |" >> $GITHUB_STEP_SUMMARY
+        echo "| Dependencies | ${{ needs.dependencies.result }} |" >> $GITHUB_STEP_SUMMARY

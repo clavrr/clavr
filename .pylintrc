@@ -1,0 +1,23 @@
+[MESSAGES CONTROL]
+# Enable import-related checks
+enable=import-error,import-outside-toplevel,cyclic-import
+
+[IMPORTS]
+# Check for imports that should be at top level
+import-outside-toplevel=yes
+
+# Check for cyclic imports
+cyclic-import=yes
+
+# Ignore imports from these modules (if needed)
+ignored-modules=
+
+[FORMAT]
+# Maximum number of characters on a single line
+max-line-length=100
+
+
+
+
+
+

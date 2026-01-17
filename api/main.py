@@ -40,8 +40,11 @@ from api.rate_limit_handler import rate_limit_exceeded_handler
 
 # Import routers
 from api.routers import (
-    health, chat, ai_features, auth, blog, admin, data_export, webhooks, profile, dashboard,
-    integrations, conversations
+    auth, chat, graph,
+    integrations, webhooks,
+    notifications, blog, dashboard,
+    analytics, proactive, health,
+    admin, ghost, ai_features, data_export, profile, conversations
 )
 from api.routers.gmail_push import router as gmail_push_router
 # from api.auth_routes import router as google_auth_router  # DEPRECATED
@@ -122,7 +125,7 @@ app.add_middleware(ErrorHandlingMiddleware)
 # Initialize SessionMiddleware with values from config
 if security_config:
     app.add_middleware(
-        SessionMiddleware, 
+        SessionMiddleware,
         ttl_minutes=security_config.session_ttl_minutes,
         cache_ttl_seconds=security_config.session_cache_ttl_seconds,
         cache_max_size=security_config.session_cache_max_size
@@ -166,8 +169,8 @@ logger.info("[OK] Security headers middleware enabled")
 # Add CSRF protection (if secret_key is set)
 if security_config and security_config.secret_key:
     app.add_middleware(
-        CSRFMiddleware, 
-        secret_key=security_config.secret_key, 
+        CSRFMiddleware,
+        secret_key=security_config.secret_key,
         token_expires=security_config.csrf_token_expires,
         excluded_paths=security_config.csrf_excluded_paths
     )
@@ -183,25 +186,30 @@ else:
 # Google OAuth authentication (new re-authentication flow)
 # app.include_router(google_auth_router)  # DEPRECATED: Replaced by auth.router
 
-# Authentication (user login/logout)
+# Standard API Routes (Prefixed with /api)
+app.include_router(auth.router, prefix="/api")
+app.include_router(integrations.router, prefix="/api")
+app.include_router(proactive.router, prefix="/api")
+app.include_router(health.router, prefix="/api")
+app.include_router(admin.router, prefix="/api")
+app.include_router(ghost.router, prefix="/api")
+app.include_router(analytics.router, prefix="/api")
+app.include_router(graph.router, prefix="/api")
+app.include_router(ai_features.router, prefix="/api")
+app.include_router(profile.router, prefix="/api")
+app.include_router(dashboard.router, prefix="/api")
+app.include_router(conversations.router, prefix="/api")
+app.include_router(data_export.router, prefix="/api")
+app.include_router(webhooks.router, prefix="/api")
+app.include_router(gmail_push_router, prefix="/api")
+app.include_router(chat.router, prefix="/api")
+app.include_router(chat.query_router, prefix="/api")  # Legacy /api/query/*
+
+# Base Routes (Without prefix)
 app.include_router(auth.router)
-app.include_router(auth.router, prefix="/api") # Alias for frontend consistency (/api/auth/...)
-app.include_router(integrations.router)
-
-
-# Core features
-app.include_router(health.router)        # Health checks and stats
+app.include_router(health.router)
 app.include_router(chat.router)          # Chat and query endpoints
-app.include_router(chat.query_router)    # Legacy /api/query/* endpoints (alias for chat)
-app.include_router(conversations.router) # Conversations listing (fixes 404)
-app.include_router(ai_features.router)   # AI-powered features
-app.include_router(profile.router)       # User writing profile management
-app.include_router(dashboard.router)     # Dashboard statistics (emails, events, tasks)
 app.include_router(blog.router)          # Blog management
-app.include_router(admin.router)         # Admin endpoints (admin only)
-app.include_router(data_export.router)   # GDPR data export (user data portability)
-app.include_router(webhooks.router)      # Webhook subscriptions and deliveries
-app.include_router(gmail_push_router)    # Gmail push notifications (real-time email indexing)
 # Voice router for voice input processing
 try:
     from api.routers import voice
@@ -221,6 +229,26 @@ except ImportError as e:
     logger.warning(f"[WARNING] Workflows router not available: {e}")
 except Exception as e:
     logger.warning(f"[WARNING] Workflows router not available: {e}")
+
+# Autonomy router for action execution settings and management
+try:
+    from api.routers import autonomy
+    app.include_router(autonomy.router)     # Autonomous action settings & management
+    logger.info("[OK] Autonomy router enabled")
+except ImportError as e:
+    logger.warning(f"[WARNING] Autonomy router not available: {e}")
+except Exception as e:
+    logger.warning(f"[WARNING] Autonomy router not available: {e}")
+
+# Notifications router for in-app notification management
+try:
+    from api.routers import notifications
+    app.include_router(notifications.router)  # In-app notifications
+    logger.info("[OK] Notifications router enabled")
+except ImportError as e:
+    logger.warning(f"[WARNING] Notifications router not available: {e}")
+except Exception as e:
+    logger.warning(f"[WARNING] Notifications router not available: {e}")
 
 
 # ============================================

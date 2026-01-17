@@ -184,7 +184,9 @@ class EmailSearchService:
                 with concurrent.futures.ThreadPoolExecutor() as executor:
                     return executor.submit(lambda: asyncio.run(self._resolve_name_to_emails(name))).result(timeout=3.0)
             return loop.run_until_complete(self._resolve_name_to_emails(name))
-        except Exception: return []
+        except Exception as e:
+            logger.warning(f"[EMAIL_SEARCH] Sync name resolution failed: {e}")
+            return []
 
     def search_emails(
         self,
@@ -236,7 +238,8 @@ class EmailSearchService:
                         # This yields a global keyword search for the name (finding it in body/subject)
                         logger.info(f"[EMAIL_SEARCH] Could not resolve '{from_email}', relaxing to keyword search")
                         from_email = None
-                except Exception:
+                except Exception as e:
+                    logger.debug(f"[EMAIL_SEARCH] Name resolution failed during search logic: {e}")
                     from_email = None
  
         if query and not from_email and not sender_logic_run:
@@ -264,10 +267,12 @@ class EmailSearchService:
                                 # Don't set from_email, rely on keyword
                                 logger.info(f"[EMAIL_SEARCH] Extracted '{temp_sender}' but could not resolve - using keyword")
                                 from_email = None
-                        except Exception: pass
+                        except Exception as e:
+                            logger.debug(f"[EMAIL_SEARCH] Name resolution failed: {e}")
                     else:
                         from_email = temp_sender
-            except Exception: pass
+            except Exception as e:
+                logger.debug(f"[EMAIL_SEARCH] Sender extraction failed: {e}")
         
         is_time_based_query = False
         newer_than_value = None
@@ -290,7 +295,8 @@ class EmailSearchService:
                         after_date = start_dt.strftime("%Y/%m/%d")
                         # Add 1 day to end_dt for 'before:' filter because it's exclusive in Gmail
                         before_date = (end_dt + timedelta(days=1)).strftime("%Y/%m/%d")
-            except Exception: pass
+            except Exception as e:
+                logger.debug(f"[EMAIL_SEARCH] Date parsing failed: {e}")
 
         has_graph = self.hybrid_coordinator and hasattr(self.hybrid_coordinator, 'graph') and self.hybrid_coordinator.graph
         emails_from_index = []
@@ -528,7 +534,9 @@ class EmailSearchService:
                 res = await self.hybrid_coordinator.graph.execute_query(aql, {"user_id": self.user_id})
                 if res: return int(res[0])
             return self.gmail_client.get_unread_count()
-        except Exception: return 0
+        except Exception as e:
+            logger.debug(f"[EMAIL_SEARCH] Unread count query failed: {e}")
+            return 0
 
     async def semantic_search(self, query: str, limit: int = 10, filters: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
         if not self.rag_engine: return []
@@ -538,4 +546,6 @@ class EmailSearchService:
                 filters['user_id'] = self.user_id
             results = await asyncio.to_thread(self.rag_engine.search, query=query, k=limit, filters=filters)
             return [{'id': r.get('metadata', {}).get('email_id'), 'subject': r.get('metadata', {}).get('subject'), 'body': r.get('content'), 'snippet': r.get('content')[:200]} for r in results]
-        except Exception: return []
+        except Exception as e:
+            logger.debug(f"[EMAIL_SEARCH] Semantic search failed: {e}")
+            return []

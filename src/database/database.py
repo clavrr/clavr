@@ -33,7 +33,7 @@ def _get_database_url():
         return db_url
     
     # Default to SQLite
-    return 'sqlite:///./notely_agent.db'
+    return 'sqlite:///./clavr.db'
 
 # Database URL from environment or default to SQLite
 # Get it dynamically to ensure .env file is loaded
@@ -170,8 +170,8 @@ def _create_index_safe(connection, index_sql: str, is_sqlite: bool):
         # SQLite doesn't support IF NOT EXISTS for indexes, so we'll skip if it fails
         try:
             connection.execute(text(index_sql))
-        except Exception:
-            pass  # Index might already exist
+        except Exception as e:
+            logger.debug(f"Index creation skipped (may already exist): {e}")
     else:
         connection.execute(text(index_sql))
 

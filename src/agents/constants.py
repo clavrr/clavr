@@ -15,6 +15,10 @@ AGENT_NAME_RESEARCH = "ResearchAgent"
 AGENT_NAME_KEEP = "KeepAgent"
 AGENT_NAME_FINANCE = "FinanceAgent"
 AGENT_NAME_SUPERVISOR = "SupervisorAgent"
+AGENT_NAME_CLASSIFIER = "ClassifierAgent"
+
+# Memory Categories
+MEMORY_CATEGORIES = ['preference', 'contact', 'work', 'general']
 
 # Tool Aliases
 TOOL_ALIASES_EMAIL = ["email", "gmail", "mail"]

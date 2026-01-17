@@ -95,7 +95,10 @@ class SupervisorAgent:
                  db: Optional[Any] = None,
                  event_emitter: Optional['WorkflowEventEmitter'] = None,
                  memory_orchestrator: Optional[Any] = None,
-                 user_id: int = 1):  # ADDED user_id with default
+                 user_id: int = None):  # REQUIRED
+        
+        if user_id is None:
+            raise ValueError("user_id is required for SupervisorAgent - cannot default for multi-tenancy")
         
         self.config = config
         self.memory = memory
@@ -114,7 +117,7 @@ class SupervisorAgent:
                 from src.memory import get_memory_orchestrator
                 self.memory_orchestrator = get_memory_orchestrator()
             except ImportError:
-                pass
+                logger.debug("MemoryOrchestrator not available, falling back to basic memory.")
         
         # Initialize Domain Agents with specialized DomainContext
         # We retrieve a specific context for each agent based on its domain config
@@ -140,33 +143,17 @@ class SupervisorAgent:
         }
         
         for name, cls in agent_map.items():
-            try:
-                # Create specialized context for this agent
-                domain_context = self.memory_factory.get_domain_context(agent_name=name, user_id=user_id)
-                
-                # Initialize agent with domain context
-                # We assume updated __init__ signature: (config, tools, domain_context, event_emitter)
-                # If agent hasn't been updated yet, this might fail with "unexpected keyword argument".
-                # However, Python allows **kwargs in most of our agents or we'll update them immediately after.
-                # Actually, standard BaseAgent subclasses might strict init.
-                # Use kwargs to be safe if they support it, but better to update them all.
-                # For now, we instantiate assuming the new signature OR that we will fix it.
-                self.agents[name] = cls(
-                    config=config, 
-                    tools=tools, 
-                    domain_context=domain_context, 
-                    event_emitter=self.event_emitter
-                )
-            except TypeError as e:
-                # Fallback for agents not yet refactored (during migration)
-                logger.warning(f"Agent {name} initialization failed with DomainContext ({e}), trying legacy init...")
-                self.agents[name] = cls(
-                    config=config, 
-                    tools=tools, 
-                    memory=memory, 
-                    memory_orchestrator=self.memory_orchestrator, 
-                    event_emitter=self.event_emitter
-                )
+            # Create specialized context for this agent
+            domain_context = self.memory_factory.get_domain_context(agent_name=name, user_id=user_id)
+            
+            # Initialize agent with domain context
+            # All agents now follow the updated __init__ signature: (config, tools, domain_context, event_emitter)
+            self.agents[name] = cls(
+                config=config, 
+                tools=tools, 
+                domain_context=domain_context, 
+                event_emitter=self.event_emitter
+            )
 
         
         # Initialize Router LLM (fallback)
@@ -225,32 +212,13 @@ class SupervisorAgent:
 
     def _get_service_display_name(self, domain: str) -> str:
         """Get user-friendly display name for a service domain"""
-        mapping = {
-            'email': 'Gmail',
-            'calendar': 'Google Calendar',
-            'tasks': 'Google Tasks',
-            'drive': 'Google Drive',
-            'keep': 'Google Keep',
-            'notes': 'Google Keep',
-            'slack': 'Slack',
-            'notion': 'Notion',
-            'asana': 'Asana'
-        }
-        return mapping.get(domain.lower(), domain.capitalize())
+        from .constants import DOMAIN_DISPLAY_NAMES
+        return DOMAIN_DISPLAY_NAMES.get(domain.lower(), domain.capitalize())
 
     def _resolve_provider(self, domain: str) -> Optional[str]:
         """Map agent domain to required provider"""
-        domain = domain.lower()
-        if domain == 'email': return 'gmail'
-        if domain == 'calendar': return 'google_calendar'
-        if domain == 'tasks': return 'google_tasks'
-        if domain == 'drive': return 'google_drive'
-        if domain in ['keep', 'notes']: return 'google_keep'
-        
-        # Direct mappings
-        if domain in ['slack', 'notion', 'asana']:
-            return domain
-        return None  # No strict provider requirement
+        from .constants import PROVIDER_MAPPINGS
+        return PROVIDER_MAPPINGS.get(domain.lower())
 
     def _init_llm(self, config: Dict[str, Any]):
         """Initialize a fast LLM for routing (fallback)"""
@@ -268,25 +236,27 @@ class SupervisorAgent:
         """Fetch integration status for context-aware routing"""
         active_providers = await self._get_active_providers(user_id)
         
-        disconnected_services = []
+        from .constants import DOMAIN_DISPLAY_NAMES, PROVIDER_MAPPINGS
+        
         connected_services = []
+        disconnected_services = []
+        processed_providers = set()
         
-        # Helper to check and append
-        def check_service(name, provider_key):
+        # Dynamically check all mapped providers
+        for domain, display_name in DOMAIN_DISPLAY_NAMES.items():
+            provider_key = PROVIDER_MAPPINGS.get(domain)
+            if not provider_key or provider_key in processed_providers:
+                continue
+                
+            processed_providers.add(provider_key)
             if provider_key in active_providers:
-                connected_services.append(name)
+                connected_services.append(display_name)
             else:
-                disconnected_services.append(name)
+                disconnected_services.append(display_name)
         
-        check_service("Gmail", "gmail")
-        check_service("Google Calendar", "google_calendar")
-        check_service("Google Tasks", "google_tasks")
-        check_service("Google Drive", "google_drive")
-        
-        # Other Services
-        check_service("Slack", "slack")
-        check_service("Notion", "notion")
-        check_service("Asana", "asana")
+        # Ensure lists are sorted for consistent output
+        connected_services.sort()
+        disconnected_services.sort()
         
         return f"""
 [INTEGRATION STATUS]
@@ -380,9 +350,6 @@ CRITICAL ROUTING RULES:
         Uses Interactions API with previous_interaction_id for stateful planning.
         Also includes recent conversation context AND extracted entities for pronoun resolution.
         """
-        # Build conversation context and others via ContextService
-        from src.services.context_service import get_context_service
-        
         # Build conversation context and others via ContextService
         from src.services.context_service import get_context_service
         
@@ -573,29 +540,6 @@ CRITICAL ROUTING RULES:
             
         return response
 
-    async def _record_learning(
-        self, 
-        user_id: Optional[int], 
-        session_id: Optional[str], 
-        query: str, 
-        response: str, 
-        agent_name: str
-    ):
-        """Record interaction for Perfect Memory learning."""
-        if not self.memory_orchestrator or not user_id or not session_id:
-            return
-            
-        try:
-            await self.memory_orchestrator.learn_from_turn(
-                user_id=user_id,
-                session_id=session_id,
-                user_message=query,
-                assistant_response=response,
-                agent_name=agent_name,
-                success=True
-            )
-        except Exception as e:
-            logger.debug(f"Failed to learn from turn: {e}")
 
     async def _execute_single_step(
         self, 
@@ -673,61 +617,22 @@ CRITICAL ROUTING RULES:
             )
             
             full_content = ""
-            chunk_queue = asyncio.Queue()
+            full_content = ""
             
-            # Capture event loop reference BEFORE creating the thread
-            loop = asyncio.get_running_loop()
+            # Use reusable ThreadedStreamer
+            from src.utils.streaming import ThreadedStreamer
             
-            def stream_in_thread(loop_ref):
-                """Run sync LLM stream in a thread and put chunks in queue."""
-                logger.info(f"[STREAM] Thread started for query: {query[:50]}...")
-                try:
-                    chunk_count = 0
-                    # Standard sync stream call
-                    for chunk in self.llm.stream(prompt):
-                        content = chunk.content if hasattr(chunk, 'content') else str(chunk)
-                        if content:
-                            chunk_count += 1
-                            logger.info(f"[STREAM] Thread received chunk #{chunk_count}: {len(content)} chars")
-                            # Put chunk in queue (thread-safe way to use non-thread-safe put_nowait)
-                            loop_ref.call_soon_threadsafe(chunk_queue.put_nowait, content)
-                            
-                    logger.info(f"[STREAM] Thread successfully completed: {chunk_count} total chunks")
-                except Exception as e:
-                    logger.error(f"[STREAM] Critical LLM streaming error: {e}")
-                finally:
-                    # Signal completion (sentinel)
-                    loop_ref.call_soon_threadsafe(chunk_queue.put_nowait, None)
-            
+            # Define generation lambda
+            def _generate():
+                return self.llm.stream(prompt)
+
             with LatencyMonitor("Response Enhancement", threshold_ms=25000):
-                # Start streaming in background thread
-                import concurrent.futures
-                executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-                stream_future = loop.run_in_executor(executor, stream_in_thread, loop)
-                
-                # Consume chunks from queue and emit events in real-time
-                while True:
-                    try:
-                        # Wait for chunk with short timeout
-                        chunk = await asyncio.wait_for(chunk_queue.get(), timeout=30.0)
-                        
-                        if chunk is None:  # Sentinel - stream complete
-                            logger.info(f"[STREAM] Async loop received sentinel, total content: {len(full_content)} chars")
-                            break
-                            
-                        full_content += chunk
-                        logger.info(f"[STREAM] Async loop processing chunk: {len(chunk)} chars")
-                        # Emit chunk event for real-time streaming to frontend
-                        await self._emit_event('content_chunk', chunk, data={'chunk': chunk})
-                        
-                    except asyncio.TimeoutError:
-                        logger.warning("[STREAM] Async loop timeout waiting for chunk")
-                        break
-                
-                # Ensure thread cleanup
-                await stream_future
-                executor.shutdown(wait=False)
-            
+                async for chunk in ThreadedStreamer.stream_from_sync(_generate, logger_context="Enhancer"):
+                    content = chunk.content if hasattr(chunk, 'content') else str(chunk)
+                    if content:
+                        full_content += content
+                        await self._emit_event('content_chunk', content, data={'chunk': content})
+
             return full_content if len(full_content) > 10 else None
             
         except Exception as e:
@@ -738,7 +643,9 @@ CRITICAL ROUTING RULES:
         """
         Main entry point: Route query and execute agents.
         """
-        if user_id is None: user_id = 1 # Default safety
+        if user_id is None:
+            logger.warning("[SupervisorAgent] route_and_execute called without user_id - authentication may be missing")
+            return "I cannot process your request because your session is not authenticated. Please log in again."
         
         # 1. Security Check
         if not await self._check_security(query, user_id):
@@ -772,70 +679,14 @@ CRITICAL ROUTING RULES:
             steps = await self._plan_execution(planning_query, user_id, session_id)
             
         # 5. Execution Logic
-        final_result = ""
-        
         if steps:
-            # Multi-step Execution
-            logger.info(f"Supervisor Plan: {len(steps)} steps")
-            summary = ", ".join([s.get('domain', 'general').title() for s in steps])
-            await self._emit_event('supervisor_plan_created', f"I'll check: {summary}", data={'steps': steps})
-            
-            # Identify dependencies
-            dep_indices = [i for i, s in enumerate(steps) if any(x in s.get("query", "").lower() for x in ["previous", "step ", "result"])]
-            ind_indices = [i for i in range(len(steps)) if i not in dep_indices]
-            
-            results_accumulated = ""
-            
-            # Run independent steps in parallel
-            if ind_indices:
-                with LatencyMonitor("Parallel Steps", threshold_ms=30000):
-                    tasks = [
-                        self._execute_single_step(
-                            steps[i], i+1, "", user_id, user_name, session_id, active_providers
-                        ) for i in ind_indices
-                    ]
-                    results = await asyncio.gather(*tasks)
-                    results_accumulated += "".join(results)
-            
-            # Run dependent steps sequentially
-            for i in dep_indices:
-                res = await self._execute_single_step(
-                    steps[i], i+1, results_accumulated, user_id, user_name, session_id, active_providers
-                )
-                results_accumulated += res
-                
-            final_result = results_accumulated
-            
+            final_result = await self._execute_multi_step_plan(
+                steps, user_id, user_name, session_id, active_providers
+            )
         else:
-            # Fallback: Single-Step Routing
-            with LatencyMonitor("Route Decision"):
-                target_agent = await self._decide_route(query, user_id)
-            
-            target_agent = DOMAIN_ALIASES.get(target_agent, target_agent)
-            
-            # Check permission
-            if not await self._is_service_enabled(target_agent, active_providers):
-                display = DOMAIN_DISPLAY_NAMES.get(target_agent, target_agent.capitalize())
-                return self._sanitize_response(
-                    f"Please enable {display} integration in Settings to use this feature.", 
-                    user_id
-                )
-            
-            # Execute
-            if target_agent == "general" or target_agent not in self.agents:
-                if target_agent != "general":
-                    logger.warning(f"Routed to unknown agent '{target_agent}', falling back to general.")
-                final_result = await self._handle_general(query, user_id)
-            else:
-                agent = self.agents[target_agent]
-                start_msg = DOMAIN_START_MESSAGES.get(target_agent, f"Checking {target_agent}...")
-                await self._emit_event('tool_call_start', start_msg, data={'tool': target_agent})
-                
-                ctx = {"user_id": user_id, "user_name": user_name, "session_id": session_id}
-                with LatencyMonitor(f"Agent Execution: {target_agent}"):
-                    final_result = await agent.run(query, context=ctx)
-                
-                await self._emit_event('tool_complete', f"Done with {target_agent}", data={'tool': target_agent})
+            final_result = await self._execute_single_routing(
+                query, user_id, user_name, session_id, active_providers
+            )
 
         # 6. Response Enhancement & Sanitation
         enhanced = await self._enhance_response_stream(query, final_result, user_name)
@@ -849,7 +700,14 @@ CRITICAL ROUTING RULES:
         final_result = await self._inject_urgent_insights(final_result, user_id)
         
         # 8. Perfect Memory Learning
-        await self._record_learning(user_id, session_id, query, final_result, "supervisor_multi_step" if steps else "supervisor_single_step")
+        # 8. Record interaction for learning
+        await self._record_interaction(
+            user_id=user_id, 
+            session_id=session_id, 
+            query=query, 
+            response=final_result, 
+            agent_name="supervisor_multi_step" if steps else "supervisor_single_step"
+        )
         
         await self._emit_event('workflow_complete', 'Here is what I found.')
         
@@ -1001,3 +859,108 @@ CRITICAL ROUTING RULES:
         if user_id in self._interaction_sessions:
             del self._interaction_sessions[user_id]
             logger.info(f"Cleared interaction session for user {user_id}")
+
+
+    async def _execute_multi_step_plan(
+        self, 
+        steps: List[Dict[str, Any]], 
+        user_id: int, 
+        user_name: Optional[str], 
+        session_id: Optional[str],
+        active_providers: set
+    ) -> str:
+        """Execute a decomposed multi-step plan."""
+        logger.info(f"Supervisor Plan: {len(steps)} steps")
+        summary = ", ".join([s.get('domain', 'general').title() for s in steps])
+        await self._emit_event('supervisor_plan_created', f"I'll check: {summary}", data={'steps': steps})
+        
+        # Identify dependencies
+        dep_indices = [i for i, s in enumerate(steps) if any(x in s.get("query", "").lower() for x in ["previous", "step ", "result"])]
+        ind_indices = [i for i in range(len(steps)) if i not in dep_indices]
+        
+        results_accumulated = ""
+        
+        # Run independent steps in parallel
+        if ind_indices:
+            with LatencyMonitor("Parallel Steps", threshold_ms=30000):
+                tasks = [
+                    self._execute_single_step(
+                        steps[i], i+1, "", user_id, user_name, session_id, active_providers
+                    ) for i in ind_indices
+                ]
+                results = await asyncio.gather(*tasks)
+                results_accumulated += "".join(results)
+        
+        # Run dependent steps sequentially
+        for i in dep_indices:
+            res = await self._execute_single_step(
+                steps[i], i+1, results_accumulated, user_id, user_name, session_id, active_providers
+            )
+            results_accumulated += res
+            
+        return results_accumulated
+
+    async def _execute_single_routing(
+        self, 
+        query: str, 
+        user_id: int, 
+        user_name: Optional[str], 
+        session_id: Optional[str],
+        active_providers: set
+    ) -> str:
+        """Fallback to single-step routing if no decomposition is possible."""
+        with LatencyMonitor("Route Decision"):
+            target_agent = await self._decide_route(query, user_id)
+        
+        target_agent = DOMAIN_ALIASES.get(target_agent, target_agent)
+        
+        # Check permission
+        if not await self._is_service_enabled(target_agent, active_providers):
+            display = DOMAIN_DISPLAY_NAMES.get(target_agent, target_agent.capitalize())
+            return f"Please enable {display} integration in Settings to use this feature."
+        
+        # Execute
+        if target_agent == "general" or target_agent not in self.agents:
+            if target_agent != "general":
+                logger.warning(f"Routed to unknown agent '{target_agent}', falling back to general.")
+            return await self._handle_general(query, user_id)
+        else:
+            agent = self.agents[target_agent]
+            start_msg = DOMAIN_START_MESSAGES.get(target_agent, f"Checking {target_agent}...")
+            await self._emit_event('tool_call_start', start_msg, data={'tool': target_agent})
+            
+            ctx = {"user_id": user_id, "user_name": user_name, "session_id": session_id}
+            with LatencyMonitor(f"Agent Execution: {target_agent}"):
+                final_result = await agent.run(query, context=ctx)
+            
+            await self._emit_event('tool_complete', f"Done with {target_agent}", data={'tool': target_agent})
+            return final_result
+
+    async def _record_interaction(
+        self, 
+        user_id: Optional[int], 
+        session_id: Optional[str], 
+        query: str, 
+        response: str,
+        success: bool = True,
+        agent_name: Optional[str] = None
+    ):
+        """
+        Record the interaction for persistent learning and session context.
+        Uses the Unified Memory System (MemoryOrchestrator).
+        """
+        if not self.memory_orchestrator or not user_id or not session_id:
+            return
+            
+        try:
+            with LatencyMonitor("[SupervisorAgent] Recording Memory"):
+                await self.memory_orchestrator.learn_from_turn(
+                    user_id=user_id,
+                    session_id=session_id,
+                    user_message=query,
+                    assistant_response=response,
+                    agent_name=agent_name or "SupervisorAgent",
+                    success=success
+                )
+        except Exception as e:
+            logger.debug(f"[SupervisorAgent] Interaction recording failed: {e}")

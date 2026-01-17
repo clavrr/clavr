@@ -15,6 +15,11 @@ from src.services.indexing.graph.manager import KnowledgeGraphManager
 from src.memory.agent_memory_lane import AgentMemoryLaneManager, get_agent_memory_lane_manager, init_agent_memory_lane_manager
 from src.memory.domain_context import DomainContext
 
+# New services
+from src.features.protection.deep_work import DeepWorkLogic
+from src.services.proactive.cross_stack_context import CrossStackContext
+from src.integrations.linear.service import LinearService
+
 logger = setup_logger(__name__)
 
 # Configuration map for domains
@@ -99,6 +104,15 @@ class DomainMemoryFactory:
         
         # Cache for RAGEngines to avoid recreating connections
         self._rag_engines: Dict[str, RAGEngine] = {}
+        
+        # Initialize new services
+        self.deep_work_logic = DeepWorkLogic()
+        self.cross_stack_context = CrossStackContext(
+            config=config,
+            graph_manager=self.graph_manager,
+            rag_engine=self._get_rag_engine("email-knowledge") # Default RAG for glue
+        )
+        self.linear_service = None # initialized per-user if needed
         
     def get_domain_context(self, agent_name: str, user_id: int) -> DomainContext:
         """

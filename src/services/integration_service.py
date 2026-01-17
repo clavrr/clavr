@@ -237,6 +237,25 @@ class IntegrationService:
                     })
             except Exception as e:
                 logger.warning(f"Failed to fetch Google user info for {provider}: {e}")
+        elif provider == "linear":
+            try:
+                # Use GraphQL to get viewer info
+                query = {"query": "{ viewer { id name email } }"}
+                resp = await client.post(
+                    "https://api.linear.app/graphql",
+                    json=query,
+                    headers={"Authorization": access_token}, # Linear uses Bearer or raw token? Docs say 'Authorization: <TOKEN>'
+                    timeout=5.0
+                )
+                if resp.status_code == 200:
+                    data = resp.json().get("data", {}).get("viewer", {})
+                    metadata.update({
+                        "user_id": data.get("id"),
+                        "name": data.get("name"),
+                        "email": data.get("email")
+                    })
+            except Exception as e:
+                logger.warning(f"Failed to fetch Linear metadata: {e}")
         return metadata
 
     async def disconnect(self, user_id: int, provider: str):

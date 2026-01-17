@@ -404,11 +404,26 @@ class MemoryConsolidationWorker:
                             to_archive.append(goal_id)
                 
                 for goal_id in to_archive:
-                    # Mark as archived (remove from active tracking)
-                    del user_goals[goal_id]
+                    # Mark as archived (move to archived status instead of deleting)
+                    goal = user_goals[goal_id]
+                    goal.status = GoalStatus.ARCHIVED
                     archived += 1
                     
-                    # TODO: Store in archive table for history
+                    # Store in database if available
+                    if self.db:
+                        try:
+                            from src.database.models import AgentGoal
+                            db_goal = self.db.query(AgentGoal).filter(
+                                AgentGoal.id == int(goal_id.replace('goal_', '')) if 'goal_' in goal_id else 0,
+                                AgentGoal.user_id == user_id
+                            ).first()
+                            
+                            if db_goal:
+                                db_goal.status = 'archived'
+                                self.db.commit()
+                        except Exception as e:
+                            logger.debug(f"[Consolidation] Failed to persist archived goal {goal_id} to DB: {e}")
+                            self.db.rollback()
         
         except Exception as e:
             result.errors.append(f"Archival failed: {str(e)}")

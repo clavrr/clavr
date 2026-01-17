@@ -659,7 +659,8 @@ class ToolPreflightValidator:
                                 try:
                                     dt = datetime.fromisoformat(slot_start.replace('Z', '+00:00'))
                                     alternatives.append(dt.strftime('%I:%M %p'))
-                                except:
+                                except (ValueError, TypeError):
+                                    # Invalid datetime format, skip this alternative
                                     pass
                     except Exception:
                         pass
@@ -685,7 +686,8 @@ class ToolPreflightValidator:
         # Try ISO format first
         try:
             return datetime.fromisoformat(value.replace('Z', '+00:00'))
-        except:
+        except (ValueError, TypeError):
+            # ISO format parsing failed, try natural language
             pass
         
         # Try dateparser for natural language
@@ -696,7 +698,8 @@ class ToolPreflightValidator:
                 'RETURN_AS_TIMEZONE_AWARE': False
             })
             return parsed
-        except:
+        except (ImportError, ValueError, TypeError):
+            # dateparser not available or failed, return None
             pass
         
         return None
@@ -712,7 +715,8 @@ class ToolPreflightValidator:
         
         try:
             return datetime.fromisoformat(dt_str.replace('Z', '+00:00'))
-        except:
+        except (ValueError, TypeError):
+            # Invalid datetime format
             return None
     
     def _build_clarification_prompt(self, issues: List[ValidationIssue]) -> str:

@@ -218,7 +218,8 @@ class PostgresVectorStore(VectorStore):
             # Try to get the document
             results = self.store.similarity_search(f"id:{doc_id}", k=1)
             return len(results) > 0
-        except:
+        except Exception:
+            # Document search failed, assume doesn't exist
             return False
     
     def batch_document_exists(self, doc_ids: List[str]) -> Set[str]:

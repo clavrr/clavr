@@ -107,8 +107,8 @@ async def log_auth_event(
     try:
         await db.commit()
         await db.refresh(audit_log)
-    except:
-        # Sync session
+    except TypeError:
+        # Sync session - commit/refresh not awaitable
         db.commit()
         db.refresh(audit_log)
     

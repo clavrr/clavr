@@ -81,20 +81,23 @@ def send_email_notification(
                     server.send_message(msg)
                     
                 logger.info(f"Email notification sent to {user_email} via SMTP")
+                status = 'sent'
                 
             except Exception as smtp_error:
                 logger.warning(f"SMTP send failed: {smtp_error}, falling back to log-only mode")
                 # Fallback: just log the notification
                 logger.info(f"[NOTIFICATION] To: {user_email} | Subject: {subject} | Message: {message}")
+                status = 'logged'
         else:
             # No SMTP configured - log the notification
             logger.info(f"[NOTIFICATION] To: {user_email} | Subject: {subject} | Message: {message}")
             logger.warning("SMTP not configured - notification logged only")
+            status = 'logged'
         
         return {
             'recipient': user_email,
             'subject': subject,
-            'status': 'sent',
+            'status': status,
             'template': template,
             'sent_time': datetime.utcnow().isoformat()
         }

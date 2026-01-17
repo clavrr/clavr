@@ -32,6 +32,8 @@ class InjectionReason(str, Enum):
     UNACCESSED_IMPORTANT = "unaccessed_important"  # Important but not recently accessed
     CONFLICT_DETECTED = "conflict_detected"  # Conflicts with current action
     OPPORTUNITY = "opportunity"  # Opportunity based on context
+    PROTECTION_ADVISORY = "protection_advisory"  # Advice based on Deep Work status
+    CROSS_STACK_INSIGHT = "cross_stack_insight"  # Insight synthesized from multiple sources
 
 
 @dataclass
@@ -143,7 +145,9 @@ class ProactiveInjector:
             self._find_goal_related_memories(context),
             self._find_time_sensitive_memories(context),
             self._find_conflict_memories(context),
-            self._find_opportunity_memories(context)
+            self._find_opportunity_memories(context),
+            self._find_linear_proactive_memories(context),
+            self._find_protection_memories(context)
         ]
         
         try:
@@ -309,6 +313,40 @@ class ProactiveInjector:
         except Exception as e:
             logger.debug(f"[ProactiveInjector] Time-sensitive search failed: {e}")
         
+        # Check for Linear deadlines if available
+        if self.graph_manager:
+            try:
+                # Query for Linear issues due within 24 hours
+                now = datetime.utcnow()
+                tomorrow = now + timedelta(days=1)
+                
+                query = """
+                FOR i IN LinearIssue
+                    FILTER i.user_id == @user_id
+                      AND i.dueDate >= @now
+                      AND i.dueDate <= @tomorrow
+                      AND i.priority IN [1, 2]
+                    LIMIT 2
+                    RETURN { title: i.title, identifier: i.identifier, priority: i.priority }
+                """
+                
+                results = await self.graph_manager.query(
+                    query,
+                    {"user_id": context.user_id, "now": now.isoformat(), "tomorrow": tomorrow.isoformat()}
+                )
+                
+                for record in results:
+                    memories.append(ProactiveMemory(
+                        content=f"Deadline: {record['i.identifier']} - {record['i.title']}",
+                        reason=InjectionReason.TIME_SENSITIVE,
+                        relevance_score=0.9,
+                        source="graph",
+                        explanation="Linear issue due soon",
+                        urgency="critical" if record['i.priority'] == 1 else "high"
+                    ))
+            except Exception as e:
+                logger.debug(f"[ProactiveInjector] Linear deadline search failed: {e}")
+        
         return memories
     
     async def _find_conflict_memories(
@@ -389,6 +427,28 @@ class ProactiveInjector:
             except Exception as e:
                 logger.debug(f"[ProactiveInjector] Opportunity search failed: {e}")
         
+        return memories
+
+    async def _find_linear_proactive_memories(
+        self, 
+        context: InjectionContext
+    ) -> List[ProactiveMemory]:
+        """Find Linear issues that should be proactively surfaced."""
+        memories = []
+        
+        # Placeholder for Linear-specific proactive discovery.
+        # Could query Linear for blockers or high-priority unassigned issues.
+        return memories
+
+    async def _find_protection_memories(
+        self, 
+        context: InjectionContext
+    ) -> List[ProactiveMemory]:
+        """Find protection (Deep Work) advisories."""
+        memories = []
+        
+        # If the user is in Deep Work, inject a reminder for the agent to be brief
+        # and not ask for elaborate clarifications unless necessary.
         return memories
     
     def _filter_candidates(

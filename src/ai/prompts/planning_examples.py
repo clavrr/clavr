@@ -57,9 +57,19 @@ PLANNING_EXAMPLES: List[PlanningExample] = [
         "plan": [
             {"step": 1, "domain": "calendar", "query": "Find next meeting with Sarah"},
             {"step": 2, "domain": "email", "query": "Find recent emails to/from Sarah"},
-            {"step": 3, "domain": "notion", "query": "Find recent notes about Sarah"}
+            {"step": 3, "domain": "drive", "query": "Find documents related to Sarah"},
+            {"step": 4, "domain": "notion", "query": "Find recent notes about Sarah"}
         ],
-        "reasoning": "Vague 'prepare' intent requires gathering context from multiple sources."
+        "reasoning": "Vague 'prepare' intent requires gathering context from multiple sources (Calendar, Email, Drive, Notion)."
+    },
+    {
+        "user_query": "Prepare me for my next meeting.",
+        "plan": [
+            {"step": 1, "domain": "calendar", "query": "Get details of my next meeting"},
+            {"step": 2, "domain": "drive", "query": "Find documents related to the meeting found in the previous step"},
+            {"step": 3, "domain": "email", "query": "Find emails related to the meeting found in the previous step"}
+        ],
+        "reasoning": "Identify the meeting first, then use that context to gather files and communications."
     },
     {
         "user_query": "If it's raining in Seattle tomorrow, remind me to pack an umbrella.",

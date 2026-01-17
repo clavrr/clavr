@@ -1,8 +1,6 @@
-"""
-Maps Service
-Business logic for location-aware features.
-"""
-from typing import Optional, Dict, Any
+import aiohttp
+import time
+from typing import Optional, Dict, Any, List
 from datetime import datetime, timedelta
 
 from ...utils.config import Config
@@ -71,7 +69,6 @@ class MapsService:
         Get lat/lng using New Places API (REST).
         This is compatible with "Places API (New)" restrictions.
         """
-        import aiohttp
         
         api_key = self.config.google_maps_api_key
         if not api_key:
@@ -107,9 +104,6 @@ class MapsService:
         Get timezone info for a location.
         Returns dict with 'timeZoneId' (e.g., 'America/Los_Angeles'), 'timeZoneName', 'rawOffset', 'dstOffset'.
         """
-        import aiohttp
-        import time
-        
         # First get coordinates
         coords = await self.get_location_coordinates_async(location)
         if not coords:
@@ -152,5 +146,58 @@ class MapsService:
             logger.error(f"[MapsService] Timezone lookup failed: {e}")
             
         return None
+
+    async def search_nearby_places_async(self, query: str, limit: int = 5) -> List[Dict]:
+        """
+        Search for places using New Places API (Text Search).
+        Handles queries like "coffee near 123 Main St" or "restaurants in San Francisco".
+        """
+        
+        api_key = self.config.google_maps_api_key
+        if not api_key:
+            return []
+            
+        url = "https://places.googleapis.com/v1/places:searchText"
+        headers = {
+            "Content-Type": "application/json",
+            "X-Goog-Api-Key": api_key,
+            "X-Goog-FieldMask": "places.displayName,places.formattedAddress,places.location,places.rating,places.userRatingCount"
+        }
+        
+        # We can pass the raw query directly (e.g. "coffee near 123 Main St")
+        data = {
+            "textQuery": query,
+            "maxResultCount": limit
+        }
+        
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(url, json=data, headers=headers) as response:
+                    if response.status == 200:
+                        result = await response.json()
+                        places_data = result.get("places", [])
+                        
+                        clean_results = []
+                        for p in places_data:
+                            name = p.get('displayName', {}).get('text', 'Unknown')
+                            addr = p.get('formattedAddress', '')
+                            loc = p.get('location', {})
+                            rating = p.get('rating')
+                            
+                            clean_results.append({
+                                "name": name,
+                                "address": addr,
+                                "lat": loc.get('latitude'),
+                                "lng": loc.get('longitude'),
+                                "rating": rating
+                            })
+                        return clean_results
+                    else:
+                        error = await response.json()
+                        logger.error(f"[MapsService] Places Search Error: {error}")
+        except Exception as e:
+            logger.error(f"[MapsService] Places Search failed: {e}")
+            
+        return []
 
 

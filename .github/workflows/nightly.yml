@@ -1,0 +1,313 @@
+# Nightly Build & Extended Tests
+name: Nightly Build
+
+on:
+  schedule:
+    # Run nightly at 2 AM UTC
+    - cron: '0 2 * * *'
+  workflow_dispatch:
+
+env:
+  PYTHON_VERSION: '3.9'
+
+jobs:
+  # Job 1: Full Test Suite
+  full-tests:
+    name: Full Test Suite
+    runs-on: ubuntu-latest
+    
+    services:
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_USER: notely_test
+          POSTGRES_PASSWORD: test_password
+          POSTGRES_DB: notely_test
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+      
+      redis:
+        image: redis:7-alpine
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 6379:6379
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+    
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: ${{ env.PYTHON_VERSION }}
+        cache: 'pip'
+    
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install pytest pytest-cov pytest-asyncio pytest-mock pytest-timeout
+        pip install -r requirements.txt
+    
+    - name: Run all tests
+      env:
+        DATABASE_URL: postgresql://notely_test:test_password@localhost:5432/notely_test
+        REDIS_URL: redis://localhost:6379/0
+        TESTING: true
+      run: |
+        pytest tests/ -v \
+          --cov=src \
+          --cov=api \
+          --cov-report=term-missing \
+          --cov-report=xml \
+          --cov-report=html \
+          --timeout=300
+    
+    - name: Upload coverage
+      uses: codecov/codecov-action@v4
+      with:
+        file: ./coverage.xml
+        flags: nightly
+      continue-on-error: true
+    
+    - name: Upload test results
+      uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: nightly-test-results
+        path: |
+          coverage.xml
+          htmlcov/
+        retention-days: 30
+
+  # Job 2: Database Migration Tests
+  migration-tests:
+    name: Database Migration Tests
+    runs-on: ubuntu-latest
+    
+    services:
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_USER: notely_test
+          POSTGRES_PASSWORD: test_password
+          POSTGRES_DB: notely_test
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: ${{ env.PYTHON_VERSION }}
+        cache: 'pip'
+    
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+    
+    - name: Test database initialization
+      env:
+        DATABASE_URL: postgresql://notely_test:test_password@localhost:5432/notely_test
+      run: |
+        python -c "
+        from src.database import init_db
+        print('🔧 Initializing database...')
+        init_db()
+        print('Database initialized successfully')
+        "
+    
+    - name: Verify webhook tables
+      env:
+        DATABASE_URL: postgresql://notely_test:test_password@localhost:5432/notely_test
+      run: |
+        python -c "
+        from src.database import get_session
+        from src.database.webhook_models import WebhookSubscription, WebhookDelivery
+        
+        with get_session() as session:
+            # Test webhook subscription creation
+            from src.database.webhook_models import WebhookEventType
+            sub = WebhookSubscription(
+                user_id=1,
+                url='https://example.com/webhook',
+                event_type=WebhookEventType.EMAIL_RECEIVED,
+                secret='test_secret',
+                is_active=True
+            )
+            session.add(sub)
+            session.commit()
+            print('Webhook tables working correctly')
+        "
+
+  # Job 3: End-to-End Tests
+  e2e-tests:
+    name: End-to-End Tests
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: ${{ env.PYTHON_VERSION }}
+        cache: 'pip'
+    
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+    
+    - name: Test API startup
+      run: |
+        python -c "
+        from api.main import app
+        print('API application loads successfully')
+        print(f'Routes: {len(app.routes)}')
+        "
+    
+    - name: Test webhook integration
+      run: |
+        python -c "
+        from api.main import app
+        routes = [r.path for r in app.routes]
+        webhook_routes = [r for r in routes if 'webhook' in r]
+        print(f'Found {len(webhook_routes)} webhook routes')
+        for route in webhook_routes:
+            print(f'  - {route}')
+        "
+
+  # Job 4: Security Audit
+  security-audit:
+    name: Nightly Security Audit
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: ${{ env.PYTHON_VERSION }}
+        cache: 'pip'
+    
+    - name: Install security tools
+      run: |
+        python -m pip install --upgrade pip
+        pip install bandit safety pip-audit
+        pip install -r requirements.txt
+    
+    - name: Run comprehensive security scan
+      run: |
+        echo "🔒 Running comprehensive security scan..."
+        bandit -r src/ api/ -ll -f json -o bandit-nightly.json || true
+        safety check --json --output safety-nightly.json || true
+        pip-audit --format json -o pip-audit-nightly.json || true
+    
+    - name: Upload security reports
+      uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: nightly-security-reports
+        path: |
+          bandit-nightly.json
+          safety-nightly.json
+          pip-audit-nightly.json
+        retention-days: 90
+
+  # Job 5: Code Quality Metrics
+  code-metrics:
+    name: Code Quality Metrics
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+    
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: ${{ env.PYTHON_VERSION }}
+    
+    - name: Install analysis tools
+      run: |
+        pip install radon lizard
+    
+    - name: Generate metrics
+      run: |
+        echo "Generating code metrics..."
+        
+        # Cyclomatic complexity
+        radon cc src/ api/ -a -s > metrics-cc.txt || true
+        
+        # Maintainability index
+        radon mi src/ api/ -s > metrics-mi.txt || true
+        
+        # Raw metrics
+        radon raw src/ api/ > metrics-raw.txt || true
+        
+        # Lizard analysis
+        lizard src/ api/ > metrics-lizard.txt || true
+    
+    - name: Upload metrics
+      uses: actions/upload-artifact@v4
+      with:
+        name: code-metrics
+        path: |
+          metrics-*.txt
+        retention-days: 90
+
+  # Job 6: Nightly Summary
+  nightly-summary:
+    name: Nightly Build Summary
+    runs-on: ubuntu-latest
+    needs: [full-tests, migration-tests, e2e-tests, security-audit, code-metrics]
+    if: always()
+    
+    steps:
+    - name: Generate summary
+      run: |
+        echo "## 🌙 Nightly Build Summary - $(date +%Y-%m-%d)" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "| Job | Status |" >> $GITHUB_STEP_SUMMARY
+        echo "|-----|--------|" >> $GITHUB_STEP_SUMMARY
+        echo "| Full Tests | ${{ needs.full-tests.result }} |" >> $GITHUB_STEP_SUMMARY
+        echo "| Migration Tests | ${{ needs.migration-tests.result }} |" >> $GITHUB_STEP_SUMMARY
+        echo "| E2E Tests | ${{ needs.e2e-tests.result }} |" >> $GITHUB_STEP_SUMMARY
+        echo "| Security Audit | ${{ needs.security-audit.result }} |" >> $GITHUB_STEP_SUMMARY
+        echo "| Code Metrics | ${{ needs.code-metrics.result }} |" >> $GITHUB_STEP_SUMMARY
+    
+    - name: Check for failures
+      run: |
+        if [[ "${{ needs.full-tests.result }}" == "failure" ]] || \
+           [[ "${{ needs.migration-tests.result }}" == "failure" ]] || \
+           [[ "${{ needs.e2e-tests.result }}" == "failure" ]]; then
+          echo "Nightly build has failures"
+          # Add notification logic here (e.g., Slack, email)
+        else
+          echo "Nightly build successful"
+        fi

@@ -17,6 +17,7 @@ from api.dependencies import get_config, AppState, get_auth_service, get_integra
 from src.database.models import User
 from src.services.voice_service import VoiceService
 from src.utils.audio_transcoder import StreamingTranscoder
+from src.services.service_constants import ServiceConstants
 
 logger = setup_logger(__name__)
 router = APIRouter(prefix="/api/voice", tags=["voice"])
@@ -44,8 +45,8 @@ async def websocket_transcribe(
                 auth_msg = await asyncio.wait_for(websocket.receive_json(), timeout=3.0)
                 if auth_msg.get("type") == "auth":
                     token = auth_msg.get("token")
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug(f"[WS] Auth message receive error: {e}")
         
         auth_service = AppState.get_auth_service(db)
         if token:
@@ -84,14 +85,14 @@ async def websocket_transcribe(
                             # Noise Gate: Skip very low-energy chunks
                             energy = StreamingTranscoder.calculate_rms(pcm_chunk)
                             # Lower threshold to 100 to catch more audio
-                            if energy >= 100:
+                            if energy >= ServiceConstants.VOICE_ENERGY_THRESHOLD:
                                 yield pcm_chunk
                             # Log occasionally to track activity
                             if not hasattr(audio_generator, '_chunk_count'):
                                 audio_generator._chunk_count = 0
                                 audio_generator._yielded = 0
                             audio_generator._chunk_count += 1
-                            if energy >= 100:
+                            if energy >= ServiceConstants.VOICE_ENERGY_THRESHOLD:
                                 audio_generator._yielded += 1
                             if audio_generator._chunk_count <= 5 or audio_generator._chunk_count % 100 == 0:
                                 logger.info(f"[AudioGen] Chunk {audio_generator._chunk_count}: energy={energy:.0f}, yielded={audio_generator._yielded}")
@@ -122,5 +123,5 @@ async def websocket_transcribe(
     finally:
         try:
             await websocket.close()
-        except:
-            pass
+        except Exception as e:
+            logger.debug(f"[WS] Error closing websocket: {e}")

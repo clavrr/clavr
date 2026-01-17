@@ -591,13 +591,10 @@ def init_insight_service(config: Config, graph_manager: KnowledgeGraphManager) -
     """Initialize and return the global insight service."""
     global _insight_service
     
-    # Try to get drive service
+    # Drive service is optional - must be passed explicitly if needed
+    # NOTE: Background IndexService should pass user-specific drive_service when needed
     drive_service = None
-    try:
-         from api.dependencies import AppState
-         drive_service = AppState.get_drive_service(user_id=1) # Default user for background
-    except Exception:
-         pass
+    # Do NOT use hardcoded user_id for background services
 
     _insight_service = InsightService(config, graph_manager, drive_service)
     logger.info("[InsightService] Initialized")

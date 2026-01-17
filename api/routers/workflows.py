@@ -19,6 +19,7 @@ from src.database.models import User
 from api.dependencies import AppState
 from api.middleware import require_session
 from src.utils.logger import setup_logger
+from src.workers.tasks import run_workflow
 
 logger = setup_logger(__name__)
 
@@ -127,289 +128,136 @@ async def list_workflows():
 @router.get("/morning-briefing")
 async def morning_briefing(
     params: MorningBriefingParams = Depends(),
-    user: User = Depends(require_session),
-    request = None
+    user: User = Depends(require_session)
 ):
     """
-    Generate morning briefing.
-    
-    Provides:
-    - Today's calendar events
-    - Urgent and overdue tasks
-    - Important unread emails
-    - AI-powered recommendations
+    Generate morning briefing in the background.
     """
     try:
-        # Get services for user
-        from fastapi import Request
-        if request is None:
-            from starlette.requests import Request as StarletteRequest
-            # Create a minimal request context if needed
-            
-        email_tool = await AppState.get_email_tool(user.id, request)
-        calendar_tool = await AppState.get_calendar_tool(user.id, request)
-        task_tool = await AppState.get_task_tool(user.id, request)
-        
-        # Create workflow instance
-        workflow = MorningBriefingWorkflow(
-            calendar_service=calendar_tool.calendar_service,
-            task_service=task_tool.task_service,
-            email_service=email_tool.email_service
-        )
-        
-        # Execute
-        from src.workflows.base import WorkflowContext
-        context = WorkflowContext.create(
-            workflow_name="morning_briefing",
+        # Queue the workflow task
+        task = run_workflow.delay(
             user_id=user.id,
+            workflow_name="morning_briefing",
             params=params.model_dump()
         )
         
-        context.start()
-        result = await workflow.execute(context)
-        context.complete(result)
-        
-        return WorkflowResponse(
-            workflow_id=context.workflow_id,
-            status="completed",
-            result=result,
-            duration_seconds=(
-                context.completed_at - context.started_at
-            ).total_seconds() if context.completed_at and context.started_at else 0
-        )
+        return {
+            "workflow_id": task.id,
+            "status": "queued",
+            "message": "Morning briefing generation started in background",
+            "check_status_url": f"/api/workflows/status/{task.id}"
+        }
         
     except Exception as e:
-        logger.error(f"Morning briefing failed: {e}")
+        logger.error(f"Failed to queue morning briefing: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @router.post("/email-to-action")
 async def email_to_action(
     params: EmailToActionParams,
-    user: User = Depends(require_session),
-    request = None
+    user: User = Depends(require_session)
 ):
     """
-    Process an email and convert to actions.
-    
-    Automatically:
-    - Extracts action items → creates tasks
-    - Detects meeting requests → creates events
-    - Classifies email by urgency/category
+    Process an email and convert to actions in the background.
     """
     try:
-        email_tool = await AppState.get_email_tool(user.id, request)
-        calendar_tool = await AppState.get_calendar_tool(user.id, request)
-        task_tool = await AppState.get_task_tool(user.id, request)
-        
-        # Check if AI analyzer is available
-        ai_analyzer = getattr(email_tool, 'email_ai_analyzer', None)
-        if not ai_analyzer:
-            raise HTTPException(
-                status_code=400,
-                detail="Email AI analyzer not available. This workflow requires AI features."
-            )
-        
-        workflow = EmailToActionWorkflow(
-            email_service=email_tool.email_service,
-            calendar_service=calendar_tool.calendar_service,
-            task_service=task_tool.task_service,
-            email_ai_analyzer=ai_analyzer
-        )
-        
-        from src.workflows.base import WorkflowContext
-        context = WorkflowContext.create(
-            workflow_name="email_to_action",
+        task = run_workflow.delay(
             user_id=user.id,
+            workflow_name="email_to_action",
             params=params.model_dump()
         )
         
-        context.start()
-        result = await workflow.execute(context)
-        context.complete(result)
+        return {
+            "workflow_id": task.id,
+            "status": "queued",
+            "message": "Email processing started in background",
+            "check_status_url": f"/api/workflows/status/{task.id}"
+        }
         
-        return WorkflowResponse(
-            workflow_id=context.workflow_id,
-            status="completed",
-            result=result,
-            duration_seconds=(
-                context.completed_at - context.started_at
-            ).total_seconds() if context.completed_at and context.started_at else 0
-        )
-        
-    except HTTPException:
-        raise
     except Exception as e:
-        logger.error(f"Email to action failed: {e}")
+        logger.error(f"Failed to queue email-to-action: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @router.get("/weekly-planning")
 async def weekly_planning(
     params: WeeklyPlanningParams = Depends(),
-    user: User = Depends(require_session),
-    request = None
+    user: User = Depends(require_session)
 ):
     """
-    Generate weekly planning overview.
-    
-    Provides:
-    - This week's calendar with daily breakdown
-    - Tasks due this week by priority
-    - Last week's productivity stats (optional)
-    - Workload distribution analysis
-    - AI recommendations
+    Generate weekly planning survey in the background.
     """
     try:
-        calendar_tool = await AppState.get_calendar_tool(user.id, request)
-        task_tool = await AppState.get_task_tool(user.id, request)
-        
-        workflow = WeeklyPlanningWorkflow(
-            calendar_service=calendar_tool.calendar_service,
-            task_service=task_tool.task_service
-        )
-        
-        from src.workflows.base import WorkflowContext
-        context = WorkflowContext.create(
-            workflow_name="weekly_planning",
+        task = run_workflow.delay(
             user_id=user.id,
+            workflow_name="weekly_planning",
             params=params.model_dump()
         )
         
-        context.start()
-        result = await workflow.execute(context)
-        context.complete(result)
-        
-        return WorkflowResponse(
-            workflow_id=context.workflow_id,
-            status="completed",
-            result=result,
-            duration_seconds=(
-                context.completed_at - context.started_at
-            ).total_seconds() if context.completed_at and context.started_at else 0
-        )
+        return {
+            "workflow_id": task.id,
+            "status": "queued",
+            "message": "Weekly planning started in background",
+            "check_status_url": f"/api/workflows/status/{task.id}"
+        }
         
     except Exception as e:
-        logger.error(f"Weekly planning failed: {e}")
+        logger.error(f"Failed to queue weekly-planning: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @router.get("/end-of-day")
 async def end_of_day_review(
-    include_email_stats: bool = True,
-    user: User = Depends(require_session),
-    request = None
+    include_email_stats: bool = Query(default=True),
+    user: User = Depends(require_session)
 ):
     """
-    Generate end-of-day review.
-    
-    Provides:
-    - Today's accomplishments
-    - Tasks completed
-    - Productivity score
-    - Tomorrow's preview
-    - Personalized insights
+    Generate end-of-day review in the background.
     """
     try:
-        calendar_tool = await AppState.get_calendar_tool(user.id, request)
-        task_tool = await AppState.get_task_tool(user.id, request)
-        email_service = None
-        
-        if include_email_stats:
-            try:
-                email_tool = await AppState.get_email_tool(user.id, request)
-                email_service = email_tool.email_service
-            except:
-                pass  # Email stats are optional
-        
-        workflow = EndOfDayReviewWorkflow(
-            calendar_service=calendar_tool.calendar_service,
-            task_service=task_tool.task_service,
-            email_service=email_service
-        )
-        
-        from src.workflows.base import WorkflowContext
-        context = WorkflowContext.create(
-            workflow_name="end_of_day_review",
+        task = run_workflow.delay(
             user_id=user.id,
+            workflow_name="end_of_day_review",
             params={"include_email_stats": include_email_stats}
         )
         
-        context.start()
-        result = await workflow.execute(context)
-        context.complete(result)
-        
-        return WorkflowResponse(
-            workflow_id=context.workflow_id,
-            status="completed",
-            result=result,
-            duration_seconds=(
-                context.completed_at - context.started_at
-            ).total_seconds() if context.completed_at and context.started_at else 0
-        )
+        return {
+            "workflow_id": task.id,
+            "status": "queued",
+            "message": "End-of-day review started in background",
+            "check_status_url": f"/api/workflows/status/{task.id}"
+        }
         
     except Exception as e:
-        logger.error(f"End of day review failed: {e}")
+        logger.error(f"Failed to queue end-of-day: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @router.post("/batch-emails")
 async def batch_process_emails(
     params: BatchEmailParams,
-    user: User = Depends(require_session),
-    request = None
+    user: User = Depends(require_session)
 ):
     """
-    Process multiple emails in batch.
-    
-    Can process:
-    - Specific email IDs
-    - Unread emails (default)
-    - Custom Gmail query
+    Process multiple emails in batch in the background.
     """
     try:
-        email_tool = await AppState.get_email_tool(user.id, request)
-        calendar_tool = await AppState.get_calendar_tool(user.id, request)
-        task_tool = await AppState.get_task_tool(user.id, request)
-        
-        ai_analyzer = getattr(email_tool, 'email_ai_analyzer', None)
-        if not ai_analyzer:
-            raise HTTPException(
-                status_code=400,
-                detail="Email AI analyzer not available"
-            )
-        
-        workflow = BatchEmailProcessorWorkflow(
-            email_service=email_tool.email_service,
-            calendar_service=calendar_tool.calendar_service,
-            task_service=task_tool.task_service,
-            email_ai_analyzer=ai_analyzer
-        )
-        
-        from src.workflows.base import WorkflowContext
-        context = WorkflowContext.create(
-            workflow_name="batch_email_processor",
+        task = run_workflow.delay(
             user_id=user.id,
+            workflow_name="batch_email_processor",
             params=params.model_dump()
         )
         
-        context.start()
-        result = await workflow.execute(context)
-        context.complete(result)
+        return {
+            "workflow_id": task.id,
+            "status": "queued",
+            "message": "Batch email processing started in background",
+            "check_status_url": f"/api/workflows/status/{task.id}"
+        }
         
-        return WorkflowResponse(
-            workflow_id=context.workflow_id,
-            status="completed",
-            result=result,
-            duration_seconds=(
-                context.completed_at - context.started_at
-            ).total_seconds() if context.completed_at and context.started_at else 0
-        )
-        
-    except HTTPException:
-        raise
     except Exception as e:
-        logger.error(f"Batch email processing failed: {e}")
+        logger.error(f"Failed to queue batch-emails: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 

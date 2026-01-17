@@ -71,8 +71,20 @@ class MapsTool(BaseTool):
                         summary += " Start: " + ", ".join([s.get('html_instructions', '') for s in steps])
                     return summary
                 return f"Could not get directions from {start} to {end}."
+            
+            elif action == "search" or action == "search_nearby":
+                query = kwargs.get("query", "") or location
+                if not query: return "Please provide a search query."
                 
-            else:
+                places = asyncio.run(self._service.search_nearby_places_async(query))
+                if not places:
+                    return f"I couldn't find any places matching '{query}'."
+                
+                summary = f"Found {len(places)} places for '{query}':\n"
+                for i, p in enumerate(places, 1):
+                    rating_str = f" ({p['rating']}★)" if p.get('rating') else ""
+                    summary += f"{i}. **{p['name']}**{rating_str}\n   {p['address']}\n"
+                return summary
                 return f"Unknown action: {action}"
                 
         except Exception as e:

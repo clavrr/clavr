@@ -132,7 +132,9 @@ class EmailParser(BaseParser):
             try:
                 ms = int(email_data.get('internalDate'))
                 date_raw = datetime.fromtimestamp(ms/1000.0).isoformat()
-            except: pass
+            except (ValueError, TypeError, OSError):
+                # Invalid timestamp format, will fallback to current date
+                pass
             
         parsed_date = self._parse_date_to_date_only(date_raw)
         if not parsed_date:
@@ -560,7 +562,9 @@ Respond ONLY with the JSON, no other text."""
                 if fin.get('amount'):
                     parts.append(f"TOTAL AMOUNT: ${fin['amount']} ({fin.get('currency', 'USD')})")
                     parts.append(f"MERCHANT: {fin.get('merchant', 'Unknown')}")
-            except: pass
+            except (json.JSONDecodeError, TypeError, KeyError):
+                # Financial info parsing failed, skip this section
+                pass
         
         body = email_data.get('body', '')
         if body:
@@ -585,7 +589,8 @@ Respond ONLY with the JSON, no other text."""
             from email.utils import parsedate_to_datetime
             dt = parsedate_to_datetime(date_str)
             return dt.isoformat()
-        except:
+        except (ValueError, TypeError):
+            # Date parsing failed, return original string
             return date_str
     
     def _parse_date_to_date_only(self, date_str: str) -> Optional[str]:
@@ -598,14 +603,14 @@ Respond ONLY with the JSON, no other text."""
             dt = parsedate_to_datetime(date_str)
             # Return date only in YYYY-MM-DD format
             return dt.strftime('%Y-%m-%d')
-        except:
+        except (ValueError, TypeError):
             # Fallback: try to extract date from string
             try:
                 # Try ISO format first
                 from datetime import datetime
                 dt = datetime.fromisoformat(date_str.replace('Z', '+00:00'))
                 return dt.strftime('%Y-%m-%d')
-            except:
+            except (ValueError, TypeError):
                 # Last resort: return as-is (might fail validation)
                 return date_str[:10] if len(date_str) >= 10 else date_str
 

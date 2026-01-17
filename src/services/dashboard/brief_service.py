@@ -13,9 +13,9 @@ import asyncio
 import pytz
 
 from src.utils.logger import setup_logger
-from src.utils.config import Config, get_timezone
+from src.utils.config import Config, get_timezone, ConfigDefaults
 from src.database import get_db_context
-from src.database.models import ActionableItem, User
+from src.database.models import ActionableItem, User, GhostDraft
 from sqlalchemy import select, and_, or_
 
 # Integrations
@@ -57,11 +57,14 @@ class BriefService:
         ]
         if not fast_mode:
             tasks.append(self._get_documents(user_id))
+        
+        # Always fetch Ghost drafts (internal and fast)
+        tasks.append(self._get_ghost_drafts(user_id))
             
         results = await asyncio.gather(*tasks, return_exceptions=True)
         
         # Unpack results handling errors
-        emails, todos, meetings, documents = [], [], [], []
+        emails, todos, meetings, documents, ghost_drafts = [], [], [], [], []
         
         if len(results) > 0 and isinstance(results[0], list): emails = results[0]
         else: logger.error(f"[BriefService] Emails failed: {results[0] if len(results) > 0 else 'N/A'}")
@@ -72,9 +75,15 @@ class BriefService:
         if len(results) > 2 and isinstance(results[2], list): meetings = results[2]
         else: logger.error(f"[BriefService] Meetings failed: {results[2] if len(results) > 2 else 'N/A'}")
 
-        if not fast_mode and len(results) > 3:
-            if isinstance(results[3], list): documents = results[3]
-            else: logger.error(f"[BriefService] Documents failed: {results[3]}")
+        idx = 3
+        if not fast_mode:
+            if len(results) > idx and isinstance(results[idx], list): documents = results[idx]
+            else: logger.error(f"[BriefService] Documents failed: {results[idx] if len(results) > idx else 'N/A'}")
+            idx += 1
+            
+        # Ghost drafts are usually the last task
+        if len(results) > idx and isinstance(results[idx], list):
+            ghost_drafts = results[idx]
         
         # 2. Skip slow LLM-based summarization in fast_mode (voice optimization)
         # _generate_smart_reminders takes ~6-8s, which is too slow for voice (~1s limit)
@@ -107,7 +116,8 @@ class BriefService:
                 emails=emails,
                 todos=todos,
                 meetings=meetings,
-                documents=documents
+                documents=documents,
+                ghost_drafts=ghost_drafts
             )
 
         return {
@@ -115,6 +125,7 @@ class BriefService:
             "todos": todos,
             "meetings": meetings,
             "documents": documents,
+            "ghost_drafts": ghost_drafts,
             "reminders": reminders
         }
 
@@ -144,28 +155,16 @@ class BriefService:
             logger.info(f"[BriefService] Found {len(messages)} emails")
             
             # Promotional sender patterns to exclude (be specific to avoid over-filtering)
-            promo_patterns = [
-                # Newsletter platforms (most reliable to filter)
-                '@substack.com', '@beehiiv.com',
-                '@convertkit.com', '@ghost.io',
-                '@interviewcake.com', 
-                # Social media notifications
-                '@facebookmail.com', 
-                # E-commerce / Streaming notifications
-                '@primevideo.com', '@email.amazon.com', '@netflix.com',
-                '@spotify.com', '@doordash.com', 
-                # Explicit marketing only
-                'newsletter@', 'marketing@',
-            ]
+            # Promotional sender patterns to exclude
+            promo_patterns = ConfigDefaults.EMAIL_PROMO_PATTERNS
             
             brief_emails = []
             for msg in messages:
                 sender = msg.get('sender', '').lower()
                 logger.info(f"[BriefService] Checking email from: {sender}")
                 
-                # Skip promotional emails (TEMPORARILY DISABLED for debugging)
-                # is_promo = any(pattern in sender for pattern in promo_patterns)
-                is_promo = False
+                # Skip promotional emails
+                is_promo = any(pattern in sender for pattern in promo_patterns)
                 
                 if is_promo:
                     logger.info(f"[BriefService] Skipping promotional email from: {sender}")
@@ -258,7 +257,10 @@ class BriefService:
                                 is_overdue = dt < now
                             else:
                                 is_overdue = dt < now.replace(tzinfo=None)
-                        except Exception: pass
+                        except Exception as e:
+                            logger.warning(f"[BriefService] Date parsing failed for task {t.get('id')}: {e}")
+                            # urgency defaults to medium if date parse fails
+                            pass
 
                     external_tasks.append({
                         "id": t['id'],
@@ -368,6 +370,29 @@ class BriefService:
             
         except Exception as e:
             logger.error(f"[BriefService] Calendar error: {e}", exc_info=True)
+            return []
+
+    async def _get_ghost_drafts(self, user_id: int) -> List[Dict]:
+        """Fetch pending Ghost drafts."""
+        try:
+            with get_db_context() as session:
+                query = select(GhostDraft).where(
+                    and_(
+                        GhostDraft.user_id == user_id,
+                        GhostDraft.status == 'draft'
+                    )
+                ).order_by(GhostDraft.created_at.desc()).limit(5)
+                
+                drafts = session.execute(query).scalars().all()
+                return [{
+                    "id": d.id,
+                    "title": d.title,
+                    "type": "draft",
+                    "integration": d.integration_type,
+                    "confidence": d.confidence
+                } for d in drafts]
+        except Exception as e:
+            logger.error(f"[BriefService] Ghost drafts error: {e}")
             return []
 
     async def _get_documents(self, user_id: int) -> List[Dict]:
@@ -499,7 +524,8 @@ class BriefService:
         emails: List[Dict],
         todos: List[Dict],
         meetings: List[Dict],
-        documents: List[Dict] = []
+        documents: List[Dict] = [],
+        ghost_drafts: List[Dict] = []
     ) -> Dict[str, Any]:
         """
         Generate intelligent reminders by aggregating emails, todos, and meetings.
@@ -559,6 +585,20 @@ class BriefService:
                     "link": doc.get('link')
                 })
         
+        # 3c. Add Ghost Drafts (High confidence ones)
+        for draft in ghost_drafts:
+            # We only add clearly high-confidence drafts to the primary reminders list
+            # to avoid cluttering with low-confidence "ghost noise"
+            if draft.get('confidence', 0) > 0.7:
+                items.append({
+                    "title": f"Review {draft.get('integration', 'Linear')} Draft: {draft.get('title')}",
+                    "subtitle": "Proactive Ghost Suggestion",
+                    "type": "ghost_draft",
+                    "urgency": "high" if draft.get('confidence', 0) > 0.9 else "medium",
+                    "due_date": datetime.now().isoformat(), # Suggestions are always "for now"
+                    "id": f"ghost_{draft.get('id')}"
+                })
+    
         # 4. Also check ActionableItems (bills, deadlines) from database
         try:
             with get_db_context() as session:
@@ -613,7 +653,8 @@ class BriefService:
                 return False
             now = datetime.now(dt.tzinfo) if dt.tzinfo else datetime.now()
             return (dt - now).total_seconds() < 7200  # 2 hours
-        except:
+        except (ValueError, TypeError, AttributeError):
+            # Datetime parsing failed
             return False
     
     async def _generate_greeting(self, user_name: str, items: List[Dict]) -> str:
@@ -669,6 +710,12 @@ Generate ONLY the greeting, nothing else:"""
         3. High-priority unread emails (sent within last 24h).
         """
         try:
+            # 0. Check Ghost Drafts (High confidence ones)
+            ghost_drafts = await self._get_ghost_drafts(user_id)
+            for draft in ghost_drafts:
+                if draft.get('confidence', 0) > 0.8:
+                    return f"I've drafted a {draft.get('integration')} issue for you: '{draft.get('title')}'"
+
             # 1. Check Meetings (Upcoming in next 30 mins)
             if self.calendar_service:
                 meetings = await self._get_meetings(user_id)
@@ -703,7 +750,8 @@ Generate ONLY the greeting, nothing else:"""
                     item = session.execute(query).scalar_one_or_none()
                     if item:
                         return f"your {item.item_type} '{item.title}' is due today"
-            except Exception:
+            except Exception as e:
+                logger.error(f"[BriefService] ActionableItem reminder query failed: {e}")
                 pass
 
             return None

@@ -125,8 +125,8 @@ class EndOfDayReviewWorkflow(Workflow):
                     start_dt = datetime.fromisoformat(start.replace('Z', '+00:00'))
                     end_dt = datetime.fromisoformat(end.replace('Z', '+00:00'))
                     total_minutes += (end_dt - start_dt).total_seconds() / 60
-                except:
-                    total_minutes += 60
+                except Exception as e:
+                    logger.debug(f"[EndOfDayReview] Failed to parse event time: {e}")
         
         return {
             "events_attended": len(events),

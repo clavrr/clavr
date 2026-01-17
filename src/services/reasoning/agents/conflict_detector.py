@@ -21,6 +21,7 @@ from src.utils.config import Config
 from src.services.indexing.graph.manager import KnowledgeGraphManager
 from src.services.indexing.graph.schema import NodeType, RelationType
 from src.services.reasoning.interfaces import ReasoningAgent, ReasoningResult
+from src.services.service_constants import ServiceConstants
 
 logger = setup_logger(__name__)
 
@@ -57,6 +58,7 @@ class ConflictDetectorAgent(ReasoningAgent):
             self._detect_attendee_conflicts(user_id),
             self._detect_deadline_conflicts(user_id),
             self._detect_workload_conflicts(user_id),
+            self._detect_linear_calendar_conflicts(user_id),  # New: Linear vs Calendar
         ]
         
         try:
@@ -159,7 +161,11 @@ class ConflictDetectorAgent(ReasoningAgent):
                             continue  # Minor overlap, skip
                             
                         # Higher confidence for longer overlaps
-                        confidence = min(0.95, 0.6 + (overlap_minutes / 120))
+                        base_conf = ServiceConstants.CONFLICT_CALENDAR_OVERLAP_CONFIDENCE_BASE
+                        max_conf = ServiceConstants.CONFLICT_CALENDAR_OVERLAP_CONFIDENCE_MAX
+                        max_minutes = ServiceConstants.CONFLICT_MAX_OVERLAP_MINUTES
+                        
+                        confidence = min(max_conf, base_conf + (overlap_minutes / max_minutes))
                         
                         content = {
                             "content": f"Scheduling conflict: '{event_a['title']}' and '{event_b['title']}' overlap by {overlap_minutes} minutes",
@@ -257,7 +263,7 @@ class ConflictDetectorAgent(ReasoningAgent):
                     
                     results.append(ReasoningResult(
                         type="insight",
-                        confidence=0.9,
+                        confidence=ServiceConstants.CONFLICT_ATTENDEE_CONFIDENCE,
                         content=content,
                         source_agent=self.name
                     ))
@@ -330,7 +336,10 @@ class ConflictDetectorAgent(ReasoningAgent):
                     task_titles = [t["title"][:30] for t in date_tasks[:3]]
                     high_priority_count = sum(1 for t in date_tasks if t.get("priority") == "high")
                     
-                    confidence = min(0.9, 0.5 + (len(date_tasks) * 0.1))
+                    base_conf = ServiceConstants.CONFLICT_DEADLINE_CLUSTER_CONFIDENCE_BASE
+                    max_conf = ServiceConstants.CONFLICT_DEADLINE_CLUSTER_CONFIDENCE_MAX
+                    
+                    confidence = min(max_conf, base_conf + (len(date_tasks) * 0.1))
                     
                     content = {
                         "content": f"{len(date_tasks)} tasks due on {date_key}: {', '.join(task_titles)}...",
@@ -435,7 +444,10 @@ class ConflictDetectorAgent(ReasoningAgent):
                 task_count = task_result[0] if task_result and isinstance(task_result[0], int) else 0
                 
                 # Flag if heavy meetings (>5 hours) AND multiple tasks due
-                if meeting_hours >= 5 and task_count >= 2:
+                meeting_threshold = ServiceConstants.CONFLICT_WORKLOAD_MEETING_HOURS
+                task_threshold = ServiceConstants.CONFLICT_WORKLOAD_TASK_COUNT
+                
+                if meeting_hours >= meeting_threshold and task_count >= task_threshold:
                     day_name = check_date.strftime("%A, %B %d")
                     
                     content = {
@@ -450,7 +462,7 @@ class ConflictDetectorAgent(ReasoningAgent):
                     
                     results.append(ReasoningResult(
                         type="insight",
-                        confidence=0.8,
+                        confidence=ServiceConstants.CONFLICT_WORKLOAD_CONFIDENCE,
                         content=content,
                         source_agent=self.name
                     ))
@@ -459,4 +471,146 @@ class ConflictDetectorAgent(ReasoningAgent):
                 logger.error(f"[{self.name}] Workload analysis for day {day_offset} failed: {e}")
                 continue
                 
+        return results
+
+    async def _detect_linear_calendar_conflicts(self, user_id: int) -> List[ReasoningResult]:
+        """
+        Detect conflicts between high-priority Linear deadlines and calendar commitments.
+        
+        This is a KEY competitive advantage feature.
+        
+        Examples:
+        - "You have a High Priority Linear deadline Friday but 6 hours of meetings"
+        - "ENG-234 is due in 2 days but you're in back-to-back meetings"
+        """
+        results = []
+        
+        try:
+            # Get high-priority Linear issues with upcoming deadlines (AQL)
+            now = datetime.utcnow()
+            week_ahead = (now + timedelta(days=7)).isoformat()
+            today = now.date().isoformat()
+            
+            linear_query = """
+            FOR i IN LinearIssue
+                FILTER i.user_id == @user_id
+                   AND i.priority IN [1, 2]
+                   AND i.stateType != 'completed'
+                   AND i.stateType != 'canceled'
+                   AND i.dueDate != null
+                   AND i.dueDate >= @today
+                   AND i.dueDate <= @week_ahead
+                SORT i.priority, i.dueDate ASC
+                RETURN {
+                    id: i.id,
+                    identifier: i.identifier,
+                    title: i.title,
+                    priority: i.priority,
+                    due_date: i.dueDate,
+                    url: i.url
+                }
+            """
+            
+            issues = await self.graph.execute_query(linear_query, {
+                "user_id": user_id,
+                "today": today,
+                "week_ahead": week_ahead
+            })
+            
+            if not issues:
+                return results
+            
+            # For each high-priority issue, check meeting load on due date
+            for issue in issues:
+                due_str = issue.get("due_date")
+                if not due_str:
+                    continue
+                
+                try:
+                    if isinstance(due_str, str):
+                        due_date = datetime.fromisoformat(due_str.replace('Z', '+00:00'))
+                    else:
+                        due_date = due_str
+                    
+                    # Get meetings on that day
+                    day_start = due_date.replace(hour=0, minute=0, second=0)
+                    day_end = due_date.replace(hour=23, minute=59, second=59)
+                    
+                    # AQL query for calendar events
+                    meeting_query = """
+                    FOR e IN CalendarEvent
+                        FILTER e.user_id == @user_id
+                           AND e.start_time >= @day_start
+                           AND e.start_time <= @day_end
+                        RETURN {
+                            start: e.start_time,
+                            end: e.end_time,
+                            title: e.title
+                        }
+                    """
+                    
+                    meetings = await self.graph.execute_query(meeting_query, {
+                        "user_id": user_id,
+                        "day_start": day_start.isoformat(),
+                        "day_end": day_end.isoformat()
+                    })
+                    
+                    # Calculate total meeting hours
+                    total_minutes = 0
+                    for meeting in meetings or []:
+                        start_str = meeting.get("start")
+                        end_str = meeting.get("end")
+                        if start_str and end_str:
+                            try:
+                                start = datetime.fromisoformat(str(start_str).replace('Z', '+00:00'))
+                                end = datetime.fromisoformat(str(end_str).replace('Z', '+00:00'))
+                                total_minutes += int((end - start).total_seconds() / 60)
+                            except (ValueError, TypeError):
+                                pass
+                    
+                    meeting_hours = total_minutes / 60
+                    
+                    # Flag if heavy meeting day (>4 hours) conflicts with high-priority deadline
+                    if meeting_hours >= 4:
+                        priority_str = "Urgent" if issue.get("priority") == 1 else "High Priority"
+                        identifier = issue.get("identifier", "Issue")
+                        title = issue.get("title", "Untitled")[:40]
+                        day_name = due_date.strftime("%A, %b %d")
+                        
+                        content = {
+                            "content": f"⚠️ {priority_str} Linear deadline '{identifier}: {title}' is due {day_name}, but you have {meeting_hours:.1f} hours of meetings scheduled",
+                            "type": "conflict",
+                            "conflict_type": "linear_calendar_conflict",
+                            "issue_id": issue.get("id"),
+                            "issue_identifier": identifier,
+                            "issue_title": title,
+                            "issue_url": issue.get("url"),
+                            "due_date": due_date.date().isoformat(),
+                            "meeting_hours": round(meeting_hours, 1),
+                            "priority": priority_str,
+                            "actionable": True,
+                            "suggested_actions": [
+                                f"Reschedule some meetings on {day_name}",
+                                f"Request deadline extension for {identifier}",
+                                "Notify team of capacity constraint"
+                            ]
+                        }
+                        
+                        # Higher confidence for urgent (P1) issues
+                        confidence = 0.9 if issue.get("priority") == 1 else 0.8
+                        
+                        results.append(ReasoningResult(
+                            type="insight",
+                            confidence=confidence,
+                            content=content,
+                            source_agent=self.name
+                        ))
+                        
+                except (ValueError, TypeError) as e:
+                    logger.debug(f"[{self.name}] Date parse failed for issue: {e}")
+                    continue
+                    
+        except Exception as e:
+            logger.error(f"[{self.name}] Linear calendar conflict detection failed: {e}")
+        
         return results

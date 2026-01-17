@@ -42,16 +42,14 @@ async def lifespan(app: FastAPI):
             
             config = AppState.get_config()
             rag_engine = AppState.get_rag_engine()
-            # Assuming we can get graph_manager from somewhere, or verify if it's available
-            # AppState might not have get_graph_manager explicitly exposed yet depending on implementation
-            # But usually it's initialized in main or services.
+            cross_stack_context = AppState.get_cross_stack_context()
             
             # For now, let's try to get it from AppState or skip if not available
             graph_manager = getattr(AppState, 'get_knowledge_graph_manager', lambda: None)()
             
             if rag_engine and graph_manager:
                  with get_db_context() as db:
-                    await start_unified_indexing(db, config, rag_engine, graph_manager)
+                    await start_unified_indexing(db, config, rag_engine, graph_manager, cross_stack_context)
         except Exception as e:
             logger.warning(f"Could not start Unified Indexer: {e}")
 

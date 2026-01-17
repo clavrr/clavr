@@ -126,7 +126,8 @@ class DailyDigestGenerator:
                 }
                 for r in (results or [])
             ]
-        except Exception:
+        except Exception as e:
+            logger.error(f"Failed to fetch today's schedule for user {user_id}: {e}", exc_info=True)
             return []
 
     def _is_due_today(self, due_date_str: Optional[str]) -> bool:

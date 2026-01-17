@@ -479,7 +479,8 @@ class CalendarTool(WorkflowEventMixin, BaseTool):
                                 
                                 # Clean the search query of date phrases/fillers to improve text matching
                                 clean_search = self._clean_query_text(search_query)
-                        except:
+                        except (ValueError, AttributeError):
+                            # Date parsing failed for search optimization, use full search
                             pass
 
                         # Search for the event
@@ -604,7 +605,8 @@ class CalendarTool(WorkflowEventMixin, BaseTool):
                             date_context = " for today"
                         else:
                             date_context = f" for {query_date.strftime('%B %d')}"
-                    except:
+                    except (ValueError, TypeError, AttributeError):
+                        # Date context extraction failed, continue without context
                         pass
                 
                 lines = [f"I found {len(events)} events{date_context}:\n"]
@@ -620,7 +622,7 @@ class CalendarTool(WorkflowEventMixin, BaseTool):
                             d_raw = data.get('date')
                             if dt_raw:
                                 try: return datetime.fromisoformat(dt_raw.replace('Z', '+00:00'))
-                                except: return None
+                                except (ValueError, TypeError): return None
                         return None
 
                     start_dt = parse_time(start_data)
@@ -645,14 +647,15 @@ class CalendarTool(WorkflowEventMixin, BaseTool):
                                     
                                 if start_dt <= check_now <= end_dt:
                                     is_ongoing = True
-                            except:
+                            except (TypeError, AttributeError):
+                                # Timezone comparison failed, skip ongoing check
                                 pass
                     elif isinstance(start_data, dict) and start_data.get('date'):
                         d_raw = start_data.get('date')
                         try:
                             dt = datetime.fromisoformat(d_raw)
                             time_str = f"All Day ({dt.strftime('%a, %b %d')})"
-                        except:
+                        except (ValueError, TypeError):
                             time_str = f"All Day ({d_raw})"
                     
                     summary = event.get('summary', event.get('title', 'No Title'))
@@ -660,10 +663,60 @@ class CalendarTool(WorkflowEventMixin, BaseTool):
                     
                     lines.append(f"**{summary}**{status_label}")
                     lines.append(f"   at {time_str}")
+                    
+                    # Add attendees for context awareness (crucial for "email everyone in that meeting" flows)
+                    attendees = event.get('attendees', [])
+                    if attendees:
+                        # each attendee is dict {'email': '...', 'responseStatus': '...'} or just a string
+                        att_list = []
+                        for att in attendees:
+                            if isinstance(att, dict):
+                                email = att.get('email')
+                                if email and not any(block in email for block in ['noreply', 'calendar.google.com']):
+                                    att_list.append(email)
+                            elif isinstance(att, str):
+                                att_list.append(att)
+                        
+                        if att_list:
+                            lines.append(f"   Attendees: {', '.join(att_list)}")
+
                     lines.append("")
                 
                 return "\n".join(lines)
 
+                return "\n".join(lines)
+
+            elif action in ["find_free_time", "find_gap", "availability"]:
+                duration = kwargs.get('duration_minutes', 30)
+                # Default to today if not specified
+                start_search = kwargs.get('start_time') or kwargs.get('start_date') or datetime.now().isoformat()
+                
+                # Default to next 24h if end not specified
+                end_search = kwargs.get('end_time') or kwargs.get('end_date')
+                
+                free_slots = self._service.find_free_time(
+                    duration_minutes=duration,
+                    max_suggestions=5,
+                    start_datetime=start_search if isinstance(start_search, datetime) else None,
+                    end_datetime=end_search if isinstance(end_search, datetime) else None,
+                    working_hours_only=kwargs.get('working_hours_only', True)
+                )
+                
+                if not free_slots:
+                    return "I couldn't find any free slots of that duration."
+                
+                lines = [f"Found available slots for {duration} mins:"]
+                for slot in free_slots:
+                    start_raw = slot.get('start', '')
+                    if start_raw:
+                        try:
+                            start_dt = datetime.fromisoformat(start_raw.replace('Z', '+00:00'))
+                            lines.append(f"- {start_dt.strftime('%A, %I:%M %p')}")
+                        except Exception:
+                            lines.append(f"- {start_raw}")
+                            
+                return "\n".join(lines)
+                
             else:
                 return f"Error: Unknown action '{action}'"
 

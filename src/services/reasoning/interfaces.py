@@ -30,7 +30,7 @@ class ReasoningAgent(ABC):
     @abstractmethod
     def name(self) -> str:
         """Name of the agent."""
-        pass
+        raise NotImplementedError("Subclasses must implement name property")
         
     @abstractmethod
     async def analyze(self, user_id: int, context: Optional[Dict[str, Any]] = None) -> List[ReasoningResult]:
@@ -44,7 +44,7 @@ class ReasoningAgent(ABC):
         Returns:
             List of ReasoningResults
         """
-        pass
+        raise NotImplementedError("Subclasses must implement analyze()")
         
     @abstractmethod
     async def verify(self, hypothesis_id: str) -> bool:
@@ -57,4 +57,4 @@ class ReasoningAgent(ABC):
         Returns:
             True if verified, False if rejected
         """
-        pass
+        raise NotImplementedError("Subclasses must implement verify()")

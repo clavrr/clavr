@@ -73,11 +73,29 @@ def sync_user_emails(self, user_id: str, max_results: int = 100) -> Dict[str, An
             user.last_email_synced_at = datetime.utcnow()
             db.commit()
             
-            logger.info(f"Synced {len(messages)} emails for user {user_id}")
+            # Trigger webhooks for new emails (Ghost Piping)
+            from .webhook_tasks import trigger_email_received_webhook
+            
+            webhook_count = 0
+            for msg in messages:
+                # We only trigger if it's a recent message to avoid flooding
+                # For now, simplistic approach: trigger for all synced (consumer handles idempotency)
+                try:
+                    trigger_email_received_webhook.delay(
+                        email_id=msg.get('id'),
+                        email_data=msg,
+                        user_id=int(user_id) if str(user_id).isdigit() else user_id
+                    )
+                    webhook_count += 1
+                except Exception as e:
+                    logger.warning(f"Failed to trigger webhook for email {msg.get('id')}: {e}")
+            
+            logger.info(f"Synced {len(messages)} emails for user {user_id}, triggered {webhook_count} events")
             
             return {
                 'user_id': user_id,
                 'emails_synced': len(messages),
+                'events_triggered': webhook_count,
                 'sync_time': datetime.utcnow().isoformat(),
                 'status': 'success'
             }
@@ -180,6 +198,25 @@ def send_email(
         )
         
         logger.info(f"Email sent to {to}")
+        
+        # Trigger 'email.sent' webhook for Relationship Gardener
+        from .webhook_tasks import deliver_webhook_task
+        from src.database.webhook_models import WebhookEventType
+        
+        try:
+             deliver_webhook_task.delay(
+                event_type=WebhookEventType.EMAIL_SENT.value,
+                event_id=result.get('id', 'unknown'),
+                payload={
+                    'to': to,
+                    'subject': subject,
+                    'message_id': result.get('id'),
+                    'timestamp': datetime.utcnow().isoformat()
+                },
+                user_id=int(user_id) if str(user_id).isdigit() else user_id
+            )
+        except Exception as e:
+            logger.warning(f"Failed to trigger email.sent webhook: {e}")
         
         return {
             'to': to,

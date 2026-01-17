@@ -55,7 +55,7 @@ class ContactResolver:
         # Resolve "Carol" for user 123
         result = await resolver.resolve_alias("Carol", user_id=123)
         if result:
-            print(f"Found: {result.email}")  # carol.smith@company.com
+            logger.info(f"Found: {result.email}")  # carol.smith@company.com
     """
     
     def __init__(

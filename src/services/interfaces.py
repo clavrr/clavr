@@ -65,7 +65,7 @@ class EmailServiceInterface(ABC):
         attachments: Optional[List[Dict[str, Any]]] = None
     ) -> Dict[str, Any]:
         """Send a new email"""
-        pass
+        raise NotImplementedError()
     
     @abstractmethod
     def reply_to_email(
@@ -75,7 +75,7 @@ class EmailServiceInterface(ABC):
         reply_all: bool = False
     ) -> Dict[str, Any]:
         """Reply to an email"""
-        pass
+        raise NotImplementedError()
     
     @abstractmethod
     def search_emails(
@@ -84,12 +84,12 @@ class EmailServiceInterface(ABC):
         max_results: int = 50
     ) -> List[Dict[str, Any]]:
         """Search emails"""
-        pass
+        raise NotImplementedError()
     
     @abstractmethod
     def get_email(self, email_id: str) -> Dict[str, Any]:
         """Get a single email by ID"""
-        pass
+        raise NotImplementedError()
     
     @abstractmethod
     def list_emails(
@@ -98,22 +98,20 @@ class EmailServiceInterface(ABC):
         page_token: Optional[str] = None
     ) -> Dict[str, Any]:
         """List emails with pagination"""
-        pass
+        raise NotImplementedError()
     
     @abstractmethod
     def archive_email(self, email_id: str) -> Dict[str, Any]:
         """Archive an email"""
-        pass
+        raise NotImplementedError()
     
     @abstractmethod
     def delete_email(self, email_id: str) -> Dict[str, Any]:
         """Delete an email"""
-        pass
+        raise NotImplementedError()
 
 
-# ===================================================================
 # CALENDAR SERVICE INTERFACE
-# ===================================================================
 
 class CalendarServiceInterface(ABC):
     """Abstract interface for calendar services"""
@@ -129,7 +127,7 @@ class CalendarServiceInterface(ABC):
         calendar_id: str = "primary"
     ) -> Dict[str, Any]:
         """Create a new calendar event"""
-        pass
+        raise NotImplementedError()
     
     @abstractmethod
     def update_event(
@@ -142,7 +140,7 @@ class CalendarServiceInterface(ABC):
         calendar_id: str = "primary"
     ) -> Dict[str, Any]:
         """Update an existing event"""
-        pass
+        raise NotImplementedError()
     
     @abstractmethod
     def delete_event(
@@ -151,7 +149,7 @@ class CalendarServiceInterface(ABC):
         calendar_id: str = "primary"
     ) -> Dict[str, Any]:
         """Delete an event"""
-        pass
+        raise NotImplementedError()
     
     @abstractmethod
     def get_event(
@@ -160,7 +158,7 @@ class CalendarServiceInterface(ABC):
         calendar_id: str = "primary"
     ) -> Dict[str, Any]:
         """Get a single event by ID"""
-        pass
+        raise NotImplementedError()
     
     @abstractmethod
     def list_events(
@@ -171,7 +169,7 @@ class CalendarServiceInterface(ABC):
         max_results: int = 50
     ) -> List[Dict[str, Any]]:
         """List events in time range"""
-        pass
+        raise NotImplementedError()
     
     @abstractmethod
     def find_free_time(
@@ -182,12 +180,10 @@ class CalendarServiceInterface(ABC):
         calendar_id: str = "primary"
     ) -> List[Dict[str, Any]]:
         """Find free time slots"""
-        pass
+        raise NotImplementedError()
 
 
-# ===================================================================
-# TASK SERVICE INTERFACE
-# ===================================================================
+# TASK SERVICE INTERFACE 
 
 class TaskServiceInterface(ABC):
     """Abstract interface for task services"""
@@ -203,7 +199,7 @@ class TaskServiceInterface(ABC):
         tags: Optional[List[str]] = None
     ) -> Dict[str, Any]:
         """Create a new task"""
-        pass
+        raise NotImplementedError()
     
     @abstractmethod
     def update_task(
@@ -216,22 +212,22 @@ class TaskServiceInterface(ABC):
         status: Optional[str] = None
     ) -> Dict[str, Any]:
         """Update an existing task"""
-        pass
+        raise NotImplementedError()
     
     @abstractmethod
     def complete_task(self, task_id: str) -> Dict[str, Any]:
         """Mark a task as complete"""
-        pass
+        raise NotImplementedError()
     
     @abstractmethod
     def delete_task(self, task_id: str) -> Dict[str, Any]:
         """Delete a task"""
-        pass
+        raise NotImplementedError()
     
     @abstractmethod
     def get_task(self, task_id: str) -> Dict[str, Any]:
         """Get a single task by ID"""
-        pass
+        raise NotImplementedError()
     
     @abstractmethod
     def list_tasks(
@@ -240,7 +236,7 @@ class TaskServiceInterface(ABC):
         limit: int = 100
     ) -> List[Dict[str, Any]]:
         """List tasks with filters"""
-        pass
+        raise NotImplementedError()
     
     @abstractmethod
     def search_tasks(
@@ -250,7 +246,7 @@ class TaskServiceInterface(ABC):
         category: Optional[str] = None
     ) -> List[Dict[str, Any]]:
         """Search tasks"""
-        pass
+        raise NotImplementedError()
 
 
 # ===================================================================
@@ -268,7 +264,7 @@ class RAGServiceInterface(ABC):
         use_llm: bool = True
     ) -> Dict[str, Any]:
         """Get context for a query using semantic search"""
-        pass
+        raise NotImplementedError()
     
     @abstractmethod
     def add_documents(
@@ -276,7 +272,7 @@ class RAGServiceInterface(ABC):
         documents: List[Dict[str, Any]]
     ) -> Dict[str, Any]:
         """Add documents to the knowledge base"""
-        pass
+        raise NotImplementedError()
     
     @abstractmethod
     def search_knowledge(
@@ -285,7 +281,7 @@ class RAGServiceInterface(ABC):
         filters: Optional[Dict[str, Any]] = None
     ) -> List[Dict[str, Any]]:
         """Search the knowledge base"""
-        pass
+        raise NotImplementedError()
     
     @abstractmethod
     def get_insights(
@@ -294,7 +290,7 @@ class RAGServiceInterface(ABC):
         context_window: int = 30
     ) -> Dict[str, Any]:
         """Get insights about a topic"""
-        pass
+        raise NotImplementedError()
 
 
 # ===================================================================
@@ -307,22 +303,22 @@ class ServiceFactoryInterface(ABC):
     @abstractmethod
     def create_email_service(self, **kwargs) -> EmailServiceInterface:
         """Create email service instance"""
-        pass
+        raise NotImplementedError()
     
     @abstractmethod
     def create_calendar_service(self, **kwargs) -> CalendarServiceInterface:
         """Create calendar service instance"""
-        pass
+        raise NotImplementedError()
     
     @abstractmethod
     def create_task_service(self, **kwargs) -> TaskServiceInterface:
         """Create task service instance"""
-        pass
+        raise NotImplementedError()
     
     @abstractmethod
     def create_rag_service(self, **kwargs) -> RAGServiceInterface:
         """Create RAG service instance"""
-        pass
+        raise NotImplementedError()
 
 
 # ===================================================================

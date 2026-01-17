@@ -19,7 +19,6 @@ from src.services.graph_search_service import GraphSearchService
 logger = setup_logger(__name__)
 router = APIRouter(prefix="/api/graph", tags=["knowledge_graph"])
 
-
 # ============================================
 # REQUEST/RESPONSE MODELS
 # ============================================

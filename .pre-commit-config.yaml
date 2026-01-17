@@ -1,0 +1,37 @@
+# Pre-commit hooks for code quality
+# Install: pip install pre-commit && pre-commit install
+
+repos:
+  - repo: local
+    hooks:
+      - id: check-circular-imports
+        name: Check Circular Imports
+        entry: python scripts/check_circular_imports.py
+        language: system
+        pass_filenames: false
+        always_run: true
+        
+      - id: test-critical-imports
+        name: Test Critical Imports
+        entry: python -c "from src.utils import QueryClassifier; from src.ai.rag import RAGEngine; from src.services import RAGService; print('✓ Imports OK')"
+        language: system
+        pass_filenames: false
+        always_run: true
+
+  - repo: https://github.com/psf/black
+    rev: 24.1.1
+    hooks:
+      - id: black
+        language_version: python3.9
+        
+  - repo: https://github.com/pycqa/isort
+    rev: 5.13.2
+    hooks:
+      - id: isort
+        args: ["--profile", "black"]
+
+
+
+
+
+

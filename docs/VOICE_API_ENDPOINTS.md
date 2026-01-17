@@ -1,220 +1,120 @@
-# Voice API Endpoints
+# Voice API Endpoints (Real-time Gemini Live)
 
-This document describes the API endpoints available for voice integration.
+This document describes the WebSocket-based real-time voice interface for Clavr, leveraging the Gemini Live API for low-latency, natural interactions.
 
-## Base URL
-
-All voice endpoints are prefixed with `/api/voice`:
+## Base WebSocket URL
 
 ```
-http://localhost:8000/api/voice
+ws://localhost:8000/api/voice/ws/transcribe
 ```
 
 ## Authentication
 
-All endpoints require authentication. Include the authentication token in the request headers:
+Authentication is required and can be performed in two ways:
 
-```
-Authorization: Bearer YOUR_TOKEN
-```
+1. **Query Parameter**:
+   ```
+   ws://localhost:8000/api/voice/ws/transcribe?token=YOUR_SESSION_TOKEN
+   ```
 
----
-
-## Endpoints
-
-### 1. POST `/api/voice/transcribe`
-
-**Standard voice transcription endpoint** - Processes voice input and returns complete response.
-
-**Request Headers:**
-```
-Content-Type: application/json
-Authorization: Bearer YOUR_TOKEN
-```
-
-**Request Body:**
-```json
-{
-  "audio_data": "base64_encoded_audio_string",
-  "mime_type": "audio/webm",
-  "session_id": "optional_session_id"
-}
-```
-
-**Request Fields:**
-- `audio_data` (string, required): Base64-encoded audio data from browser MediaRecorder
-- `mime_type` (string, optional, default: "audio/webm"): MIME type of audio (e.g., "audio/webm", "audio/webm;codecs=opus")
-- `session_id` (string, optional): Session ID for conversation context
-
-**Response:**
-```json
-{
-  "success": true,
-  "transcription": "raw transcript from STT",
-  "normalized": "cleaned and normalized transcript",
-  "response": "agent's text response (voice-formatted)",
-  "response_audio": "base64_encoded_mp3_audio",
-  "error": null
-}
-```
-
-**Response Fields:**
-- `success` (boolean): Whether the request succeeded
-- `transcription` (string, optional): Raw transcript from Speech-to-Text
-- `normalized` (string, optional): Normalized/cleaned transcript (only present if different from raw)
-- `response` (string, optional): Agent's text response (formatted for voice)
-- `response_audio` (string, optional): Base64-encoded MP3 audio of the response
-- `error` (string, optional): Error message if `success` is false
-
-**Status Codes:**
-- `200` - Success
-- `400` - Invalid request
-- `401` - Not authenticated
-- `500` - Server error
+2. **Auth Message (First Message)**:
+   Connect to the WebSocket and immediately send:
+   ```json
+   {
+     "type": "auth",
+     "token": "YOUR_SESSION_TOKEN"
+   }
+   ```
 
 ---
 
-### 2. POST `/api/voice/query`
+## Communication Protocol
 
-**Alias for `/transcribe`** - Provides the same functionality for backward compatibility.
+The voice interface uses a hybrid binary/text protocol over WebSockets.
 
-**Request/Response**: Same as `/api/voice/transcribe`
+### 1. Client to Server (Input)
 
----
+#### Audio Stream (Binary)
+Send raw PCM audio chunks as binary messages.
+- **Sample Rate**: 16,000 Hz
+- **Format**: 16-bit Linear PCM (S16_LE)
+- **Channels**: Mono
 
-### 3. POST `/api/voice/transcribe/stream`
+#### Control Messages (JSON Text)
+- `{"type": "auth", "token": "..."}`: Initial authentication.
+- `{"type": "stop"}`: Gracefully stop the current session.
 
-**Streaming voice transcription endpoint** - Provides real-time updates via Server-Sent Events (SSE).
+### 2. Server to Client (Output)
 
-**Request Headers:**
-```
-Content-Type: application/json
-Authorization: Bearer YOUR_TOKEN
-```
+#### Status Updates (JSON Text)
+- `{"type": "ready", "message": "Connected to Gemini Live"}`: Sent once authenticated and ready.
+- `{"type": "error", "message": "..."}`: Sent if an error occurs.
 
-**Request Body:** Same as `/api/voice/transcribe`
-
-**Response:** Server-Sent Events (SSE) stream with progressive updates
-
-**Event Types:**
-1. `transcribing` - STT in progress
-2. `transcribed` - Raw transcript available
-3. `normalizing` - Normalization in progress
-4. `normalized` - Normalized text available
-5. `processing` - Agent processing query
-6. `response` - Agent response ready
-7. `formatting` - Generating audio response
-8. `audio` - Audio response available
-9. `complete` - All processing done
-10. `error` - Error occurred
-
-**Event Format:**
-```
-data: {"event": "transcribing", "message": "Converting audio to text..."}
-
-data: {"event": "transcribed", "transcription": "raw transcript text"}
-
-data: {"event": "normalized", "normalized": "cleaned transcript"}
-
-data: {"event": "response", "response": "agent response text"}
-
-data: {"event": "audio", "audio": "base64_encoded_mp3"}
-
-data: {"event": "complete", "message": "All done!"}
-```
-
-**Response Headers:**
-```
-Content-Type: text/event-stream
-Cache-Control: no-cache
-Connection: keep-alive
-```
-
-**Status Codes:**
-- `200` - Success (streaming)
-- `400` - Invalid request
-- `401` - Not authenticated
-- `500` - Server error
-
----
-
-## Error Response Format
-
-All endpoints return errors in this format:
-
-```json
-{
-  "success": false,
-  "error": "Error message here",
-  "transcription": null,
-  "normalized": null,
-  "response": null,
-  "response_audio": null
-}
-```
-
-**Common Errors:**
-- `"Could not transcribe audio"` - STT failed (check audio format, credentials)
-- `"Voice processing failed: ..."` - General processing error
-- `401 Unauthorized` - Missing or invalid authentication token
-- `500 Internal Server Error` - Server-side error
+#### Agent Response (JSON Text)
+Incoming text chunks from the agent are streamed back to the client as they are generated.
 
 ---
 
 ## Request/Response Flow
 
-### Standard Endpoint (`/transcribe`)
-
 ```
-Client → POST /api/voice/transcribe
-         ↓
-      STT Service → Raw Transcript
-         ↓
-      Analyzer → Normalized Transcript
-         ↓
-      Orchestrator → Agent Response
-         ↓
-      Voice Formatter → Formatted Response
-         ↓
-      TTS Service → Audio Response
-         ↓
-      Client ← Complete Response (JSON)
+Client → Connect to WebSocket (with token)
+          ↓
+Server ←  Event: "ready"
+          ↓
+Client → Stream Binary Audio (PCM Chunks)
+          ↓
+Server → Process via VoiceService + Gemini Live
+          ↓
+Server ← Stream Text Response (JSON Chunks)
+          ↓
+Client → Play Audio (via Client-side TTS or Gemini Stream)
 ```
 
-### Streaming Endpoint (`/transcribe/stream`)
+## Implementation Notes
 
-```
-Client → POST /api/voice/transcribe/stream
-         ↓
-      SSE Stream Started
-         ↓
-      Event: "transcribing"
-         ↓
-      Event: "transcribed" (with raw transcript)
-         ↓
-      Event: "normalizing"
-         ↓
-      Event: "normalized" (with cleaned transcript)
-         ↓
-      Event: "processing"
-         ↓
-      Event: "response" (with agent response)
-         ↓
-      Event: "formatting"
-         ↓
-      Event: "audio" (with base64 audio)
-         ↓
-      Event: "complete"
-         ↓
-      Stream Closed
-```
+- **Noise Gating**: The server implements an energy-based noise gate (RMS threshold) to ignore silence and background noise.
+- **Audio Transcoding**: The server uses `StreamingTranscoder` to handle various input formats if necessary, though raw PCM is preferred for lowest latency.
+- **Tool Integration**: The voice agent has full access to Clavr tools (Calendar, Email, Ghost Drafts, etc.) and can execute actions based on voice commands.
+- **Personalization**: The voice script is dynamically personalized based on the user's name and recent proactive insights.
 
 ---
 
-## Notes
+## Client Examples (JavaScript)
 
-- **Audio Format**: Use `audio/webm` (default from browser MediaRecorder)
-- **Session Management**: Pass `session_id` to maintain conversation context
-- **Error Handling**: Always check `success` field and handle `error` messages
-- **Audio Playback**: Use HTML5 Audio API with base64 data URLs for `response_audio`
-- **Streaming**: Use EventSource API or fetch with streaming for SSE endpoints
+```javascript
+const socket = new WebSocket('ws://localhost:8000/api/voice/ws/transcribe?token=' + sessionToken);
+
+socket.onopen = () => {
+  console.log('Voice connection opened');
+};
+
+socket.onmessage = (event) => {
+  const data = JSON.parse(event.data);
+  if (data.type === 'ready') {
+    startStreamingAudio(socket);
+  } else if (data.text) {
+    console.log('Agent:', data.text);
+    // Optionally play via TTS if text-only
+  }
+};
+
+function startStreamingAudio(socket) {
+  navigator.mediaDevices.getUserMedia({ audio: true })
+    .then(stream => {
+      const audioContext = new AudioContext({ sampleRate: 16000 });
+      const source = audioContext.createMediaStreamSource(stream);
+      const processor = audioContext.createScriptProcessor(4096, 1, 1);
+
+      processor.onaudioprocess = (e) => {
+        const inputData = e.inputBuffer.getChannelData(0);
+        // Convert Float32 to Int16
+        const pcmData = convertFloat32ToInt16(inputData);
+        socket.send(pcmData.buffer);
+      };
+
+      source.connect(processor);
+      processor.connect(audioContext.destination);
+    });
+}
+```

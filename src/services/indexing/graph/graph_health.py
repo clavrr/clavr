@@ -149,8 +149,8 @@ class GraphHealthMonitor:
                 res = await self.graph.execute_query(query, {'user_id': user_id})
                 if res:
                     total_dups += sum(res) # Sum of all counts
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning(f"Error checking duplicates in {col}: {e}")
                 
         return total_dups
 

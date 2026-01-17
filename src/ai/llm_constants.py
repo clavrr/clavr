@@ -19,7 +19,13 @@ GEMINI_ALIASES: Tuple[str, ...] = (PROVIDER_GEMINI, PROVIDER_GOOGLE)
 SUPPORTED_PROVIDERS: List[str] = [PROVIDER_GEMINI, PROVIDER_GOOGLE]
 
 # Allowed Model List (Strict Enforcement)
-ALLOWED_MODELS: List[str] = [MODEL_GEMINI_3_FLASH, MODEL_GEMINI_2_5_FLASH]
+ALLOWED_MODELS: List[str] = [
+    MODEL_GEMINI_3_FLASH, 
+    MODEL_GEMINI_2_5_FLASH,
+    "gemini-1.5-flash", 
+    "gemini-1.5-pro",
+    "gemini-2.0-flash-exp"
+]
 
 # Default Values
 DEFAULT_TEMPERATURE = 0.0

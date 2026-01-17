@@ -10,6 +10,9 @@ from api.dependencies import get_db, get_integration_service, get_config, get_cu
 from src.database.models import User
 from src.utils.logger import setup_logger
 from src.utils.config import Config, get_frontend_url
+import hmac
+import hashlib
+import json
 
 logger = setup_logger(__name__)
 router = APIRouter(prefix="/integrations", tags=["integrations"])
@@ -80,3 +83,47 @@ async def get_integrations_status(
     """Get status of all integrations for the user."""
     integrations = await integration_service.get_user_integrations(user.id)
     return {"integrations": integrations}
+
+@router.post("/linear/webhook")
+async def linear_webhook(
+    request: Request,
+    config: Config = Depends(get_config)
+):
+    """
+    Handle incoming webhooks from Linear.
+    URL: /api/integrations/linear/webhook
+    """
+    # 1. Get raw body for signature verification
+    body = await request.body()
+    signature = request.headers.get("Linear-Signature")
+    
+    # 2. Verify signature if secret is configured
+    if config.linear_webhook_secret:
+        if not signature:
+            logger.warning("Missing Linear-Signature header")
+            raise HTTPException(status_code=401, detail="Missing signature")
+        
+        expected_signature = hmac.new(
+            config.linear_webhook_secret.encode(),
+            body,
+            hashlib.sha256
+        ).hexdigest()
+        
+        if not hmac.compare_digest(signature, expected_signature):
+            logger.warning("Invalid Linear signature")
+            raise HTTPException(status_code=401, detail="Invalid signature")
+    
+    # 3. Process payload
+    try:
+        payload = json.loads(body)
+        action = payload.get("action")
+        type_ = payload.get("type")
+        
+        logger.info(f"Received Linear webhook: {action} {type_}")
+        
+        # TODO: Implement specific event handlers (e.g. sync back to our DB)
+        # For now, we just acknowledge receipt
+        return {"success": True}
+        
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=400, detail="Invalid JSON")

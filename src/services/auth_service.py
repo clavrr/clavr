@@ -122,7 +122,8 @@ class AuthService:
             else:
                 try:
                     token_expiry = parser.parse(expiry_val)
-                except Exception:
+                except Exception as e:
+                    logger.debug(f"Failed to parse token_expiry '{expiry_val}': {e}")
                     token_expiry = None
         
         # Create session
@@ -177,101 +178,32 @@ class AuthService:
         return user, session, is_new_user, redirect_url
 
     def schedule_indexing(self, user_id: int, token_info: dict, delay_seconds: int = 30):
-        """Schedule background indexing task."""
-        async def _delayed_start():
-            try:
-                scopes = token_info.get('scopes', [])
-                if isinstance(scopes, str):
-                    scopes = scopes.split(' ')
-                
-                has_gmail = any('gmail.readonly' in s for s in scopes)
-                if not has_gmail:
-                    logger.info(f"Skipping indexing for user {user_id}: No Gmail access")
-                    return
+        """Schedule background indexing task duration."""
+        try:
+            from src.workers.tasks.indexing_tasks import index_user_emails
+            
+            # Check for Gmail scopes
+            scopes = token_info.get('scopes', [])
+            if isinstance(scopes, str):
+                scopes = scopes.split(' ')
+            
+            has_gmail = any('gmail.readonly' in s for s in scopes)
+            if not has_gmail:
+                logger.info(f"Skipping indexing for user {user_id}: No Gmail access")
+                return
 
-                await asyncio.sleep(delay_seconds)
-                
-                from src.services.indexing.unified_indexer import get_unified_indexer
-                from src.services.indexing.crawlers.email import EmailCrawler
-                from src.core.email.google_client import GoogleGmailClient
-                from google.oauth2.credentials import Credentials
-                from api.dependencies import AppState
-                from src.database import get_db_context
-                from src.database.models import Session as DBSession
-                from src.utils import encrypt_token
-                from sqlalchemy import update
-
-                config = AppState.get_config()
-                rag_engine = AppState.get_rag_engine()
-                graph_manager = AppState.get_knowledge_graph_manager()
-                indexer_service = get_unified_indexer()
-
-                client_id = os.getenv('GOOGLE_CLIENT_ID')
-                client_secret = os.getenv('GOOGLE_CLIENT_SECRET')
-                
-                creds = Credentials(
-                    token=token_info['access_token'],
-                    refresh_token=token_info.get('refresh_token'),
-                    token_uri="https://oauth2.googleapis.com/token",
-                    client_id=client_id,
-                    client_secret=client_secret
-                )
-                
-                # Create token saver callback to persist refreshed tokens
-                def create_token_saver(uid: int):
-                    def save_tokens(refreshed_creds):
-                        try:
-                            with get_db_context() as db:
-                                # Find latest session for this user
-                                latest_session = db.query(DBSession).filter(
-                                    DBSession.user_id == uid,
-                                    DBSession.gmail_access_token.isnot(None)
-                                ).order_by(DBSession.id.desc()).first()
-                                
-                                if latest_session:
-                                    enc_access = encrypt_token(refreshed_creds.token)
-                                    enc_refresh = encrypt_token(refreshed_creds.refresh_token) if refreshed_creds.refresh_token else None
-                                    
-                                    values = {
-                                        "gmail_access_token": enc_access,
-                                        "token_expiry": refreshed_creds.expiry.replace(tzinfo=None) if refreshed_creds.expiry else None
-                                    }
-                                    if enc_refresh:
-                                        values["gmail_refresh_token"] = enc_refresh
-                                    
-                                    db.execute(
-                                        update(DBSession)
-                                        .where(DBSession.id == latest_session.id)
-                                        .values(**values)
-                                    )
-                                    db.commit()
-                                    logger.info(f"[AuthService] Persisted refreshed tokens for session {latest_session.id}")
-                        except Exception as e:
-                            logger.error(f"[AuthService] Failed to persist tokens for user {uid}: {e}")
-                    return save_tokens
-                
-                token_saver = create_token_saver(user_id)
-                
-                google_client = GoogleGmailClient(
-                    config=config, 
-                    credentials=creds,
-                    token_update_callback=token_saver
-                )
-
-                crawler = EmailCrawler(
-                    config=config,
-                    user_id=user_id,
-                    rag_engine=rag_engine,
-                    graph_manager=graph_manager,
-                    google_client=google_client
-                )
-                
-                await indexer_service.register_and_start_indexer(crawler)
-                logger.info(f"[OK] Dynamic EmailCrawler started for user {user_id}")
-            except Exception as e:
-                logger.error(f"Failed to start indexing for user {user_id}: {e}", exc_info=True)
-
-        asyncio.create_task(_delayed_start())
+            # Trigger Celery task instead of non-durable asyncio task
+            # Countdown gives system time to stabilize/session to persist
+            index_user_emails.apply_async(
+                args=[str(user_id)],
+                kwargs={'is_incremental': False},
+                countdown=delay_seconds,
+                queue='indexing'
+            )
+            logger.info(f"[AuthService] Durable indexing task queued for user {user_id}")
+            
+        except Exception as e:
+            logger.error(f"Failed to queue indexing for user {user_id}: {e}")
 
     async def logout(self, user_id: int, request: Any) -> int:
         """Delete user sessions for logout."""

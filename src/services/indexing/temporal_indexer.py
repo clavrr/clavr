@@ -147,7 +147,8 @@ class TemporalIndexer:
             result = await self.graph.execute_query(query, {"start_time": start_time})
             if result:
                 return result[0]["name"]
-        except Exception:
+        except Exception as e:
+            logger.debug(f"Failed to get dominant topic for {start_time}: {e}")
             pass
         return None
         
@@ -260,7 +261,8 @@ class TemporalIndexer:
             result = await self.graph.execute_query(query, {"id": timeblock_id})
             if result and len(result) > 0:
                 return timeblock_id
-        except Exception:
+        except Exception as e:
+            logger.debug(f"TimeBlock {timeblock_id} existence check failed: {e}")
             pass  # TimeBlock doesn't exist, create it
         
         # Create new TimeBlock
@@ -618,7 +620,8 @@ class TemporalIndexer:
                 "curr_id": timeblock_id,
                 "now": datetime.utcnow().isoformat(),
             })
-        except Exception:
+        except Exception as e:
+            logger.debug(f"Adjacent timeblock linking failed for {timeblock_id}: {e}")
             pass  # Previous TimeBlock may not exist yet
             
     # =========================================================================

@@ -127,8 +127,25 @@ class GraphReasoningService:
         
         node_id = await self.graph.create_node(NodeType.GRAPH_PATTERN, properties)
         
-        # Create relations if provided (e.g. what triggered it)
-        # TODO: Implement relationship creation from content['related_nodes']
+        # Create relationships to related nodes if provided
+        related_nodes = content.get('related_nodes', [])
+        for related_item in related_nodes:
+            try:
+                related_id = related_item if isinstance(related_item, str) else related_item.get('id')
+                rel_type = RelationType.ABOUT
+                if isinstance(related_item, dict):
+                    rel_type_str = related_item.get('relation_type', 'ABOUT')
+                    rel_type = getattr(RelationType, rel_type_str.upper(), RelationType.ABOUT)
+                
+                if related_id:
+                    await self.graph.create_relationship(
+                        from_id=node_id,
+                        to_id=related_id,
+                        relation_type=rel_type,
+                        properties={"confidence": result.confidence}
+                    )
+            except Exception as rel_err:
+                logger.debug(f"[ReasoningService] Failed to create pattern relationship: {rel_err}")
         
         return bool(node_id)
         

@@ -55,19 +55,31 @@ class BaseIntegration(ABC):
         logger.info(f"{self.__class__.__name__} initialized")
     
     def _initialize_services(self):
-        """Initialize service layer components"""
+        """Initialize service layer components.
+        
+        Note: Services are NOT initialized here because they require user_id.
+        Call initialize_for_user(user_id, request) to get user-specific services.
+        """
+        # Services require user_id - defer initialization
+        logger.debug(f"[{self.__class__.__name__}] Services will be initialized per-user via initialize_for_user()")
+    
+    def initialize_for_user(self, user_id: int, request: Optional[Any] = None):
+        """Initialize services for a specific user.
+        
+        Args:
+            user_id: User ID to initialize services for
+            request: Optional FastAPI request for credential handling
+        """
         try:
             from api.dependencies import AppState
             
-            # Get services via tools (they provide service access)
-            # Services are accessed through tools to ensure proper credential handling
-            self.services['email_tool'] = AppState.get_email_tool(user_id=1, request=None)
-            self.services['calendar_tool'] = AppState.get_calendar_tool(user_id=1, request=None)
-            self.services['task_tool'] = AppState.get_task_tool(user_id=1, request=None, db=self.db)
+            self.services['email_tool'] = AppState.get_email_tool(user_id=user_id, request=request)
+            self.services['calendar_tool'] = AppState.get_calendar_tool(user_id=user_id, request=request)
+            self.services['task_tool'] = AppState.get_task_tool(user_id=user_id, request=request, db=self.db)
             
-            logger.debug(f"[{self.__class__.__name__}] Services initialized")
+            logger.debug(f"[{self.__class__.__name__}] Services initialized for user {user_id}")
         except Exception as e:
-            logger.warning(f"Could not initialize services: {e}")
+            logger.warning(f"Could not initialize services for user {user_id}: {e}")
     
     def _initialize_ai_components(self):
         """Initialize AI components"""
@@ -112,7 +124,7 @@ class BaseIntegration(ABC):
         Returns:
             Response string
         """
-        pass
+        raise NotImplementedError("Subclasses must implement process_query()")
     
     def get_service(self, service_name: str) -> Optional[Any]:
         """

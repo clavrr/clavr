@@ -394,8 +394,8 @@ class TemporalReasoner:
                             related_people=[], # simplified
                             source='graph'
                         ))
-                    except:
-                        pass
+                    except Exception as e:
+                        logger.debug(f"[TemporalReasoner] Timeline event timestamp parse failed: {e}")
                         
                 # Sort desc
                 events.sort(key=lambda x: x.timestamp, reverse=True)

@@ -406,9 +406,7 @@ def validate_state(state: AgentState) -> tuple[bool, Optional[str]]:
     return True, None
 
 
-# ========================================================================
 # State Mutation Helpers (Functional Style)
-# ========================================================================
 
 def update_step_status(
     state: AgentState, 

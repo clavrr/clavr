@@ -20,3 +20,10 @@ MANAGEMENT_SCHEMA = {
     "email_identifier": "Keywords to find the email (sender name, subject, or content). Required.",
     "label_name": "Label to apply (if labeling). Null if not a label action."
 }
+
+REPLY_SCHEMA = {
+    "target_person": "Name or email of the person to reply to / or whose email to follow up on.",
+    "topic_filter": "Keywords to identify the specific email thread (e.g. 'project x', 'meeting').",
+    "intent_instruction": "Instructions for the reply body (e.g. 'ask for status', 'say yes').",
+    "is_follow_up": "Boolean. True if user says 'follow up', implying finding a previous thread."
+}

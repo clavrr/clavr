@@ -239,7 +239,8 @@ class MemoryGraphAnalytics:
                         first_dt = datetime.fromisoformat(str(first_seen).replace('Z', '+00:00'))
                         days_active = max((datetime.now() - first_dt.replace(tzinfo=None)).days, 1)
                         velocity = mentions / days_active
-                    except:
+                    except (ValueError, TypeError, AttributeError):
+                        # Datetime parsing failed, velocity stays 0
                         pass
                 
                 result["trending_topics"].append({
@@ -562,7 +563,8 @@ class MemoryGraphAnalytics:
                     try:
                         last_dt = datetime.fromisoformat(str(last_activity).replace('Z', '+00:00'))
                         hours_ago = int((datetime.now() - last_dt.replace(tzinfo=None)).total_seconds() / 3600)
-                    except:
+                    except (ValueError, TypeError, AttributeError):
+                        # Datetime parsing failed, hours_ago stays 0
                         pass
                 
                 status = "healthy" if hours_ago < 24 else "stale" if hours_ago < 168 else "inactive"
