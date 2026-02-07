@@ -98,9 +98,9 @@ class MeetingPrepper:
 
     async def _generate_dossier(self, event: Dict[str, Any], user_id: int) -> str:
         """Generate HTML dossier using Proactive ContextService"""
-        from src.services.proactive.context_service import ContextService
+        from src.services.proactive.context_service import ProactiveContextService
         
-        service = ContextService(self.config, self.db)
+        service = ProactiveContextService(self.config, self.db)
         
         # Build Context
         context = await service.build_meeting_context(event, user_id)

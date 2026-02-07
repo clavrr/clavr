@@ -122,6 +122,22 @@ class ConnectionSpotterAgent(ReasoningAgent):
                         
                         # If very high confidence, also suggest a Topic/Project link
                         if similar.score > 0.85:
+                             # MATERIALIZE the connection in the graph
+                             try:
+                                 await self.graph.add_relationship(
+                                     from_node=node_id,
+                                     to_node=target_id,
+                                     rel_type=RelationType.RELATED_TO,
+                                     properties={
+                                         "discovered_by": "ConnectionSpotter",
+                                         "confidence": similar.score,
+                                         "created_at": datetime.utcnow().isoformat()
+                                     }
+                                 )
+                                 logger.info(f"[ConnectionSpotter] Created RELATED_TO link: {node_id} -> {target_id}")
+                             except Exception as e:
+                                 logger.warning(f"[ConnectionSpotter] Failed to create relationship: {e}")
+                             
                              results.append(ReasoningResult(
                                 type='insight',
                                 confidence=similar.score,

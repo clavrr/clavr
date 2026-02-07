@@ -225,6 +225,15 @@ class CalendarCrawler(BaseIndexer):
                 relationships=[]
             )
             
+            # FIXED: Link to User for graph connectivity
+            # CalendarEvent BELONGS_TO User - ensures events appear in visualization
+            event_node.relationships.append({
+                'from_node': node_id,
+                'to_node': f"User/{self.user_id}",
+                'rel_type': RelationType.BELONGS_TO.value,
+                'properties': {'source': 'google_calendar'}
+            })
+            
             nodes.append(event_node)
             
             # Create Person nodes for organizer

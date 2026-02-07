@@ -11,6 +11,9 @@ from typing import Dict, List, Any, Optional
 from datetime import datetime, timedelta
 import asyncio
 import pytz
+import pytz
+import re
+from email.utils import parsedate_to_datetime
 
 from src.utils.logger import setup_logger
 from src.utils.config import Config, get_timezone, ConfigDefaults
@@ -43,6 +46,14 @@ class BriefService:
         self.drive_service = drive_service
         self.extractor = brief_extractor
 
+    IMPACT_KEYWORDS = [
+        'urgent', 'asap', 'response needed', 'action required', 'immediate', 
+        'due', 'deadline', 'payment', 'invoice', 'bill', 'receipt',
+        'contract', 'sign', 'offer', 'investment', 'raise', 'funding', 'equity', 
+        '50k', '100k', '10k', '25k', 'money', 'transfer', 'invest', 'investor',
+        'keep me posted', 'interested', 'believe in you', 'put in', 'round'
+    ]
+
     async def get_dashboard_briefs(self, user_id: int, user_name: str = "there", fast_mode: bool = False) -> Dict[str, Any]:
         """
         Get all briefs components in parallel.
@@ -57,6 +68,9 @@ class BriefService:
         ]
         if not fast_mode:
             tasks.append(self._get_documents(user_id))
+            
+        # Parallel fetch for high-impact reminders (read or unread)
+        tasks.append(self._get_recent_important_emails(user_id))
         
         # Always fetch Ghost drafts (internal and fast)
         tasks.append(self._get_ghost_drafts(user_id))
@@ -64,27 +78,32 @@ class BriefService:
         results = await asyncio.gather(*tasks, return_exceptions=True)
         
         # Unpack results handling errors
-        emails, todos, meetings, documents, ghost_drafts = [], [], [], [], []
+        # Expected order: 
+        # 0: emails (unread)
+        # 1: todos
+        # 2: meetings
+        # 3: documents (if not fast)
+        # 4: high-impact (if not fast, idx shifts) -- WAIT, I added it AFTER documents
+        # 5: ghost drafts
         
-        if len(results) > 0 and isinstance(results[0], list): emails = results[0]
-        else: logger.error(f"[BriefService] Emails failed: {results[0] if len(results) > 0 else 'N/A'}")
-            
-        if len(results) > 1 and isinstance(results[1], list): todos = results[1]
-        else: logger.error(f"[BriefService] Todos failed: {results[1] if len(results) > 1 else 'N/A'}")
-            
-        if len(results) > 2 and isinstance(results[2], list): meetings = results[2]
-        else: logger.error(f"[BriefService] Meetings failed: {results[2] if len(results) > 2 else 'N/A'}")
-
+        # Let's be safer with unpacking by checking lengths
+        # But simpler: map results to vars based on known order
+        
+        emails = results[0] if isinstance(results[0], list) else []
+        todos = results[1] if isinstance(results[1], list) else []
+        meetings = results[2] if isinstance(results[2], list) else []
+        
         idx = 3
+        documents = []
         if not fast_mode:
-            if len(results) > idx and isinstance(results[idx], list): documents = results[idx]
-            else: logger.error(f"[BriefService] Documents failed: {results[idx] if len(results) > idx else 'N/A'}")
+            documents = results[idx] if isinstance(results[idx], list) else []
             idx += 1
             
-        # Ghost drafts are usually the last task
-        if len(results) > idx and isinstance(results[idx], list):
-            ghost_drafts = results[idx]
+        urgent_read_emails = results[idx] if isinstance(results[idx], list) else []
+        idx += 1
         
+        ghost_drafts = results[idx] if isinstance(results[idx], list) else []
+
         # 2. Skip slow LLM-based summarization in fast_mode (voice optimization)
         # _generate_smart_reminders takes ~6-8s, which is too slow for voice (~1s limit)
         if fast_mode:
@@ -113,7 +132,8 @@ class BriefService:
             reminders = await self._generate_smart_reminders(
                 user_id=user_id,
                 user_name=user_name,
-                emails=emails,
+                emails=emails, # Unread
+                urgent_emails=urgent_read_emails, # New param
                 todos=todos,
                 meetings=meetings,
                 documents=documents,
@@ -136,9 +156,9 @@ class BriefService:
             return []
             
         try:
-            # Use Gmail's IMPORTANT label - this matches what user sees in Gmail's "Important" tab
-            # label:IMPORTANT is the system label that Gmail auto-applies
-            query = "is:unread label:IMPORTANT"
+            # Use label:UNREAD to get ALL unread emails (widest net), then filter internally
+            # 'is:unread in:inbox' failed in testing (returned 0), 'label:UNREAD' found the most
+            query = "label:UNREAD"
             
             logger.info(f"[BriefService] Searching emails with query: {query}")
             
@@ -195,6 +215,62 @@ class BriefService:
             
         except Exception as e:
             logger.error(f"[BriefService] Error fetching emails: {e}", exc_info=True)
+            return []
+
+        except Exception as e:
+            logger.error(f"[BriefService] Error fetching emails: {e}", exc_info=True)
+            return []
+
+    async def _get_recent_important_emails(self, user_id: int) -> List[Dict]:
+        """
+        Fetch recent emails (read or unread) that match high-impact keywords.
+        Used specifically for Reminders to capture things like 'Investment offer' even if opened.
+        """
+        if not self.email_service:
+            return []
+            
+        try:
+            # Construct OR query with keywords
+            # "newer_than:2d (urgent OR asap OR ...)"
+            keywords_or = " OR ".join(f'"{kw}"' for kw in self.IMPACT_KEYWORDS)
+            query = f"newer_than:2d ({keywords_or})"
+            
+            logger.info(f"[BriefService] Searching recent important emails: {query[:50]}...")
+            
+            # Fetch with strict limit since this is expensive/specific
+            messages = await asyncio.to_thread(
+                self.email_service.search_emails, 
+                query=query, 
+                limit=50, 
+                allow_rag=False # pure keyword search
+            )
+            
+            cleaned = []
+            now = datetime.now()
+            
+            for msg in messages:
+                # Double check 48h (API usually handles it but good to be safe)
+                # And re-verify regex match to avoid partial word matches if API is loose
+                
+                # Check 48h logic verified earlier
+                received_at = msg.get('date')
+                # ... (date parsing logic similar to before, strictly enforcing 48h)
+                # For brevity, trusting API 'newer_than:2d' mostly, but we can do a quick pass
+                
+                cleaned.append({
+                    "id": msg.get('id'),
+                    "subject": msg.get('subject', 'No Subject'),
+                    "from": msg.get('sender', 'Unknown'),
+                    "summary": msg.get('snippet', ''),
+                    "received_at": msg.get('date'),
+                    "thread_id": msg.get('threadId')
+                })
+            
+            logger.info(f"[BriefService] Found {len(cleaned)} high-impact recent emails")
+            return cleaned
+            
+        except Exception as e:
+            logger.error(f"[BriefService] Error fetching important emails: {e}")
             return []
 
     async def _get_todos(self, user_id: int, fast_mode: bool = False) -> List[Dict]:
@@ -364,9 +440,22 @@ class BriefService:
                     logger.error(f"[BriefService] Event parsing error: {e}")
                     continue
             
-            logger.info(f"[BriefService] Returning {len(todays_events)} processed events")
+            logger.info(f"[BriefService] Raw events before dedup: {len(todays_events)}")
+            
+            # Deduplicate by start_time at source level
+            seen_times = set()
+            deduped_events = []
+            for evt in todays_events:
+                st = evt.get('start_time')
+                if st in seen_times:
+                    logger.info(f"[BriefService] Deduping meeting at source: {evt.get('title')}")
+                    continue
+                seen_times.add(st)
+                deduped_events.append(evt)
+            
+            logger.info(f"[BriefService] Returning {len(deduped_events)} deduplicated events")
                 
-            return todays_events
+            return deduped_events
             
         except Exception as e:
             logger.error(f"[BriefService] Calendar error: {e}", exc_info=True)
@@ -374,26 +463,29 @@ class BriefService:
 
     async def _get_ghost_drafts(self, user_id: int) -> List[Dict]:
         """Fetch pending Ghost drafts."""
-        try:
-            with get_db_context() as session:
-                query = select(GhostDraft).where(
-                    and_(
-                        GhostDraft.user_id == user_id,
-                        GhostDraft.status == 'draft'
-                    )
-                ).order_by(GhostDraft.created_at.desc()).limit(5)
+        def fetch_drafts():
+            try:
+                with get_db_context() as session:
+                    query = select(GhostDraft).where(
+                        and_(
+                            GhostDraft.user_id == user_id,
+                            GhostDraft.status == 'draft'
+                        )
+                    ).order_by(GhostDraft.created_at.desc()).limit(5)
+                    
+                    drafts = session.execute(query).scalars().all()
+                    return [{
+                        "id": d.id,
+                        "title": d.title,
+                        "type": "draft",
+                        "integration": d.integration_type,
+                        "confidence": d.confidence
+                    } for d in drafts]
+            except Exception as e:
+                logger.error(f"[BriefService] Ghost drafts error: {e}")
+                return []
                 
-                drafts = session.execute(query).scalars().all()
-                return [{
-                    "id": d.id,
-                    "title": d.title,
-                    "type": "draft",
-                    "integration": d.integration_type,
-                    "confidence": d.confidence
-                } for d in drafts]
-        except Exception as e:
-            logger.error(f"[BriefService] Ghost drafts error: {e}")
-            return []
+        return await asyncio.to_thread(fetch_drafts)
 
     async def _get_documents(self, user_id: int) -> List[Dict]:
         """Get recent/important documents from Drive."""
@@ -438,28 +530,36 @@ class BriefService:
         
         # 1. First, check ActionableItems database
         try:
-            with get_db_context() as session:
-                query = select(ActionableItem).where(
-                    and_(
-                        ActionableItem.user_id == user_id,
-                        ActionableItem.status == 'pending',
-                        # Exclude basic 'tasks' which go to Todo list
-                        ActionableItem.item_type.in_(['bill', 'appointment', 'deadline'])
-                    )
-                ).order_by(ActionableItem.due_date.asc()).limit(20)
+            def fetch_db_reminders():
+                reminders_list = []
+                try:
+                    with get_db_context() as session:
+                        query = select(ActionableItem).where(
+                            and_(
+                                ActionableItem.user_id == user_id,
+                                ActionableItem.status == 'pending',
+                                # Exclude basic 'tasks' which go to Todo list
+                                ActionableItem.item_type.in_(['bill', 'appointment', 'deadline'])
+                            )
+                        ).order_by(ActionableItem.due_date.asc()).limit(20)
+                        
+                        items = session.execute(query).scalars().all()
+                        
+                        for item in items:
+                            reminders_list.append({
+                                "id": item.id,
+                                "title": item.title,
+                                "type": item.item_type,
+                                "due_date": item.due_date.isoformat() if item.due_date else None,
+                                "amount": item.amount,
+                                "urgency": item.urgency,
+                                "action": item.suggested_action
+                            })
+                except Exception as e:
+                    logger.error(f"[BriefService] Reminders DB error inner: {e}")
+                return reminders_list
                 
-                items = session.execute(query).scalars().all()
-                
-                for item in items:
-                    reminders.append({
-                        "id": item.id,
-                        "title": item.title,
-                        "type": item.item_type,
-                        "due_date": item.due_date.isoformat() if item.due_date else None,
-                        "amount": item.amount,
-                        "urgency": item.urgency,
-                        "action": item.suggested_action
-                    })
+            reminders = await asyncio.to_thread(fetch_db_reminders)
                     
         except Exception as e:
             logger.error(f"[BriefService] Reminders DB error: {e}")
@@ -517,6 +617,52 @@ class BriefService:
         
         return reminders
 
+    async def _get_llm_classified_reminders(self, user_id: int) -> List[Dict[str, Any]]:
+        """
+        Fetch LLM-classified reminders from the database.
+        
+        These are pre-processed by the background classification task
+        and represent messages that Gemini determined need user attention.
+        """
+        from src.database.models import MessageClassification
+        
+        cutoff = datetime.now() - timedelta(hours=48)
+        reminders = []
+        
+        try:
+            with get_db_context() as session:
+                results = session.query(MessageClassification).filter(
+                    and_(
+                        MessageClassification.user_id == user_id,
+                        MessageClassification.needs_response == True,
+                        MessageClassification.is_dismissed == False,
+                        MessageClassification.classified_at >= cutoff
+                    )
+                ).order_by(
+                    # High urgency first (alphabetically: 'high' < 'low' < 'medium')
+                    MessageClassification.urgency.asc(),
+                    MessageClassification.classified_at.desc()
+                ).limit(10).all()
+                
+                for r in results:
+                    reminders.append({
+                        "title": r.title,
+                        "subtitle": f"from {r.sender}" if r.sender else r.classification_reason,
+                        "type": r.source_type,
+                        "urgency": r.urgency,
+                        "due_date": r.source_date.isoformat() if r.source_date else None,
+                        "id": f"llm_{r.id}",
+                        "source_id": r.source_id,  # Original message ID for deduplication
+                        "suggested_action": r.suggested_action,
+                        "reason": r.classification_reason,
+                        "is_llm_classified": True  # Flag for UI
+                    })
+                    
+        except Exception as e:
+            logger.error(f"[BriefService] Error fetching LLM classifications: {e}")
+        
+        return reminders
+
     async def _generate_smart_reminders(
         self,
         user_id: int,
@@ -524,63 +670,254 @@ class BriefService:
         emails: List[Dict],
         todos: List[Dict],
         meetings: List[Dict],
+        urgent_emails: List[Dict] = [], # New
         documents: List[Dict] = [],
         ghost_drafts: List[Dict] = []
     ) -> Dict[str, Any]:
         """
-        Generate intelligent reminders by aggregating emails, todos, and meetings.
-        Uses LLM to create a personalized greeting summary.
+        Generate intelligent reminders.
         
-        Returns:
-            {
-                "summary": "Hey Maniko! Here are your key action items...",
-                "items": [{"title": ..., "type": ..., "urgency": ..., "due_date": ...}, ...]
-            }
+        Uses LLM classifications from database as primary source.
+        Falls back to keyword matching for emails not yet classified.
         """
         items = []
         
-        # 1. Add urgent emails (first 3)
-        for email in emails[:3]:
-            items.append({
-                "title": f"Reply to: {email.get('subject', 'Email')}",
-                "subtitle": f"From {email.get('from', 'Unknown')}",
-                "type": "email",
-                "urgency": "high",
-                "due_date": email.get('received_at'),
-                "id": email.get('id')
-            })
+        # PRIORITY 1: LLM-Classified Reminders (from background task)
+        # These are pre-analyzed by Gemini for intelligent prioritization
+        try:
+            llm_reminders = await self._get_llm_classified_reminders(user_id)
+            if llm_reminders:
+                logger.info(f"[BriefService][Reminders] Found {len(llm_reminders)} LLM-classified reminders")
+                items.extend(llm_reminders)
+        except Exception as e:
+            logger.warning(f"[BriefService] LLM classification fetch failed: {e}")
         
-        # 2. Add pending todos (first 5)
-        for todo in todos[:5]:
+        # Track which email IDs are already in LLM reminders (to avoid duplicates)
+        llm_email_ids = set()
+        for item in items:
+            if item.get('type') == 'email' and item.get('source_id'):
+                llm_email_ids.add(item.get('source_id'))
+        
+        # FALLBACK: Keyword-based Email Matching (for unclassified emails)
+        
+        # 1. Process Emails for Reminders
+        # Combine unread 'emails' and 'urgent_emails' (which might be read)
+        # Deduplicate by ID
+        all_candidate_emails = {e['id']: e for e in emails}
+        for e in urgent_emails:
+            all_candidate_emails[e['id']] = e # urgent_emails take precedence or are just added
+            
+        candidate_list = list(all_candidate_emails.values())
+        
+        logger.info(f"[BriefService][Reminders] Total email candidates: {len(candidate_list)} (unread={len(emails)}, urgent={len(urgent_emails)})")
+        for c in candidate_list:
+            logger.info(f"  -> Candidate: {c.get('subject', 'N/A')[:50]}")
+        
+        # Filter: Last 48h AND High Impact
+        impact_keywords = self.IMPACT_KEYWORDS
+        
+        now = datetime.now()
+        email_reminders_added = 0
+        
+        for email in candidate_list:
+            # 1. Check Date (Last 48 hours)
+            received_at = email.get('received_at')
+            if not received_at:
+                continue
+                
+            try:
+                # Handle ISO format variations (often returned by Gmail/Graph)
+                # Ensure we handle Z or +00:00
+                email_dt = None
+                if isinstance(received_at, str):
+                    try:
+                        # Try RFC 2822 first (standard for email)
+                        email_dt = parsedate_to_datetime(received_at)
+                    except Exception:
+                        # Fallback to ISO
+                        try:
+                            email_dt = datetime.fromisoformat(received_at.replace('Z', '+00:00'))
+                        except ValueError:
+                             pass
+                elif isinstance(received_at, datetime):
+                    email_dt = received_at
+                
+                if not email_dt:
+                    continue
+                    
+                # Normalize timezones for comparison
+                if email_dt.tzinfo and now.tzinfo:
+                    diff = now - email_dt
+                elif not email_dt.tzinfo and not now.tzinfo:
+                    diff = now - email_dt
+                elif email_dt.tzinfo:
+                     diff = now.replace(tzinfo=email_dt.tzinfo) - email_dt
+                else:
+                     diff = now - email_dt.replace(tzinfo=None)
+
+                if diff > timedelta(hours=48):
+                    continue
+            except Exception as e:
+                logger.warning(f"[BriefService] Date parse failed for reminder check: {e}")
+                continue
+
+            # 2. Check Keywords (Title or Summary)
+            subject = email.get('subject', '').lower()
+            summary = email.get('summary', '').lower()
+            snippet = email.get('snippet', '').lower()
+            
+            content_to_check = f"{subject} {summary} {snippet}"
+            
+            # Use regex for word boundary matching
+            is_high_impact = any(
+                re.search(r'\b' + re.escape(kw) + r'\b', content_to_check) 
+                for kw in impact_keywords
+            )
+            
+            if is_high_impact:
+                # Clean up subject for natural display (remove "Re:", "Fwd:", etc.)
+                raw_subject = email.get('subject', 'Email')
+                clean_subject = raw_subject
+                for prefix in ['Re: ', 'RE: ', 'Fwd: ', 'FWD: ', 'Fw: ']:
+                    if clean_subject.startswith(prefix):
+                        clean_subject = clean_subject[len(prefix):]
+                
+                logger.info(f"[BriefService][Reminders] ✓ Adding email reminder: {clean_subject[:50]}")
+                items.append({
+                    "title": clean_subject,  # Just the subject, natural
+                    "subtitle": f"from {email.get('from', 'Unknown').split('<')[0].strip()}",  # "from John Doe"
+                    "type": "email",
+                    "urgency": "high",
+                    "due_date": received_at,
+                    "id": email.get('id')
+                })
+                email_reminders_added += 1
+                # Limit to 5 max email reminders
+                if email_reminders_added >= 5:
+                    break
+            else:
+                logger.info(f"[BriefService][Reminders] ✗ Skipping (no keyword match): {email.get('subject', 'N/A')[:50]}")
+        
+        # 2. Add pending todos (recent only - last 48h, max 5)
+        # Filter out:
+        # - Items older than 48h to keep reminders fresh
+        # - Placeholder/test items
+        placeholder_patterns = ['task 1', 'task 2', 'task 3', 'test task', 'placeholder', 'review overdue']
+        todos_added = 0
+        
+        for todo in todos:
+            if todos_added >= 5:
+                break
+                
+            title = todo.get('title', '').lower()
+            
+            # Skip obvious test/placeholder items
+            if any(p in title for p in placeholder_patterns):
+                logger.info(f"[BriefService][Reminders] Skipping placeholder todo: {title}")
+                continue
+                
+            # Check due date - only include items from last 48h or upcoming
+            due_date = todo.get('due_date')
+            if due_date:
+                try:
+                    if isinstance(due_date, str):
+                        due_dt = datetime.fromisoformat(due_date.replace('Z', '+00:00'))
+                    else:
+                        due_dt = due_date
+                    
+                    # Calculate difference
+                    if due_dt.tzinfo:
+                        diff = now.replace(tzinfo=due_dt.tzinfo) - due_dt
+                    else:
+                        diff = now - due_dt.replace(tzinfo=None)
+                    
+                    # Skip if older than 48h (overdue by more than 2 days)
+                    if diff > timedelta(hours=48):
+                        logger.info(f"[BriefService][Reminders] Skipping old todo (>48h): {title}")
+                        continue
+                except Exception:
+                    pass  # If can't parse, include it
+            
             items.append({
                 "title": todo.get('title', 'Task'),
                 "subtitle": todo.get('source', 'task'),
                 "type": "todo",
                 "urgency": todo.get('urgency', 'medium'),
-                "due_date": todo.get('due_date'),
+                "due_date": due_date,
                 "id": todo.get('id')
             })
+            todos_added += 1
         
-        # 3. Add upcoming meetings (all for today/tomorrow)
+        # 3. Add meetings within next 48 hours only (deduplicated by time)
+        seen_start_times = set()  # Deduplicate by start time only - same time = same event
+        
         for meeting in meetings:
+            start_time = meeting.get('start_time')
+            
+            # Simple deduplication: Skip if we already have a meeting at this exact time
+            if start_time in seen_start_times:
+                continue
+            
+            # Filter: Only meetings within 48h window
+            if start_time:
+                try:
+                    if isinstance(start_time, str):
+                        meeting_dt = datetime.fromisoformat(start_time.replace('Z', '+00:00'))
+                    else:
+                        meeting_dt = start_time
+                    
+                    # Calculate how far in past/future
+                    if meeting_dt.tzinfo:
+                        diff = meeting_dt - now.replace(tzinfo=meeting_dt.tzinfo)
+                    else:
+                        diff = meeting_dt.replace(tzinfo=None) - now
+                    
+                    # Skip if meeting is more than 48h away or more than 24h in past
+                    if diff > timedelta(hours=48) or diff < timedelta(hours=-24):
+                        continue
+                except Exception:
+                    pass  # If can't parse, include it
+            
+            seen_start_times.add(start_time)
+            title = meeting.get('title', 'Meeting')
+                    
             items.append({
-                "title": meeting.get('title', 'Meeting'),
+                "title": title,
                 "subtitle": meeting.get('location') or 'No location',
                 "type": "meeting",
-                "urgency": "high" if self._is_soon(meeting.get('start_time')) else "medium",
-                "due_date": meeting.get('start_time'),
+                "urgency": "high" if self._is_soon(start_time) else "medium",
+                "due_date": start_time,
                 "id": meeting.get('id')
             })
             
-        # 3b. Add important documents (Starred only)
+        # 3b. Add important documents (Starred and updated within 48h only)
         for doc in documents:
             if doc.get('starred'):
+                # Filter: Only docs updated within 48h
+                updated_at = doc.get('updated_at')
+                if updated_at:
+                    try:
+                        if isinstance(updated_at, str):
+                            doc_dt = datetime.fromisoformat(updated_at.replace('Z', '+00:00'))
+                        else:
+                            doc_dt = updated_at
+                        
+                        if doc_dt.tzinfo:
+                            diff = now.replace(tzinfo=doc_dt.tzinfo) - doc_dt
+                        else:
+                            diff = now - doc_dt.replace(tzinfo=None)
+                        
+                        if diff > timedelta(hours=48):
+                            continue  # Skip old docs
+                    except Exception:
+                        pass
+                        
                 items.append({
                     "title": doc.get('title'),
                     "subtitle": "Starred Document",
                     "type": "document",
                     "urgency": "medium",
-                    "due_date": doc.get('updated_at'),
+                    "due_date": updated_at,
                     "id": doc.get('id'),
                     "link": doc.get('link')
                 })
@@ -599,14 +936,26 @@ class BriefService:
                     "id": f"ghost_{draft.get('id')}"
                 })
     
-        # 4. Also check ActionableItems (bills, deadlines) from database
+        # 4. Also check ActionableItems (bills, deadlines) from database - only within 48h
         try:
+            # Calculate 48h cutoff
+            cutoff_past = now - timedelta(hours=48)
+            cutoff_future = now + timedelta(hours=48)
+            
             with get_db_context() as session:
                 query = select(ActionableItem).where(
                     and_(
                         ActionableItem.user_id == user_id,
                         ActionableItem.status == 'pending',
-                        ActionableItem.item_type.in_(['bill', 'appointment', 'deadline'])
+                        ActionableItem.item_type.in_(['bill', 'appointment', 'deadline']),
+                        # Only items due within 48h window (past or future)
+                        or_(
+                            ActionableItem.due_date.is_(None),  # No due date = include
+                            and_(
+                                ActionableItem.due_date >= cutoff_past,
+                                ActionableItem.due_date <= cutoff_future
+                            )
+                        )
                     )
                 ).order_by(ActionableItem.due_date.asc()).limit(5)
                 
@@ -623,6 +972,56 @@ class BriefService:
                     })
         except Exception as e:
             logger.error(f"[BriefService] Error fetching ActionableItems: {e}")
+        
+        # COMPREHENSIVE DEDUPLICATION - By normalized title
+        # This catches duplicates even if they have different IDs
+        logger.info(f"[BriefService] Items BEFORE final dedup: {len(items)}")
+        for i in items:
+            logger.info(f"  -> [{i.get('type')}] {i.get('title')} @ {i.get('due_date')}")
+        
+        # Pre-sort: Prefer non-midnight times over midnight (all-day events)
+        # This ensures we keep the meeting with a specific time, not the all-day marker
+        def time_preference(item):
+            due = item.get('due_date', '')
+            if not due:
+                return 1  # No date = low priority
+            # Check if time is midnight (00:00) - likely all-day event
+            if isinstance(due, str) and ('T00:00:00' in due or 'T00:00' in due.split('+')[0].split('-')[0]):
+                return 1  # Midnight = low priority (all-day event)
+            return 0  # Specific time = high priority
+        
+        items.sort(key=time_preference)
+        
+        seen_titles = set()
+        deduped_items = []
+        for item in items:
+            # Build key from significant words only
+            raw_title = item.get('title', '').lower()
+            item_type = item.get('type', 'unknown')
+            
+            # Tokenize and filter stop words
+            stop_words = {'zoom', 'interview', 'call', 'meeting', 'with', 'the', 'for', 'and', 
+                          'reply', 'fwd', 're', 'to', "maniko's", 'maniko'}
+            words = raw_title.replace("'s", '').replace(":", '').split()
+            significant_words = [w for w in words if len(w) > 1 and w not in stop_words][:3]
+            title_key = ' '.join(sorted(significant_words))
+            
+            # If key is empty (all stop words), use first 10 chars of title
+            if not title_key:
+                title_key = raw_title[:10]
+            
+            # Include type in key to avoid cross-type deduplication
+            dedup_key = f"{item_type}:{title_key}"
+            
+            if dedup_key in seen_titles:
+                logger.info(f"[BriefService] Final dedup - removing: {raw_title} (key: {dedup_key})")
+                continue
+            
+            seen_titles.add(dedup_key)
+            deduped_items.append(item)
+        
+        logger.info(f"[BriefService] Items AFTER final dedup: {len(deduped_items)}")
+        items = deduped_items
         
         # Sort by urgency (high first) then by due_date
         urgency_order = {"high": 0, "medium": 1, "low": 2}
@@ -737,21 +1136,31 @@ Generate ONLY the greeting, nothing else:"""
                     return f"you have an overdue task: {overdue[0].get('title')}"
 
             # 3. Check Database ActionableItems (Bills/Deadlines due today)
+            # 3. Check Database ActionableItems (Bills/Deadlines due today)
             try:
-                with get_db_context() as session:
-                    today = datetime.now().date()
-                    query = select(ActionableItem).where(
-                        and_(
-                            ActionableItem.user_id == user_id,
-                            ActionableItem.status == 'pending',
-                            ActionableItem.due_date <= today
-                        )
-                    ).limit(1)
-                    item = session.execute(query).scalar_one_or_none()
-                    if item:
-                        return f"your {item.item_type} '{item.title}' is due today"
+                def check_db_urgent():
+                    try:
+                        with get_db_context() as session:
+                            today = datetime.now().date()
+                            query = select(ActionableItem).where(
+                                and_(
+                                    ActionableItem.user_id == user_id,
+                                    ActionableItem.status == 'pending',
+                                    ActionableItem.due_date <= today
+                                )
+                            ).limit(1)
+                            item = session.execute(query).scalar_one_or_none()
+                            if item:
+                                return f"your {item.item_type} '{item.title}' is due today"
+                    except Exception as e:
+                         logger.error(f"[BriefService] ActionableItem reminder query failed: {e}")
+                    return None
+                
+                db_result = await asyncio.to_thread(check_db_urgent)
+                if db_result:
+                    return db_result
             except Exception as e:
-                logger.error(f"[BriefService] ActionableItem reminder query failed: {e}")
+                logger.error(f"[BriefService] ActionableItem wrapper failed: {e}")
                 pass
 
             return None

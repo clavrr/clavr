@@ -48,8 +48,8 @@ class SemanticMemory:
     
     # Thresholds for fact similarity
     DUPLICATE_THRESHOLD = 0.95       # Near-exact match
-    HIGH_SIMILARITY_THRESHOLD = 0.80 # Very similar
-    RELATED_THRESHOLD = 0.60         # Related enough to compare
+    HIGH_SIMILARITY_THRESHOLD = 0.75 # Very similar (lowered to catch slight rephrasings)
+    RELATED_THRESHOLD = 0.50         # Related enough to compare
     
     # Contradiction keywords that indicate opposite meanings
     CONTRADICTION_INDICATORS = [
@@ -357,6 +357,8 @@ class SemanticMemory:
             (r'\baren\'t\b', True),
             (r'\bnot\b', True),
             (r'\bnever\b', True),
+            (r'\bavoid\b', True),    # Treat avoid as negation
+            (r'\bavoids\b', True),   # Treat avoids as negation
         ]
         
         import re

@@ -20,6 +20,7 @@ from src.services.indexing.graph.manager import KnowledgeGraphManager
 from src.services.indexing.graph.schema import NodeType, RelationType
 from src.services.indexing.parsers.base import ParsedNode
 from src.ai.llm_factory import LLMFactory
+from src.utils.json_utils import repair_json
 
 logger = setup_logger(__name__)
 
@@ -142,9 +143,9 @@ class GraphObserverService:
         )
             FILTER n.created_at != null
             SORT n.created_at DESC
-            LIMIT 50
+            LIMIT 25
             RETURN {
-                id: n.id,
+                id: n._id,
                 type: [PARSE_IDENTIFIER(n._id).collection],
                 props: n,
                 user_id: n.user_id
@@ -180,8 +181,6 @@ class GraphObserverService:
             if not llm:
                 return
 
-            import json
-            
             response = await asyncio.to_thread(
                 llm.invoke, 
                 [SystemMessage(content=SYSTEM_PROMPT), HumanMessage(content=context_text)]
@@ -189,18 +188,26 @@ class GraphObserverService:
             
             content = response.content
             
-            # Simple JSON parsing
-            clean_text = content.replace("```json", "").replace("```", "").strip()
-            if "{" not in clean_text:
-                logger.info("[GraphObserver] No JSON in LLM response")
-                return
-                
-            data = json.loads(clean_text)
+            # Robust JSON parsing using utility
+            data = repair_json(content)
             insights = data.get("insights", [])
             
             count = 0
             for insight in insights:
-                # Create INSIGHT node
+                # Find a reasonable user_id for this insight
+                # If related_node_ids contains nodes we know about, use their user_id
+                target_user_id = None
+                related_ids = insight.get("related_node_ids", [])
+                
+                for rel_id in related_ids:
+                    if rel_id in node_map:
+                        # Find the original record to get user_id
+                        for r in results:
+                            if r['id'] == rel_id:
+                                target_user_id = r.get('user_id')
+                                break
+                    if target_user_id: break
+                
                 props = {
                     "content": insight['content'],
                     "type": insight['type'],
@@ -208,7 +215,7 @@ class GraphObserverService:
                     "actionable": insight.get('actionable', False),
                     "created_at": datetime.utcnow().isoformat(),
                     "source": "GraphObserver",
-                    "user_id": record.get('user_id') # Propagate user_id from source
+                    "user_id": target_user_id or 1 # Fallback to default user
                 }
                 
                 insight_id = await self.graph.create_node(NodeType.INSIGHT, props)
@@ -219,8 +226,14 @@ class GraphObserverService:
                 
                 related_ids = insight.get("related_node_ids", [])
                 for rel_id in related_ids:
+                    # Only link to nodes that we know exist from our query
+                    if rel_id not in node_map:
+                        logger.debug(f"Skipping link to {rel_id} (not in current context)")
+                        continue
+                        
                     # Verify node exists? Graph manager might handle error
                     try:
+
                         await self.graph.create_relationship(
                             from_id=insight_id,
                             to_id=rel_id,
@@ -290,11 +303,8 @@ class GraphObserverService:
                 [SystemMessage(content="You are a personal assistant observer."), HumanMessage(content=prompt)]
             )
             
-            content = response.content.replace("```json", "").replace("```", "").strip()
-            if "{" not in content:
-                return None
-                
-            data = json.loads(content)
+            # Robust JSON parsing using utility
+            data = repair_json(response.content)
             insight_data = data.get("insight")
             
             if not insight_data or insight_data.get("confidence", 0) < 0.8:
@@ -336,15 +346,15 @@ class GraphObserverService:
             logger.warning(f"[GraphObserver] Immediate insight generation failed: {e}")
             return None
             
-    def _get_llm(self):
+    def _get_llm(self, max_tokens: int = 2048):
         """Get or initialize the LLM for insight generation."""
-        if not self.llm:
-            try:
-                self.llm = LLMFactory.get_llm_for_provider(self.config, temperature=0.2)
-            except Exception as e:
-                logger.error(f"[GraphObserver] Failed to get LLM: {e}")
-                return None
-        return self.llm
+        # We check if the cached LLM has the same max_tokens, if not we recreate it
+        # Actually, LLMFactory caches them internally by key, so we can just call it.
+        try:
+            return LLMFactory.get_llm_for_provider(self.config, temperature=0.2, max_tokens=max_tokens)
+        except Exception as e:
+            logger.error(f"[GraphObserver] Failed to get LLM: {e}")
+            return None
         
     # =========================================================================
     # Enhanced Intelligence Methods

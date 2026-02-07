@@ -18,7 +18,7 @@ from src.database.models import User
 logger = setup_logger(__name__)
 
 
-class ContextService:
+class ProactiveContextService:
     """
     Production-quality context service with proper dependency injection.
     
@@ -63,20 +63,22 @@ class ContextService:
             return self._graph_manager
         
         # Check class-level cache first
-        if ContextService._graph_manager_instance is not None:
-            return ContextService._graph_manager_instance
+        if ProactiveContextService._graph_manager_instance is not None:
+            return ProactiveContextService._graph_manager_instance
         
         # Initialize (expensive operation, done once)
         try:
             from src.services.indexing.graph import KnowledgeGraphManager
-            ContextService._graph_manager_instance = KnowledgeGraphManager(
+            ProactiveContextService._graph_manager_instance = KnowledgeGraphManager(
                 backend="arangodb",
                 config=self.config
             )
-            logger.info("[ContextService] Initialized KnowledgeGraphManager (ArangoDB)")
-            return ContextService._graph_manager_instance
+            logger.info("[ProactiveContextService] Initialized KnowledgeGraphManager (ArangoDB)")
+            return ProactiveContextService._graph_manager_instance
         except Exception as e:
-            logger.warning(f"[ContextService] Failed to init graph manager: {e}")
+            logger.warning(f"[ProactiveContextService] Failed to init graph manager: {e}")
+            return None
+
             return None
     
     @property
@@ -85,16 +87,16 @@ class ContextService:
         if self._rag_engine is not None:
             return self._rag_engine
         
-        if ContextService._rag_engine_instance is not None:
-            return ContextService._rag_engine_instance
+        if ProactiveContextService._rag_engine_instance is not None:
+            return ProactiveContextService._rag_engine_instance
         
         try:
             from src.ai.rag import RAGEngine
-            ContextService._rag_engine_instance = RAGEngine(self.config)
-            logger.info("[ContextService] Initialized RAGEngine")
-            return ContextService._rag_engine_instance
+            ProactiveContextService._rag_engine_instance = RAGEngine(self.config)
+            logger.info("[ProactiveContextService] Initialized RAGEngine")
+            return ProactiveContextService._rag_engine_instance
         except Exception as e:
-            logger.warning(f"[ContextService] Failed to init RAG engine: {e}")
+            logger.warning(f"[ProactiveContextService] Failed to init RAG engine: {e}")
             return None
     
     @property

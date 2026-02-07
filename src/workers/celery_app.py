@@ -52,6 +52,7 @@ celery_app = Celery(
         'src.workers.tasks.consolidation_tasks',
         'src.workers.tasks.integration_tasks',
         'src.workers.tasks.ghost_tasks',
+        'src.workers.tasks.classification_tasks',
     ]
 )
 
@@ -173,6 +174,13 @@ celery_app.conf.update(
         'proactive-think-every-15-minutes': {
             'task': 'src.workers.tasks.autonomy_tasks.proactive_think',
             'schedule': 900.0,  # 15 minutes
+            'options': {'queue': 'default'}
+        },
+        
+        # LLM-based Message Classification (every 5 minutes)
+        'classify-messages-every-5-minutes': {
+            'task': 'src.workers.tasks.classification_tasks.classify_recent_messages',
+            'schedule': 300.0,  # 5 minutes
             'options': {'queue': 'default'}
         },
 

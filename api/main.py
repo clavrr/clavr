@@ -208,6 +208,7 @@ app.include_router(chat.query_router, prefix="/api")  # Legacy /api/query/*
 # Base Routes (Without prefix)
 app.include_router(auth.router)
 app.include_router(health.router)
+app.include_router(integrations.router)   # Also at /integrations for frontend compatibility
 app.include_router(chat.router)          # Chat and query endpoints
 app.include_router(blog.router)          # Blog management
 # Voice router for voice input processing
@@ -251,9 +252,7 @@ except Exception as e:
     logger.warning(f"[WARNING] Notifications router not available: {e}")
 
 
-# ============================================
 # APPLICATION INFO
-# ============================================
 
 port = int(os.getenv("PORT", "8000"))
 host = os.getenv("HOST", "0.0.0.0")

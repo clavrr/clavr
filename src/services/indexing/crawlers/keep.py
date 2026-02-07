@@ -48,13 +48,13 @@ class KeepCrawler(BaseIndexer):
             user_id: User ID to index for
             keep_service: KeepService instance
         """
+        from src.services.service_constants import ServiceConstants
         super().__init__(config, user_id, **kwargs)
         self.keep_service = keep_service
         self.last_sync_time = datetime.now() - timedelta(days=ServiceConstants.INITIAL_LOOKBACK_DAYS_NOTES)  # Notes need longer lookback
         self._note_cache = {}  # Track indexed notes
         
         # Keep-specific settings from ServiceConstants
-        from src.services.service_constants import ServiceConstants
         self.sync_interval = ServiceConstants.KEEP_SYNC_INTERVAL
     
     @property

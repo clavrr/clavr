@@ -25,16 +25,27 @@ class LinearService:
     - Sync with Knowledge Graph
     """
     
-    def __init__(self, config: Config, api_key: Optional[str] = None):
+    def __init__(self, config: Config, api_key: Optional[str] = None, user_id: Optional[int] = None):
         """
         Initialize Linear service.
         
         Args:
             config: Application configuration
-            api_key: Linear API key (optional, can use env var)
+            api_key: Linear API key (optional, can use env var or user OAuth token)
+            user_id: User ID for fetching OAuth token from UserIntegration
         """
         self.config = config
-        self.client = LinearClient(api_key=api_key, config=config)
+        
+        # Try to get user-specific token if user_id provided and no explicit api_key
+        effective_api_key = api_key
+        if not effective_api_key and user_id:
+            try:
+                from src.core.integration_tokens import get_integration_token
+                effective_api_key = get_integration_token(user_id, 'linear')
+            except Exception as e:
+                logger.debug(f"[LinearService] Could not get token for user {user_id}: {e}")
+        
+        self.client = LinearClient(api_key=effective_api_key, config=config)
         self._teams_cache: Optional[List[Dict]] = None
         self._viewer_cache: Optional[Dict] = None
     

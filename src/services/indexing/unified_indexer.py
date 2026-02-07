@@ -436,7 +436,9 @@ async def start_unified_indexing(db_session, config, rag_engine, graph_manager, 
     from src.services.indexing.indexing_constants import (
         PROVIDER_SLACK, PROVIDER_NOTION, PROVIDER_ASANA, 
         PROVIDER_GMAIL, PROVIDER_GOOGLE_DRIVE,
-        CRAWLER_EMAIL, CRAWLER_DRIVE, CRAWLER_SLACK, CRAWLER_NOTION, CRAWLER_ASANA
+        PROVIDER_CALENDAR, PROVIDER_GOOGLE_TASKS, PROVIDER_GOOGLE_KEEP, PROVIDER_LINEAR,
+        CRAWLER_EMAIL, CRAWLER_DRIVE, CRAWLER_SLACK, CRAWLER_NOTION, CRAWLER_ASANA,
+        CRAWLER_CALENDAR, CRAWLER_TASKS, CRAWLER_KEEP, CRAWLER_LINEAR
     )
     
     indexer_service = get_unified_indexer()
@@ -449,8 +451,12 @@ async def start_unified_indexing(db_session, config, rag_engine, graph_manager, 
     temporal_indexer = indexer_service.temporal_indexer
     relationship_manager = indexer_service.relationship_manager
     
+    
+    from sqlalchemy import select
+    
     # 1. Fetch all active integrations (Slack, Notion, Asana, etc.)
-    integrations = db_session.query(UserIntegration).all()
+    result = await db_session.execute(select(UserIntegration))
+    integrations = result.scalars().all()
     
     count = 0
     for integration in integrations:
@@ -532,6 +538,111 @@ async def start_unified_indexing(db_session, config, rag_engine, graph_manager, 
                     observer_service=indexer_service.observer_service,
                     token_saver_callback=token_saver
                 )
+                
+            elif integration.provider == PROVIDER_CALENDAR:
+                from src.core.credential_provider import CredentialProvider
+                creds = CredentialProvider.get_integration_credentials(
+                    user_id=integration.user_id,
+                    provider=PROVIDER_CALENDAR,
+                    auto_refresh=True
+                )
+                crawler_type = CRAWLER_CALENDAR
+                if not creds:
+                    continue
+                    
+                from src.auth.token_persistence import create_token_saver_callback
+                token_saver = create_token_saver_callback(integration.id, "integration")
+                
+                crawler = IndexerFactory.create_crawler(
+                    crawler_type=crawler_type,
+                    config=config,
+                    creds=creds,
+                    user_id=integration.user_id,
+                    rag_engine=rag_engine,
+                    graph_manager=graph_manager,
+                    topic_extractor=topic_extractor,
+                    temporal_indexer=temporal_indexer,
+                    relationship_manager=relationship_manager,
+                    entity_resolver=indexer_service.resolution_service,
+                    observer_service=indexer_service.observer_service,
+                    token_saver_callback=token_saver
+                )
+                
+            elif integration.provider == PROVIDER_GOOGLE_TASKS:
+                from src.core.credential_provider import CredentialProvider
+                creds = CredentialProvider.get_integration_credentials(
+                    user_id=integration.user_id,
+                    provider=PROVIDER_GOOGLE_TASKS,
+                    auto_refresh=True
+                )
+                crawler_type = CRAWLER_TASKS
+                if not creds:
+                    continue
+                    
+                from src.auth.token_persistence import create_token_saver_callback
+                token_saver = create_token_saver_callback(integration.id, "integration")
+                
+                crawler = IndexerFactory.create_crawler(
+                    crawler_type=crawler_type,
+                    config=config,
+                    creds=creds,
+                    user_id=integration.user_id,
+                    rag_engine=rag_engine,
+                    graph_manager=graph_manager,
+                    topic_extractor=topic_extractor,
+                    temporal_indexer=temporal_indexer,
+                    relationship_manager=relationship_manager,
+                    entity_resolver=indexer_service.resolution_service,
+                    observer_service=indexer_service.observer_service,
+                    token_saver_callback=token_saver
+                )
+                
+            elif integration.provider == PROVIDER_GOOGLE_KEEP:
+                from src.core.credential_provider import CredentialProvider
+                creds = CredentialProvider.get_integration_credentials(
+                    user_id=integration.user_id,
+                    provider=PROVIDER_GOOGLE_KEEP,
+                    auto_refresh=True
+                )
+                crawler_type = CRAWLER_KEEP
+                if not creds:
+                    continue
+                    
+                from src.auth.token_persistence import create_token_saver_callback
+                token_saver = create_token_saver_callback(integration.id, "integration")
+                
+                crawler = IndexerFactory.create_crawler(
+                    crawler_type=crawler_type,
+                    config=config,
+                    creds=creds,
+                    user_id=integration.user_id,
+                    rag_engine=rag_engine,
+                    graph_manager=graph_manager,
+                    topic_extractor=topic_extractor,
+                    temporal_indexer=temporal_indexer,
+                    relationship_manager=relationship_manager,
+                    entity_resolver=indexer_service.resolution_service,
+                    observer_service=indexer_service.observer_service,
+                    token_saver_callback=token_saver
+                )
+                
+            elif integration.provider == PROVIDER_LINEAR:
+                crawler_type = CRAWLER_LINEAR
+                creds = integration
+                
+                crawler = IndexerFactory.create_crawler(
+                    crawler_type=crawler_type,
+                    config=config,
+                    creds=creds,
+                    user_id=integration.user_id,
+                    rag_engine=rag_engine,
+                    graph_manager=graph_manager,
+                    topic_extractor=topic_extractor,
+                    temporal_indexer=temporal_indexer,
+                    relationship_manager=relationship_manager,
+                    entity_resolver=indexer_service.resolution_service,
+                    observer_service=indexer_service.observer_service
+                )
 
             # Create crawler for generic types (Slack, Notion, Asana) using Factory if not already created
             if not crawler and crawler_type and creds:
@@ -567,17 +678,23 @@ async def start_unified_indexing(db_session, config, rag_engine, graph_manager, 
         # Check if email indexing enabled
         if os.getenv("AUTO_START_INDEXING", "false").lower() == "true":
              # Find users with gmail access tokens
-             authenticated_users = db_session.query(User).join(DBSession).filter(
+             query = select(User).join(DBSession).filter(
                 DBSession.gmail_access_token.isnot(None)
-             ).distinct().all()
+             ).distinct()
+             
+             result = await db_session.execute(query)
+             authenticated_users = result.scalars().all()
              
              for user in authenticated_users:
                  try:
                      # Get valid session
-                     user_session = db_session.query(DBSession).filter(
+                     sess_query = select(DBSession).filter(
                         DBSession.user_id == user.id,
                         DBSession.gmail_access_token.isnot(None)
-                     ).order_by(DBSession.id.desc()).first()
+                     ).order_by(DBSession.id.desc())
+                     
+                     sess_result = await db_session.execute(sess_query)
+                     user_session = sess_result.scalars().first()
                      
                      if user_session:
                         # Define token saver closure
@@ -650,7 +767,7 @@ async def start_unified_indexing(db_session, config, rag_engine, graph_manager, 
     # 3. Register Environmental Crawlers (Weather/Maps) for all active users
     try:
         from src.database.models import User
-        active_users = db_session.query(User).all()
+        active_users = (await db_session.execute(select(User))).scalars().all()
         for user in active_users:
             try:
                 from src.services.indexing.crawlers.weather import WeatherCrawler

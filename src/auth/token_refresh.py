@@ -76,21 +76,20 @@ async def refresh_token_with_retry(
     if not access_token or not refresh_token:
         # Decryption failed - token may be encrypted with different key or corrupted
         # This is expected for stale sessions or after encryption key changes
-        error_type = type(e).__name__
-        error_msg = str(e) if str(e) else "Unknown decryption error"
         logger.debug(
-            f"Failed to decrypt tokens for session {session.id} (stale/corrupted token): "
-            f"{error_type} - {error_msg}. Session will need re-authentication."
+            f"Failed to decrypt tokens for session {session.id} (stale/corrupted token). "
+            f"Session will need re-authentication."
         )
         await log_auth_event(
             db=db,
             event_type=AuditEventType.TOKEN_REFRESH_FAILURE,
             user_id=session.user_id,
             success=False,
-            error_message=f"Token decryption failed: {error_type} - {error_msg}",
+            error_message="Token decryption failed: tokens are None or empty",
             session_id=session.id
         )
         return False, None
+
     
     # Create credentials object
     client_id = os.getenv('GOOGLE_CLIENT_ID')

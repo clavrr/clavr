@@ -36,13 +36,14 @@ class SlackClient:
     - Event listening and dispatching
     """
     
-    def __init__(self, app_token: Optional[str] = None, bot_token: Optional[str] = None):
+    def __init__(self, app_token: Optional[str] = None, bot_token: Optional[str] = None, skip_socket_mode: bool = False):
         """
         Initialize Slack client.
         
         Args:
             app_token: Slack App-Level Token (xapp-*) - defaults to SLACK_APP_TOKEN env var
             bot_token: Slack Bot User OAuth Token (xoxb-*) - defaults to SLACK_BOT_TOKEN env var
+            skip_socket_mode: Skip Socket Mode initialization (for OAuth-based bots)
         """
         if not SLACK_SDK_AVAILABLE:
             raise ImportError(
@@ -51,10 +52,9 @@ class SlackClient:
         
         self.app_token = app_token or SlackConfig.SLACK_APP_TOKEN
         self.bot_token = bot_token or SlackConfig.SLACK_BOT_TOKEN
+        self._skip_socket_mode = skip_socket_mode
         
-        if not self.app_token:
-            raise ValueError("SLACK_APP_TOKEN is required (set environment variable or pass as parameter)")
-        
+        # Bot token is required
         if not self.bot_token:
             raise ValueError("SLACK_BOT_TOKEN is required (set environment variable or pass as parameter)")
         
@@ -62,22 +62,31 @@ class SlackClient:
         # Type: ignore since we've already checked SLACK_SDK_AVAILABLE
         self.web_client = WebClient(token=self.bot_token)  # type: ignore
         
-        # Initialize SocketModeClient for receiving events
-        self.socket_client = SocketModeClient(  # type: ignore
-            app_token=self.app_token,
-            web_client=self.web_client
-        )
-        
-        logger.info("Slack client initialized (Socket Mode)")
+        # Initialize SocketModeClient only if we have app_token and not skipping
+        self.socket_client = None
+        if not self._skip_socket_mode and self.app_token:
+            self.socket_client = SocketModeClient(  # type: ignore
+                app_token=self.app_token,
+                web_client=self.web_client
+            )
+            logger.info("Slack client initialized (Socket Mode)")
+        else:
+            logger.info("Slack client initialized (Web API only, no Socket Mode)")
     
     def start(self):
         """Start Socket Mode client (blocking)"""
+        if not self.socket_client:
+            logger.warning("Cannot start Socket Mode - no socket_client (skip_socket_mode=True or missing app_token)")
+            return
         logger.info("Starting Slack Socket Mode client...")
         self.socket_client.connect()
         logger.info("Slack Socket Mode client connected")
     
     async def start_async(self):
         """Start Socket Mode client (async)"""
+        if not self.socket_client:
+            logger.warning("Cannot start Socket Mode - no socket_client (skip_socket_mode=True or missing app_token)")
+            return
         logger.info("Starting Slack Socket Mode client (async)...")
         # Socket Mode client runs in a separate thread, so we just connect
         self.socket_client.connect()
@@ -199,43 +208,75 @@ class SlackClient:
         user_id: str,
         status_text: str,
         status_emoji: str = "",
-        expiration: int = 0
+        expiration: int = 0,
+        user_token: Optional[str] = None
     ) -> Dict[str, Any]:
         """
         Set a user's Slack status.
         
+        This requires a user OAuth token with `users.profile:write` scope.
+        Bot tokens cannot set user status - this is a Slack API limitation.
+        
         Args:
-            user_id: Slack user ID
+            user_id: Slack user ID (for logging purposes)
             status_text: Status message
-            status_emoji: Status emoji code (e.g. :house:)
-            expiration: Expiration timestamp (0 for no expiration)
+            status_emoji: Status emoji code (e.g. :house:, :calendar:)
+            expiration: Expiration timestamp in Unix epoch (0 for no expiration)
+            user_token: User's OAuth access token (required, with users.profile:write scope)
             
         Returns:
-            API response dictionary
+            API response dictionary with 'ok' boolean and 'error' if failed
         """
+        if not user_token:
+            logger.warning(f"[SlackClient] Cannot set status - no user token provided")
+            return {
+                "ok": False, 
+                "error": "missing_user_token",
+                "message": "User OAuth token with users.profile:write scope is required to set status"
+            }
+        
         try:
-            # Note: This requires the users.profile:write scope and a User Token
-            # For now we attempt with the bot token, but in production this likely
-            # needs a user-specific token from OAuth
+            # Create a temporary WebClient with the USER token (not bot token)
+            # Bot tokens cannot call users.profile.set for setting the user's own status
+            user_client = WebClient(token=user_token)
+            
             profile = {
                 "status_text": status_text,
                 "status_emoji": status_emoji,
                 "status_expiration": expiration
             }
             
-            response = self.web_client.users_profile_set(
-                user=user_id,
-                profile=profile
-            )
+            # Use users.profile.set (not users_profile_set with user param)
+            # When using a user token, we're setting the token owner's status
+            response = user_client.users_profile_set(profile=profile)
             
             if response.get('ok'):
-                logger.info(f"Updated status for user {user_id}: {status_emoji} {status_text}")
-                return response
+                logger.info(f"[SlackClient] Updated status for user {user_id}: {status_emoji} {status_text}")
+                return dict(response)
             else:
                 error = response.get('error', 'Unknown error')
-                logger.warning(f"Failed to update status for user {user_id}: {error}")
-                return response
+                logger.warning(f"[SlackClient] Failed to update status for user {user_id}: {error}")
+                return dict(response)
                 
         except Exception as e:
-            logger.error(f"Error setting user status: {e}", exc_info=True)
+            error_msg = str(e)
+            
+            # Provide helpful error messages for common issues
+            if 'missing_scope' in error_msg.lower():
+                logger.warning(f"[SlackClient] Missing scope for status update. Ensure user has granted 'users.profile:write' scope.")
+                return {
+                    "ok": False, 
+                    "error": "missing_scope",
+                    "message": "The user needs to re-authorize with the 'users.profile:write' scope"
+                }
+            elif 'invalid_auth' in error_msg.lower():
+                logger.warning(f"[SlackClient] Invalid or expired user token for status update")
+                return {
+                    "ok": False,
+                    "error": "invalid_auth", 
+                    "message": "User's Slack authorization has expired. Please reconnect Slack."
+                }
+            
+            logger.error(f"[SlackClient] Error setting user status: {e}", exc_info=True)
             return {"ok": False, "error": str(e)}
+

@@ -28,6 +28,15 @@ class GhostTool(BaseTool):
     class Config:
         arbitrary_types_allowed = True
 
+    def __init__(self, config: Config = None, user_id: int = 1, **kwargs):
+        if config:
+            kwargs['config'] = config
+        kwargs['user_id'] = user_id
+        super().__init__(**kwargs)
+        if config:
+            self.config = config
+        self.user_id = user_id
+
     def _run(self, action: str, draft_id: Optional[int] = None, **kwargs) -> str:
         return "Please use the async version of this tool."
 
@@ -49,75 +58,117 @@ class GhostTool(BaseTool):
             return f"I had trouble with the Ghost Collaborator: {str(e)}"
 
     async def _list_drafts(self) -> str:
-        with get_db_context() as db:
-            drafts = db.query(GhostDraft).filter(
-                GhostDraft.user_id == self.user_id,
-                GhostDraft.status == "draft"
-            ).order_by(GhostDraft.created_at.desc()).limit(5).all()
-            
-            if not drafts:
-                return "You have no pending drafts or suggestions from the Ghost Collaborator right now."
-            
-            res = "I have a few suggestions for you:\n"
-            for d in drafts:
-                res += f"- ID {d.id}: {d.title} (Confidence: {int(d.confidence*100)}%)\n"
-            
-            res += "\nYou can say 'approve draft [ID]' to post it to Linear."
-            return res
+        from src.database import get_async_db_context
+        from sqlalchemy import select
+        
+        try:
+            async with get_async_db_context() as db:
+                query = select(GhostDraft).filter(
+                    GhostDraft.user_id == self.user_id,
+                    GhostDraft.status == "draft"
+                ).order_by(GhostDraft.created_at.desc()).limit(5)
+                
+                result = await db.execute(query)
+                drafts = result.scalars().all()
+                
+                if not drafts:
+                    return "You have no pending drafts or suggestions from the Ghost Collaborator right now."
+                
+                res = "I have a few suggestions for you:\n"
+                for d in drafts:
+                    res += f"- ID {d.id}: {d.title} (Confidence: {int(d.confidence*100)}%)\n"
+                
+                res += "\nYou can say 'approve draft [ID]' to post it to Linear."
+                return res
+        except Exception as e:
+            logger.error(f"[GhostTool] _list_drafts error: {e}")
+            return f"Error listing drafts: {e}"
 
     async def _approve_draft(self, draft_id: Optional[int]) -> str:
         from src.integrations.linear.service import LinearService
+        from src.database import get_async_db_context
+        from sqlalchemy import select
         
-        with get_db_context() as db:
-            # If no ID, find the most recent
-            if draft_id is None:
-                draft = db.query(GhostDraft).filter(
-                    GhostDraft.user_id == self.user_id,
-                    GhostDraft.status == "draft"
-                ).order_by(GhostDraft.created_at.desc()).first()
-            else:
-                draft = db.query(GhostDraft).filter(
-                    GhostDraft.id == draft_id,
-                    GhostDraft.user_id == self.user_id
-                ).first()
-            
-            if not draft:
-                return "I couldn't find that draft. Try saying 'list my drafts' first."
-
-            if draft.status != "draft":
-                return f"That draft is already {draft.status}."
-
-            # Post to integration
-            if draft.integration_type == "linear":
-                linear = LinearService(self.config, user_id=self.user_id)
-                await linear.create_issue(
-                    title=draft.title,
-                    description=draft.description,
-                    priority="urgent" if draft.confidence > 0.8 else "high"
-                )
+        try:
+            async with get_async_db_context() as db:
+                # If no ID, find the most recent
+                if draft_id is None:
+                    query = select(GhostDraft).filter(
+                        GhostDraft.user_id == self.user_id,
+                        GhostDraft.status == "draft"
+                    ).order_by(GhostDraft.created_at.desc()).limit(1)
+                    result = await db.execute(query)
+                    draft = result.scalar_one_or_none()
+                else:
+                    query = select(GhostDraft).filter(
+                        GhostDraft.id == draft_id,
+                        GhostDraft.user_id == self.user_id
+                    )
+                    result = await db.execute(query)
+                    draft = result.scalar_one_or_none()
                 
-                draft.status = "posted"
-                db.commit()
-                return f"Great! I've posted '{draft.title}' to Linear for you."
-            else:
-                return f"I don't support posting to {draft.integration_type} yet."
+                if not draft:
+                    return "I couldn't find that draft. Try saying 'list my drafts' first."
+
+                if draft.status != "draft":
+                    return f"That draft is already {draft.status}."
+
+                # Post to integration
+                if draft.integration_type == "linear":
+                    # LinearService might block if it does sync HTTP. 
+                    # Ideally LinearService should be async or wrapped. 
+                    # Assuming LinearService here is capable of being run or is lightweight enough, 
+                    # BUT ideally we should wrap it if it's sync.
+                    # Looking at other tools, they likely wrap sync calls.
+                    # For now, let's wrap the service call in to_thread just in case.
+                    linear = LinearService(self.config, user_id=self.user_id)
+                    
+                    # Check if create_issue is async or sync. 
+                    # Usually our services are sync wrappers around APIs unless refactored.
+                    # Let's assume it's async based on `await linear.create_issue`.
+                    
+                    await linear.create_issue(
+                        title=draft.title,
+                        description=draft.description,
+                        priority="urgent" if draft.confidence > 0.8 else "high"
+                    )
+                    
+                    draft.status = "posted"
+                    await db.commit()
+                    return f"Great! I've posted '{draft.title}' to Linear for you."
+                else:
+                    return f"I don't support posting to {draft.integration_type} yet."
+        except Exception as e:
+            logger.error(f"[GhostTool] _approve_draft error: {e}")
+            return f"Error approving draft: {e}"
 
     async def _dismiss_draft(self, draft_id: Optional[int]) -> str:
-        with get_db_context() as db:
-            if draft_id is None:
-                draft = db.query(GhostDraft).filter(
-                    GhostDraft.user_id == self.user_id,
-                    GhostDraft.status == "draft"
-                ).order_by(GhostDraft.created_at.desc()).first()
-            else:
-                draft = db.query(GhostDraft).filter(
-                    GhostDraft.id == draft_id,
-                    GhostDraft.user_id == self.user_id
-                ).first()
+        from src.database import get_async_db_context
+        from sqlalchemy import select
+        
+        try:
+            async with get_async_db_context() as db:
+                if draft_id is None:
+                    query = select(GhostDraft).filter(
+                        GhostDraft.user_id == self.user_id,
+                        GhostDraft.status == "draft"
+                    ).order_by(GhostDraft.created_at.desc()).limit(1)
+                    result = await db.execute(query)
+                    draft = result.scalar_one_or_none()
+                else:
+                    query = select(GhostDraft).filter(
+                        GhostDraft.id == draft_id,
+                        GhostDraft.user_id == self.user_id
+                    )
+                    result = await db.execute(query)
+                    draft = result.scalar_one_or_none()
+                    
+                if not draft:
+                    return "I couldn't find that draft to dismiss."
                 
-            if not draft:
-                return "I couldn't find that draft to dismiss."
-            
-            draft.status = "dismissed"
-            db.commit()
-            return f"Okay, I've dismissed the suggestion: '{draft.title}'."
+                draft.status = "dismissed"
+                await db.commit()
+                return f"Okay, I've dismissed the suggestion: '{draft.title}'."
+        except Exception as e:
+            logger.error(f"[GhostTool] _dismiss_draft error: {e}")
+            return f"Error dismissing draft: {e}"

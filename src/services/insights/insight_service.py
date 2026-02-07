@@ -390,14 +390,25 @@ class InsightService:
         
         for insight in insights[:MAX_INSIGHTS_PER_RESPONSE]:
             insight_type = insight.get("type", "suggestion")
-            content = insight.get("content", "")
+            content = insight.get("content", insight.get("description", ""))
             
-            if insight_type == "conflict":
+            # Format based on type
+            if insight_type in ("conflict", "calendar_conflict"):
                 formatted_parts.append(f"⚠️ **Heads up:** {content}")
             elif insight_type == "connection":
                 formatted_parts.append(f"🔗 **Related:** {content}")
+            elif insight_type == "person_ooo":
+                formatted_parts.append(f"🏖️ **FYI:** {content}")
+            elif insight_type == "bug_report_candidate":
+                formatted_parts.append(f"🐛 **Detected:** {content}")
             else:
                 formatted_parts.append(f"💡 **Suggestion:** {content}")
+            
+            # Display available actions
+            actions = insight.get("actions", [])
+            if actions:
+                action_labels = [a.get("label", a.get("type")) for a in actions]
+                formatted_parts.append(f"   → Actions: {' | '.join(action_labels)}")
             
             # Mark as shown
             if insight.get("id"):

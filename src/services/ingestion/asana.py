@@ -5,6 +5,7 @@ Synchronizes Asana Tasks and Projects into the Knowledge Graph.
 """
 from datetime import datetime
 from typing import Any, List, Optional
+import asyncio
 import logging
 
 from .base import BaseIngestor
@@ -81,36 +82,69 @@ class AsanaIngestor(BaseIngestor):
         if assignee:
             person_email = assignee.get('email')
             person_name = assignee.get('name')
+            person_id = None
             
-            # Try to find existing Person by email
-            person_node = await self.graph.find_node_by_property(NodeType.PERSON, "email", person_email)
-            
-            if not person_node:
-                # Create Person Node if not exists
-                # In real scenario, we might want to be careful creating people blindly
-                # but for an MVP graph, it's safer to have nodes than not.
-                person_id = f"person:{person_email}"
-                await self.graph.add_node(
-                    node_id=person_id,
-                    node_type=NodeType.PERSON,
-                    properties={
-                        "name": person_name,
-                        "email": person_email
-                    }
-                )
+            # Validate: Must have at least a valid email or name
+            if not person_email and not person_name:
+                logger.warning(f"[AsanaIngestor] Skipping assignee with no email or name for task {task_id}")
             else:
-                person_id = person_node['id']
+                # Step 1: Try to find existing Person by email (primary lookup)
+                if person_email:
+                    person_node = await self.graph.find_node_by_property(NodeType.PERSON, "email", person_email)
+                    if person_node:
+                        person_id = person_node.get('_id') or person_node.get('id')
+                        logger.debug(f"[AsanaIngestor] Found existing person by email: {person_email}")
                 
-            # Add Relationship: ActionItem -[ASSIGNED_TO]-> Person
-            # Wait, schema is usually Task -> ASSIGNED_TO -> Person? 
-            # Or Person -> ASSIGNED_TO -> Task?
-            # Let's check Schema or common sense: "Task is assigned to Person"
-            await self.graph.add_relationship(
-                source_id=task_id,
-                target_id=person_id,
-                rel_type=RelationType.ASSIGNED_TO,
-                properties={}
-            )
+                # Step 2: Fallback - Try to find by name if no email match
+                if not person_id and person_name:
+                    person_node = await self.graph.find_node_by_property(NodeType.PERSON, "name", person_name)
+                    if person_node:
+                        person_id = person_node.get('_id') or person_node.get('id')
+                        logger.debug(f"[AsanaIngestor] Found existing person by name: {person_name}")
+                
+                # Step 3: Create new Person node if not found
+                if not person_id:
+                    # Validate email format before creating
+                    import re
+                    email_valid = person_email and re.match(r'^[^@]+@[^@]+\.[^@]+$', person_email)
+                    
+                    # Avoid creating nodes for system/bot accounts
+                    system_patterns = ['noreply', 'no-reply', 'notifications', 'system', 'bot@', 'automated']
+                    is_system_account = person_email and any(p in person_email.lower() for p in system_patterns)
+                    
+                    if is_system_account:
+                        logger.debug(f"[AsanaIngestor] Skipping system account: {person_email}")
+                    elif email_valid or person_name:
+                        # Generate a stable ID based on email (preferred) or name
+                        if email_valid:
+                            person_id = f"person:{person_email.lower()}"
+                        else:
+                            # Use sanitized name as ID fallback
+                            safe_name = re.sub(r'[^a-zA-Z0-9]', '_', person_name.lower())
+                            person_id = f"person:asana:{safe_name}"
+                        
+                        await self.graph.add_node(
+                            node_id=person_id,
+                            node_type=NodeType.PERSON,
+                            properties={
+                                "name": person_name or person_email.split('@')[0].title(),
+                                "email": person_email if email_valid else None,
+                                "source": "asana",
+                                "created_by_integration": True
+                            }
+                        )
+                        logger.info(f"[AsanaIngestor] Created Person node: {person_name or person_email}")
+                    else:
+                        logger.warning(f"[AsanaIngestor] Invalid assignee data, skipping: {assignee}")
+                
+                # Create relationship if we have a valid person
+                if person_id:
+                    await self.graph.add_relationship(
+                        source_id=task_id,
+                        target_id=person_id,
+                        rel_type=RelationType.ASSIGNED_TO,
+                        properties={"source": "asana"}
+                    )
 
         # 3. Link Project
         for proj in item.get('projects', []):

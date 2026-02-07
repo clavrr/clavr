@@ -10,6 +10,7 @@ from datetime import datetime
 from src.utils.logger import setup_logger
 from src.utils.config import Config
 from src.services.indexing.base_indexer import BaseIndexer, IndexingResult, IndexingStats
+from src.services.indexing.parsers.base import ParsedNode, Relationship
 from src.integrations.linear.service import LinearService
 
 logger = setup_logger(__name__)
@@ -30,75 +31,56 @@ class LinearIndexer(BaseIndexer):
     - (LinearIssue)-[:BELONGS_TO_TEAM]->(LinearTeam)
     """
     
-    def __init__(self, config: Config, graph_manager=None, vector_store=None):
-        super().__init__(config, graph_manager, vector_store)
+    def __init__(
+        self, 
+        config: Config, 
+        user_id: int, 
+        rag_engine=None, 
+        graph_manager=None, 
+        topic_extractor=None,
+        **kwargs
+    ):
+        super().__init__(
+            config=config, 
+            user_id=user_id, 
+            rag_engine=rag_engine, 
+            graph_manager=graph_manager, 
+            topic_extractor=topic_extractor,
+            **kwargs
+        )
         self.linear_service: Optional[LinearService] = None
     
     @property
     def source_name(self) -> str:
         return "linear"
     
-    async def _initialize_service(self, user_id: int):
-        """Initialize Linear service for user."""
-        # In a real implementation, we'd get the user's Linear API key
-        # from their stored credentials
-        if self.linear_service is None:
-            self.linear_service = LinearService(self.config)
-    
-    async def index(
-        self,
-        user_id: int,
-        options: Optional[Dict[str, Any]] = None
-    ) -> IndexingResult:
-        """
-        Index Linear data for a user.
+    @property
+    def name(self) -> str:
+        return "linear"
         
-        Args:
-            user_id: User to index for
-            options: Indexing options
-            
-        Returns:
-            IndexingResult with stats
-        """
-        options = options or {}
-        stats = IndexingStats()
-        errors = []
-        
+    # Implement abstract methods from BaseIndexer
+    async def fetch_delta(self) -> List[Any]:
+        """Fetch Linear issues and cycles that need indexing."""
         try:
-            await self._initialize_service(user_id)
+            await self._initialize_service(self.user_id)
             
             if not self.linear_service or not self.linear_service.is_available:
-                return IndexingResult(
-                    success=False,
-                    stats=stats,
-                    errors=["Linear not configured for user"]
-                )
+                logger.warning("[LinearIndexer] Linear not configured or available")
+                return []
             
-            # 1. Index Teams
+            items = []
+            
+            # 1. Fetch Teams
             teams = await self.linear_service.get_teams()
-            logger.info(f"[LinearIndexer] Found {len(teams)} teams")
-            
             for team in teams:
-                try:
-                    await self._index_team(team, user_id)
-                    stats.created += 1
-                except Exception as e:
-                    errors.append(f"Team {team.get('name')}: {e}")
-                    stats.errors += 1
+                items.append({"type": "team", "data": team})
             
-            # 2. Index Issues
-            issues = await self.linear_service.client.get_issues(limit=500)
-            logger.info(f"[LinearIndexer] Found {len(issues)} issues")
-            
+            # 2. Fetch Issues
+            issues = await self.linear_service.client.get_issues(limit=100)
             for issue in issues:
-                try:
-                    await self._index_issue(issue, user_id)
-                    stats.created += 1
-                except Exception as e:
-                    errors.append(f"Issue {issue.get('identifier')}: {e}")
-                    stats.errors += 1
+                items.append({"type": "issue", "data": issue})
             
-            # 3. Index Active Cycles
+            # 3. Fetch Active Cycles
             for team in teams:
                 try:
                     cycles = await self.linear_service.client.get_cycles(
@@ -106,274 +88,123 @@ class LinearIndexer(BaseIndexer):
                         is_active=True
                     )
                     for cycle in cycles:
-                        await self._index_cycle(cycle, user_id)
-                        stats.created += 1
+                        items.append({"type": "cycle", "data": cycle})
                 except Exception as e:
-                    errors.append(f"Cycles for {team.get('name')}: {e}")
-                    stats.errors += 1
+                    logger.debug(f"[LinearIndexer] Could not fetch cycles for team {team.get('id')}: {e}")
             
-            logger.info(f"[LinearIndexer] Indexed {stats.created} items for user {user_id}")
-            
-            return IndexingResult(
-                success=True,
-                stats=stats,
-                errors=errors if errors else None
-            )
+            return items
             
         except Exception as e:
-            logger.error(f"[LinearIndexer] Indexing failed: {e}")
-            return IndexingResult(
-                success=False,
-                stats=stats,
-                errors=[str(e)]
-            )
-        finally:
-            if self.linear_service:
-                await self.linear_service.close()
-    
-    async def _index_team(self, team: Dict[str, Any], user_id: int):
-        """Index a Linear team."""
-        if not self.graph_manager:
-            return
+            logger.error(f"[LinearIndexer] Fetch delta failed: {e}")
+            return []
         
-        # AQL UPSERT for team
-        query = """
-        UPSERT { _key: @id }
-        INSERT {
-            _key: @id,
-            id: @id,
-            name: @name,
-            key: @key,
-            user_id: @user_id,
-            synced_at: DATE_ISO8601(DATE_NOW())
-        }
-        UPDATE {
-            name: @name,
-            key: @key,
-            user_id: @user_id,
-            synced_at: DATE_ISO8601(DATE_NOW())
-        }
-        IN LinearTeam
-        RETURN NEW
-        """
+    async def transform_item(self, item_wrapper: Any) -> Optional[List[ParsedNode]]:
+        """Transform a Linear item into ParsedNode(s)."""
+        item_type = item_wrapper.get("type")
+        item = item_wrapper.get("data")
         
-        await self.graph_manager.execute_query(query, {
-            "id": team.get("id"),
-            "name": team.get("name"),
-            "key": team.get("key"),
-            "user_id": user_id
-        })
-    
-    async def _index_issue(self, issue: Dict[str, Any], user_id: int):
-        """Index a Linear issue."""
-        if not self.graph_manager:
-            return
+        if item_type == "team":
+            return [self._transform_team(item)]
+        elif item_type == "issue":
+            return self._transform_issue(item)
+        elif item_type == "cycle":
+            return [self._transform_cycle(item)]
         
+        return None
+
+    def _transform_team(self, team: Dict[str, Any]) -> ParsedNode:
+        return ParsedNode(
+            node_id=f"linear_team_{team.get('id')}",
+            node_type="LinearTeam",
+            properties={
+                "id": team.get("id"),
+                "name": team.get("name"),
+                "key": team.get("key"),
+                "user_id": self.user_id,
+                "source": "linear"
+            }
+        )
+
+    def _transform_issue(self, issue: Dict[str, Any]) -> List[ParsedNode]:
         assignee = issue.get("assignee", {}) or {}
         team = issue.get("team", {}) or {}
         state = issue.get("state", {}) or {}
         
-        # AQL UPSERT for issue
-        query = """
-        UPSERT { _key: @id }
-        INSERT {
-            _key: @id,
-            id: @id,
-            identifier: @identifier,
-            title: @title,
-            description: @description,
-            priority: @priority,
-            state: @state,
-            stateType: @state_type,
-            dueDate: @due_date,
-            url: @url,
-            user_id: @user_id,
-            team_id: @team_id,
-            assignee_email: @assignee_email,
-            assignee_name: @assignee_name,
-            synced_at: DATE_ISO8601(DATE_NOW())
-        }
-        UPDATE {
-            identifier: @identifier,
-            title: @title,
-            description: @description,
-            priority: @priority,
-            state: @state,
-            stateType: @state_type,
-            dueDate: @due_date,
-            url: @url,
-            user_id: @user_id,
-            team_id: @team_id,
-            assignee_email: @assignee_email,
-            assignee_name: @assignee_name,
-            synced_at: DATE_ISO8601(DATE_NOW())
-        }
-        IN LinearIssue
-        RETURN NEW
-        """
+        issue_id = f"LinearIssue/{issue.get('id')}"
         
-        await self.graph_manager.execute_query(query, {
-            "id": issue.get("id"),
-            "identifier": issue.get("identifier"),
-            "title": issue.get("title"),
-            "description": (issue.get("description") or "")[:500],
-            "priority": issue.get("priority"),
-            "state": state.get("name"),
-            "state_type": state.get("type"),
-            "due_date": issue.get("dueDate"),
-            "url": issue.get("url"),
-            "user_id": user_id,
-            "team_id": team.get("id"),
-            "assignee_email": assignee.get("email"),
-            "assignee_name": assignee.get("name")
-        })
+        relationships = []
         
-        # Link to team via edge (if team exists)
+        # Link to team
         if team.get("id"):
-            edge_query = """
-            LET issue_id = CONCAT("LinearIssue/", @issue_id)
-            LET team_id = CONCAT("LinearTeam/", @team_id)
-            UPSERT { _from: issue_id, _to: team_id }
-            INSERT { _from: issue_id, _to: team_id, created_at: DATE_ISO8601(DATE_NOW()) }
-            UPDATE { updated_at: DATE_ISO8601(DATE_NOW()) }
-            IN BELONGS_TO_TEAM
-            """
-            try:
-                await self.graph_manager.execute_query(edge_query, {
-                    "issue_id": issue.get("id"),
-                    "team_id": team.get("id")
-                })
-            except Exception as e:
-                logger.debug(f"[LinearIndexer] Could not create team edge: {e}")
-        
-        # Create assignee relationship if exists
-        if assignee.get("email"):
-            # First upsert the Person node
-            person_query = """
-            UPSERT { email: @email }
-            INSERT { email: @email, name: @name, synced_at: DATE_ISO8601(DATE_NOW()) }
-            UPDATE { name: @name, synced_at: DATE_ISO8601(DATE_NOW()) }
-            IN Person
-            RETURN NEW
-            """
-            try:
-                await self.graph_manager.execute_query(person_query, {
-                    "email": assignee.get("email"),
-                    "name": assignee.get("name")
-                })
-                
-                # Then create edge
-                assign_edge = """
-                LET person = FIRST(FOR p IN Person FILTER p.email == @email RETURN p)
-                LET issue = DOCUMENT("LinearIssue", @issue_id)
-                FILTER person != null AND issue != null
-                UPSERT { _from: person._id, _to: issue._id }
-                INSERT { _from: person._id, _to: issue._id, rel_type: "ASSIGNED_TO", created_at: DATE_ISO8601(DATE_NOW()) }
-                UPDATE { updated_at: DATE_ISO8601(DATE_NOW()) }
-                IN ASSIGNED_TO
-                """
-                await self.graph_manager.execute_query(assign_edge, {
-                    "email": assignee.get("email"),
-                    "issue_id": issue.get("id")
-                })
-            except Exception as e:
-                logger.debug(f"[LinearIndexer] Could not create assignee edge: {e}")
-        
-        # Also index to vector store for semantic search
-        if self.vector_store and issue.get("title"):
-            text = f"{issue.get('identifier')}: {issue.get('title')}"
-            if issue.get("description"):
-                text += f"\n{issue.get('description')[:300]}"
+            relationships.append(Relationship(
+                from_node=issue_id,
+                to_node=f"linear_team_{team.get('id')}",
+                rel_type="BELONGS_TO_TEAM"
+            ))
             
-            await self.vector_store.add_documents(
-                documents=[text],
-                metadatas=[{
-                    "source": "linear",
-                    "type": "issue",
-                    "id": issue.get("id"),
-                    "identifier": issue.get("identifier"),
-                    "url": issue.get("url"),
-                    "user_id": str(user_id)
-                }],
-                ids=[f"linear-{issue.get('id')}"]
-            )
-    
-    async def _index_cycle(self, cycle: Dict[str, Any], user_id: int):
-        """Index a Linear cycle."""
-        if not self.graph_manager:
-            return
+        # Link to person (assignee)
+        if assignee.get("email"):
+            from src.utils.email_utils import get_person_id_from_email
+            person_id = get_person_id_from_email(assignee.get("email"))
+            relationships.append(Relationship(
+                from_node=person_id,
+                to_node=issue_id,
+                rel_type="ASSIGNED_TO"
+            ))
+            
+        issue_node = ParsedNode(
+            node_id=issue_id,
+            node_type="LinearIssue",
+            properties={
+                "id": issue.get("id"),
+                "identifier": issue.get("identifier"),
+                "title": issue.get("title"),
+                "description": (issue.get("description") or "")[:500],
+                "priority": issue.get("priority"),
+                "state": state.get("name"),
+                "stateType": state.get("type"),
+                "dueDate": issue.get("dueDate"),
+                "url": issue.get("url"),
+                "user_id": self.user_id,
+                "source": "linear"
+            },
+            searchable_text=f"{issue.get('identifier')}: {issue.get('title')}\n{issue.get('description') or ''}",
+            relationships=relationships
+        )
         
+        return [issue_node]
+
+    def _transform_cycle(self, cycle: Dict[str, Any]) -> ParsedNode:
         team = cycle.get("team", {}) or {}
+        cycle_id = f"linear_cycle_{cycle.get('id')}"
         
-        # AQL UPSERT for cycle
-        query = """
-        UPSERT { _key: @id }
-        INSERT {
-            _key: @id,
-            id: @id,
-            number: @number,
-            name: @name,
-            startsAt: @starts_at,
-            endsAt: @ends_at,
-            team_id: @team_id,
-            user_id: @user_id,
-            synced_at: DATE_ISO8601(DATE_NOW())
-        }
-        UPDATE {
-            number: @number,
-            name: @name,
-            startsAt: @starts_at,
-            endsAt: @ends_at,
-            team_id: @team_id,
-            synced_at: DATE_ISO8601(DATE_NOW())
-        }
-        IN LinearCycle
-        RETURN NEW
-        """
-        
-        await self.graph_manager.execute_query(query, {
-            "id": cycle.get("id"),
-            "number": cycle.get("number"),
-            "name": cycle.get("name"),
-            "starts_at": cycle.get("startsAt"),
-            "ends_at": cycle.get("endsAt"),
-            "team_id": team.get("id"),
-            "user_id": user_id
-        })
-        
-        # Link cycle to team if exists
+        relationships = []
         if team.get("id"):
-            edge_query = """
-            LET cycle_id = CONCAT("LinearCycle/", @cycle_id)
-            LET team_id = CONCAT("LinearTeam/", @team_id)
-            UPSERT { _from: cycle_id, _to: team_id }
-            INSERT { _from: cycle_id, _to: team_id, created_at: DATE_ISO8601(DATE_NOW()) }
-            UPDATE { updated_at: DATE_ISO8601(DATE_NOW()) }
-            IN CYCLE_OF_TEAM
-            """
-            try:
-                await self.graph_manager.execute_query(edge_query, {
-                    "cycle_id": cycle.get("id"),
-                    "team_id": team.get("id")
-                })
-            except Exception as e:
-                logger.debug(f"[LinearIndexer] Could not create cycle-team edge: {e}")
-        
-        # Link issues to cycle
-        issues = cycle.get("issues", {}).get("nodes", [])
-        for issue in issues:
-            link_query = """
-            LET issue_id = CONCAT("LinearIssue/", @issue_id)
-            LET cycle_id = CONCAT("LinearCycle/", @cycle_id)
-            UPSERT { _from: issue_id, _to: cycle_id }
-            INSERT { _from: issue_id, _to: cycle_id, created_at: DATE_ISO8601(DATE_NOW()) }
-            UPDATE { updated_at: DATE_ISO8601(DATE_NOW()) }
-            IN IN_CYCLE
-            """
-            try:
-                await self.graph_manager.execute_query(link_query, {
-                    "issue_id": issue.get("id"),
-                    "cycle_id": cycle.get("id")
-                })
-            except Exception as e:
-                logger.debug(f"[LinearIndexer] Could not create issue-cycle edge: {e}")
+            relationships.append(Relationship(
+                from_node=cycle_id,
+                to_node=f"linear_team_{team.get('id')}",
+                rel_type="CYCLE_OF_TEAM"
+            ))
+            
+        return ParsedNode(
+            node_id=cycle_id,
+            node_type="LinearCycle",
+            properties={
+                "id": cycle.get("id"),
+                "number": cycle.get("number"),
+                "name": cycle.get("name"),
+                "startsAt": cycle.get("startsAt"),
+                "endsAt": cycle.get("endsAt"),
+                "user_id": self.user_id,
+                "source": "linear"
+            },
+            relationships=relationships
+        )
+
+    async def _initialize_service(self, user_id: int):
+        """Initialize Linear service for user."""
+        if not self.linear_service:
+            from src.integrations.linear.service import LinearService
+            self.linear_service = LinearService(self.config, user_id)
+            await self.linear_service.initialize()
+

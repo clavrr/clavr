@@ -6,7 +6,9 @@ from typing import Any, Optional
 from src.utils.logger import setup_logger
 from src.services.indexing.indexing_constants import (
     CRAWLER_EMAIL, CRAWLER_DRIVE, CRAWLER_SLACK, CRAWLER_NOTION, CRAWLER_ASANA,
-    PROVIDER_GMAIL, PROVIDER_GOOGLE_DRIVE, PROVIDER_SLACK, PROVIDER_NOTION, PROVIDER_ASANA
+    CRAWLER_CALENDAR, CRAWLER_TASKS, CRAWLER_KEEP, CRAWLER_LINEAR,
+    PROVIDER_GMAIL, PROVIDER_GOOGLE_DRIVE, PROVIDER_SLACK, PROVIDER_NOTION, PROVIDER_ASANA,
+    PROVIDER_CALENDAR, PROVIDER_GOOGLE_TASKS, PROVIDER_GOOGLE_KEEP, PROVIDER_LINEAR
 )
 
 logger = setup_logger(__name__)
@@ -144,6 +146,100 @@ class IndexerFactory:
                     rag_engine=rag_engine,
                     graph_manager=graph_manager,
                     asana_service=asana_service,
+                    topic_extractor=topic_extractor,
+                    temporal_indexer=temporal_indexer,
+                    relationship_manager=relationship_manager,
+                    entity_resolver=entity_resolver,
+                    observer_service=observer_service
+                )
+                
+            elif crawler_type == CRAWLER_CALENDAR:
+                from src.services.indexing.crawlers.calendar import CalendarCrawler
+                from src.integrations.google_calendar.service import CalendarService
+                
+                # Check required method on creds for Google Client
+                if not hasattr(creds, 'token'):
+                     logger.warning("Invalid credentials for CalendarCrawler")
+                     return None
+                     
+                service = CalendarService(config=config, credentials=creds)
+                
+                return CalendarCrawler(
+                    config=config,
+                    user_id=user_id,
+                    rag_engine=rag_engine,
+                    graph_manager=graph_manager,
+                    calendar_service=service,
+                    topic_extractor=topic_extractor,
+                    temporal_indexer=temporal_indexer,
+                    relationship_manager=relationship_manager,
+                    entity_resolver=entity_resolver,
+                    observer_service=observer_service,
+                    token_saver_callback=token_saver_callback
+                )
+                
+            elif crawler_type == CRAWLER_TASKS:
+                from src.services.indexing.crawlers.tasks import TasksCrawler
+                from src.integrations.google_tasks.service import TaskService
+                
+                # Check required method on creds for Google Client
+                if not hasattr(creds, 'token'):
+                     logger.warning("Invalid credentials for TasksCrawler")
+                     return None
+                     
+                service = TaskService(config=config, credentials=creds)
+                
+                return TasksCrawler(
+                    config=config,
+                    user_id=user_id,
+                    rag_engine=rag_engine,
+                    graph_manager=graph_manager,
+                    task_service=service,
+                    topic_extractor=topic_extractor,
+                    temporal_indexer=temporal_indexer,
+                    relationship_manager=relationship_manager,
+                    entity_resolver=entity_resolver,
+                    observer_service=observer_service,
+                    token_saver_callback=token_saver_callback
+                )
+                
+            elif crawler_type == CRAWLER_KEEP:
+                from src.services.indexing.crawlers.keep import KeepCrawler
+                from src.integrations.google_keep.service import KeepService
+                
+                # Check required method on creds for Google Client
+                if not hasattr(creds, 'token'):
+                     logger.warning("Invalid credentials for KeepCrawler")
+                     return None
+                     
+                service = KeepService(config=config, credentials=creds)
+                
+                return KeepCrawler(
+                    config=config,
+                    user_id=user_id,
+                    rag_engine=rag_engine,
+                    graph_manager=graph_manager,
+                    keep_service=service,
+                    topic_extractor=topic_extractor,
+                    temporal_indexer=temporal_indexer,
+                    relationship_manager=relationship_manager,
+                    entity_resolver=entity_resolver,
+                    observer_service=observer_service,
+                    token_saver_callback=token_saver_callback
+                )
+                
+            elif crawler_type == CRAWLER_LINEAR:
+                from src.services.indexing.crawlers.linear import LinearIndexer
+                from src.integrations.linear.service import LinearService
+                
+                # Linear uses API key or OAuth token
+                linear_service = LinearService(config=config)
+                
+                return LinearIndexer(
+                    config=config,
+                    user_id=user_id,
+                    rag_engine=rag_engine,
+                    graph_manager=graph_manager,
                     topic_extractor=topic_extractor,
                     temporal_indexer=temporal_indexer,
                     relationship_manager=relationship_manager,

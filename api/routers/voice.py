@@ -25,7 +25,7 @@ logger = setup_logger(__name__)
 router = APIRouter(prefix="/voice", tags=["voice"])
 
 
-@router.get("/introduction")
+@router.post("/introduction")
 async def get_voice_introduction(
     current_user: User = Depends(get_current_user_required),
     db: AsyncSession = Depends(get_async_db),
@@ -86,6 +86,7 @@ async def websocket_transcribe(
                 logger.debug(f"[WS] Auth message receive error: {e}")
         
         auth_service = AppState.get_auth_service(db)
+        user = None
         if token:
             user = await auth_service.validate_session_token(token)
         

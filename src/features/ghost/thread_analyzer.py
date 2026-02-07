@@ -10,6 +10,7 @@ The "Ghost Collaborator" feature - works while you sleep.
 """
 from typing import Dict, Any, List, Optional
 from datetime import datetime
+import asyncio
 import re
 
 from src.utils.logger import setup_logger
@@ -133,7 +134,8 @@ class ThreadAnalyzerAgent:
             )
             content = response.content.replace("```json", "").replace("```", "").strip()
             return json.loads(content)
-        except:
+        except Exception as e:
+            logger.debug(f"LLM analysis failed to parse response: {e}")
             return None
 
     async def _is_already_ticketed(self, title: str) -> bool:

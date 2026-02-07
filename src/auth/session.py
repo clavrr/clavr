@@ -61,6 +61,19 @@ async def create_session(
     raw_token, hashed_token = generate_session_token()
     
     # Create session with HASHED session token and raw Gmail tokens (model handles encryption)
+    # granted_scopes can be a list or a space-separated string from OAuth
+    # We store it as a comma-separated string for consistency in the database
+    if isinstance(granted_scopes, list):
+        scopes_str = ",".join(granted_scopes)
+    elif isinstance(granted_scopes, str):
+        # Handle space-separated vs comma-separated
+        if " " in granted_scopes and "," not in granted_scopes:
+            scopes_str = ",".join(granted_scopes.split(" "))
+        else:
+            scopes_str = granted_scopes
+    else:
+        scopes_str = None
+    
     db_session = DBSession(
         user_id=user_id,
         session_token=hashed_token,  # Store HASH, not raw token

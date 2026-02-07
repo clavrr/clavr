@@ -68,6 +68,9 @@ class AsanaTool(BaseTool):
             access_token: Asana access token
             workspace_id: Asana workspace ID
         """
+        if config:
+            kwargs['config'] = config
+        kwargs['user_id'] = user_id
         super().__init__(**kwargs)
         self.config = config or load_config()
         self.user_id = user_id
@@ -76,13 +79,21 @@ class AsanaTool(BaseTool):
     
     @property
     def asana_service(self):
-        """Lazy initialization of Asana service."""
+        """Lazy initialization of Asana service with user-specific OAuth token."""
         if self._service is None:
             try:
                 from src.integrations.asana import AsanaService
+                from src.core.integration_tokens import get_integration_token
+                
+                # Get user-specific token from UserIntegration
+                access_token = self._access_token or get_integration_token(self.user_id, 'asana')
+                if not access_token:
+                    logger.debug(f"[AsanaTool] No Asana token for user {self.user_id}")
+                    return None
+                
                 self._service = AsanaService(
                     config=self.config,
-                    access_token=self._access_token,
+                    access_token=access_token,
                     workspace_id=self._workspace_id
                 )
             except Exception as e:

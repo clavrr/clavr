@@ -29,46 +29,62 @@ class GhostService:
         """
         Run a full protection check for a user.
         """
+        from src.database import get_async_db_context
+        from sqlalchemy import select
+        
         logger.info(f"[Ghost] Running check for user {user_id}")
         
-        user = self.db.query(User).filter(User.id == user_id).first()
-        if not user:
-            logger.warning(f"[Ghost] User {user_id} not found")
-            return
+        # Use fresh async session instead of self.db (Sync)
+        # This prevents blocking the loop and allows using AsyncCredentialFactory
+        async with get_async_db_context() as db:
+            result = await db.execute(select(User).filter(User.id == user_id))
+            user = result.scalar_one_or_none()
+            
+            if not user:
+                logger.warning(f"[Ghost] User {user_id} not found")
+                return
+    
+            # 1. Get Calendar Events
+            events = await self._get_upcoming_events(user, db)
+            if events is None:
+                # Logged inside _get_upcoming_events
+                return
+    
+            # 2. Analyze State
+            # Logic calculation is CPU bound, fast enough to run in loop usually, 
+            # but wrapping in thread is safer if it gets complex.
+            now = datetime.utcnow()
+            window_end = now + timedelta(hours=2) # Check next 2 hours
+            
+            # Check for explicit Focus blocks first
+            level = self.logic.analyze_event_types(events)
+            
+            if level == ProtectionLevel.NORMAL:
+                # Fallback to density check
+                score = self.logic.calculate_busyness_score(events, now, window_end)
+                level = self.logic.determine_protection_level(score)
+                logger.info(f"[Ghost] Busyness score regarding user {user_id}: {score:.2f} -> {level}")
+    
+            # 3. Apply Protections (Slack Status)
+            await self._apply_slack_status(user, level)
 
-        # 1. Get Calendar Events
-        events = await self._get_upcoming_events(user)
-        if events is None:
-            logger.info(f"[Ghost] No calendar access for user {user_id}")
-            return
-
-        # 2. Analyze State
-        now = datetime.utcnow()
-        window_end = now + timedelta(hours=2) # Check next 2 hours
-        
-        # Check for explicit Focus blocks first
-        level = self.logic.analyze_event_types(events)
-        
-        if level == ProtectionLevel.NORMAL:
-            # Fallback to density check
-            score = self.logic.calculate_busyness_score(events, now, window_end)
-            level = self.logic.determine_protection_level(score)
-            logger.info(f"[Ghost] Busyness score regarding user {user_id}: {score:.2f} -> {level}")
-
-        # 3. Apply Protections (Slack Status)
-        await self._apply_slack_status(user, level)
-
-    async def _get_upcoming_events(self, user: User) -> Optional[List[Dict[str, Any]]]:
+    async def _get_upcoming_events(self, user: User, db_session) -> Optional[List[Dict[str, Any]]]:
         """Fetch events for next 2 hours."""
         try:
-            factory = AsyncCredentialFactory(self.config, self.db, user)
-            calendar_service = await factory.get_calendar_service()
+            # Initialize factory correctly (only takes config)
+            factory = AsyncCredentialFactory(self.config)
+            
+            # Create service using factory (handles async auth)
+            # Must pass async db_session because factory uses AsyncCredentialProvider
+            calendar_service = await factory.create_service('calendar', user_id=user.id, db_session=db_session)
             
             if not calendar_service:
+                logger.warning(f"[Ghost] No calendar service credential for user {user.id}")
                 return None
                 
             # Fetch slightly more to be safe
-            events = await calendar_service.get_upcoming_events(limit=20)
+            # CalendarService is SYNC, so we must wrap it
+            events = await asyncio.to_thread(calendar_service.get_upcoming_events, limit=20)
             return events
         except Exception as e:
             logger.error(f"[Ghost] Failed to fetch events: {e}")
@@ -81,11 +97,14 @@ class GhostService:
             # We assume user has a stored slack_id or we resolve it via email
             slack_tool = SlackTool(config=self.config, user_id=user.id)
             
+            # Wrap property access if it performs IO (unlikely for client init, but safe)
+            # slack_client property might init client. 
             if not slack_tool.slack_client:
                 return
-
+            
             # Resolve Slack User ID using the tool's robust logic
             # This handles DB caching and API fallback automatically
+            # _resolve_slack_user_id might use DB, so wrapping in thread is good (GhostTool does it too)
             slack_user_id = await asyncio.to_thread(slack_tool._resolve_slack_user_id)
             if not slack_user_id:
                 logger.warning(f"[Ghost] Could not resolve Slack ID for {user.email}")
@@ -119,7 +138,7 @@ class GhostService:
                 action="set_status",
                 user=slack_user_id,
                 status_text=status_text,
-                status_emoji=status_emoji,
+                status_emoji=status_emoji, # type: ignore
                 expiration=expiration
             )
 

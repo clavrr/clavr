@@ -865,3 +865,51 @@ class GhostDraft(Base):
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
     
     user = relationship("User", backref="ghost_drafts")
+
+
+class MessageClassification(Base):
+    """
+    LLM-classified messages for intelligent reminders.
+    
+    Stores classification results from Gemini analysis of emails, Slack messages,
+    and Linear issues. Used by BriefService to generate smart reminders.
+    """
+    __tablename__ = 'message_classifications'
+    
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey('users.id'), nullable=False, index=True)
+    
+    # Source identification
+    source_type = Column(String(50), nullable=False, index=True)  # 'email', 'slack', 'linear'
+    source_id = Column(String(255), nullable=False, index=True)   # Unique message/thread ID
+    
+    # Classification results (from LLM)
+    needs_response = Column(Boolean, default=False, nullable=False, index=True)
+    urgency = Column(String(20), default='low', index=True)  # 'high', 'medium', 'low'
+    classification_reason = Column(EncryptedString)  # LLM explanation
+    suggested_action = Column(String(50))  # 'reply', 'schedule', 'delegate', 'review', 'none'
+    
+    # Display content
+    title = Column(EncryptedString, nullable=False)  # Message subject/title
+    sender = Column(EncryptedString)  # From field
+    snippet = Column(EncryptedString)  # Preview text
+    
+    # Metadata
+    source_date = Column(DateTime)  # Original message date
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False, index=True)
+    classified_at = Column(DateTime, default=datetime.utcnow, nullable=False, index=True)
+    
+    # Status tracking
+    is_dismissed = Column(Boolean, default=False, index=True)  # User dismissed
+    dismissed_at = Column(DateTime, nullable=True)
+    
+    # Relationship
+    user = relationship("User", backref="message_classifications")
+    
+    __table_args__ = (
+        Index('idx_classification_user_needs_response', 'user_id', 'needs_response', 'classified_at'),
+        Index('idx_classification_source', 'user_id', 'source_type', 'source_id', unique=True),
+    )
+    
+    def __repr__(self):
+        return f"<MessageClassification(id={self.id}, source={self.source_type}, needs_response={self.needs_response}, urgency='{self.urgency}')>"

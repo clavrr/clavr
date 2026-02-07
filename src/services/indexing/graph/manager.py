@@ -12,7 +12,7 @@ No placeholders, no backward compatibility, strict validation.
 """
 import asyncio
 import json
-from typing import Dict, Any, List, Optional, Set, Tuple
+from typing import Dict, Any, List, Optional, Set, Tuple, Union
 from datetime import datetime
 from enum import Enum
 
@@ -201,14 +201,14 @@ class KnowledgeGraphManager:
         return new_props
 
     def _decrypt_graph_properties(self, properties: Dict[str, Any]) -> Dict[str, Any]:
-        """Decrypt sensitive properties after retrieving from the graph."""
+        """Decrypt sensitive properties after retrieving from the graph (recursive)."""
         if not properties:
             return properties
         
         new_props = properties.copy()
         for key, value in properties.items():
-            # Try to decrypt if it looks like an encrypted string or if it's in sensitive list
             if isinstance(value, str):
+                # Try to decrypt if it looks like an encrypted string or if it's in sensitive list
                 if value.startswith("ENC:"):
                     try:
                         decrypted = decrypt_token(value[4:])
@@ -216,7 +216,19 @@ class KnowledgeGraphManager:
                     except Exception:
                         pass
                 elif key in GraphSchema.SENSITIVE_PROPERTIES:
-                    new_props[key] = decrypt_token(value)
+                    try:
+                        new_props[key] = decrypt_token(value)
+                    except Exception:
+                        pass
+            elif isinstance(value, dict):
+                # Recursively decrypt nested dictionaries (e.g. _neighbor_node)
+                new_props[key] = self._decrypt_graph_properties(value)
+            elif isinstance(value, list):
+                # Handle lists of dicts
+                new_props[key] = [
+                    self._decrypt_graph_properties(v) if isinstance(v, dict) else v 
+                    for v in value
+                ]
                     
         return new_props
         
@@ -298,6 +310,22 @@ class KnowledgeGraphManager:
                 ))
             except Exception as e:
                 logger.warning(f"Failed to emit reactive event: {e}")
+        
+        # Auto-create BELONGS_TO relationship to User node for graph connectivity
+        # This ensures no node is orphaned - every node with user_id links to its owner
+        if success and properties.get("user_id") and node_type != NodeType.USER:
+            try:
+                user_node_id = f"User/{properties['user_id']}"
+                await self._add_relationship_arangodb(
+                    from_node=node_id,
+                    to_node=user_node_id,
+                    rel_type=RelationType.BELONGS_TO,
+                    properties={"auto_created": True, "created_at": datetime.now().isoformat()}
+                )
+                logger.debug(f"Auto-linked {node_id} BELONGS_TO {user_node_id}")
+            except Exception as e:
+                # Non-fatal: don't fail node creation if BELONGS_TO fails
+                logger.debug(f"Could not auto-link {node_id} to User: {e}")
                 
         return success
 
@@ -467,6 +495,53 @@ class KnowledgeGraphManager:
         elif self.backend_type == GraphBackend.ARANGODB:
             nodes = await self._get_nodes_batch_arangodb(node_ids, node_type)
             return {nid: self._decrypt_graph_properties(data) for nid, data in nodes.items()}
+
+    async def get_nodes_by_type(
+        self,
+        node_type: Optional[Union[NodeType, str]] = None,
+        limit: int = 100,
+        user_id: Optional[str] = None
+    ) -> List[Dict[str, Any]]:
+        """
+        Get nodes by type (or all nodes if type is None)
+        
+        Args:
+            node_type: Optional node type to filter by (NodeType enum or string)
+            limit: Maximum number of nodes to return
+            user_id: Optional user_id to filter by (for multi-user separation)
+            
+        Returns:
+            List of node dictionaries
+        """
+        # Normalize node_type to string value
+        type_value = None
+        if node_type is not None:
+            type_value = node_type.value if hasattr(node_type, 'value') else str(node_type)
+        
+        if self.backend_type == GraphBackend.NETWORKX:
+            nodes = []
+            count = 0
+            for node_id, data in self.graph.nodes(data=True):
+                # Filter by type
+                if type_value and data.get('node_type') != type_value:
+                    continue
+                # Filter by user_id
+                if user_id and str(data.get('user_id')) != str(user_id):
+                    # Special case: User node itself checks id or email? 
+                    # Usually checking user_id property is safer.
+                    # If data doesn't have user_id (e.g. system nodes?), include them? 
+                    # For now, strict filter.
+                    continue
+                    
+                nodes.append(self._decrypt_graph_properties({'id': node_id, **data}))
+                count += 1
+                if count >= limit:
+                    break
+            return nodes
+        
+        elif self.backend_type == GraphBackend.ARANGODB:
+            nodes = await self._get_nodes_by_type_arangodb(node_type, limit, user_id)
+            return [self._decrypt_graph_properties(n) for n in nodes]
 
     
     async def find_node_by_property(
@@ -919,19 +994,32 @@ class KnowledgeGraphManager:
             
             sanitized_props = self._sanitize_properties(properties)
             
-            # We'll use the AQL UPSERT for idempotency
-            # UPSERT { _key: @key } 
-            # INSERT merge(@props, { _key: @key }) 
-            # UPDATE merge(@props, { _key: @key }) IN @collection
+            # Use node_id as _key for fast lookups
+            # ArangoDB _key must be [a-zA-Z0-9_-:.@()+,=;$!*'%]
+            # If node_id starts with collection_name (e.g. User/7), strip it for the key
+            key = node_id
+            prefix_slash = f"{collection_name}/"
+            prefix_underscore = f"{collection_name}_"
             
+            if key.startswith(prefix_slash):
+                key = key[len(prefix_slash):]
+            elif key.startswith(prefix_underscore):
+                key = key[len(prefix_underscore):]
+                
+            import re
+            key = re.sub(r'[^a-zA-Z0-9_\-:.@()+,=;$!*\'%]', '_', key)
+            
+            # We'll use the AQL UPSERT for idempotency
             query = f"""
-            UPSERT {{ id: @id }}
-            INSERT MERGE(@props, {{ id: @id }})
-            UPDATE MERGE(@props, {{ id: @id }})
+            UPSERT {{ _key: @key }}
+            INSERT MERGE(@props, {{ _key: @key, id: @id }})
+            UPDATE MERGE(@props, {{ _key: @key, id: @id }})
             IN {collection_name}
             """
-            self.db.aql.execute(query, bind_vars={'id': node_id, 'props': sanitized_props})
+            self.db.aql.execute(query, bind_vars={'key': key, 'id': node_id, 'props': sanitized_props})
             return True
+
+
 
         return await asyncio.to_thread(_execute)
     
@@ -1046,6 +1134,79 @@ class KnowledgeGraphManager:
             
          return await asyncio.to_thread(_execute)
 
+    async def _get_nodes_by_type_arangodb(
+        self, 
+        node_type: Optional[Union[NodeType, str]] = None, 
+        limit: int = 100,
+        user_id: Optional[str] = None
+    ) -> List[Dict[str, Any]]:
+        """Get nodes by type from ArangoDB"""
+        def _execute():
+            collections = []
+            if node_type:
+                # Handle both NodeType enum and string
+                type_value = node_type.value if hasattr(node_type, 'value') else str(node_type)
+                collections = [type_value]
+            else:
+                # Query all document collections
+                collections = [c['name'] for c in self.db.collections() if c['type'] == 'document' and not c['name'].startswith('_')]
+            
+            if not collections:
+                return []
+                
+            # Build AQL query
+            # If single collection, simple FOR. If multiple, UNION.
+            
+            # Filter clause
+            filter_clause = ""
+            bind_vars = {'limit': limit}
+            
+            if user_id:
+                filter_clause = "FILTER doc.user_id == @user_id"
+                bind_vars['user_id'] = user_id
+            
+            subqueries = []
+            for col in collections:
+                # Need to verify collection has user_id before filtering? 
+                # AQL is forgiving, missing attribute == null. 
+                # So doc.user_id == '123' will fail for docs without user_id.
+                # If we want to include public nodes, we might need OR doc.user_id == null?
+                # For strict privacy, explicit match is better.
+                
+                query_part = f"""
+                (FOR doc IN {col} 
+                    {filter_clause}
+                    LIMIT @limit 
+                    RETURN MERGE(doc, {{node_type: '{col}'}}))
+                """
+                subqueries.append(query_part)
+
+            if len(subqueries) == 1:
+                # Simplify if just one collection (no UNION needed if we iterate)
+                full_query = f"""
+                FOR result IN {subqueries[0]} 
+                LIMIT @limit
+                RETURN result
+                """
+            else:
+                combined = ", ".join(subqueries)
+                # Note: UNION might be slow for huge datasets, but limit is per-collection in subquery
+                # We apply global limit at end
+                full_query = f"""
+                FOR result IN UNION({combined})
+                LIMIT @limit
+                RETURN result
+                """
+            
+            try:
+                cursor = self.db.aql.execute(full_query, bind_vars=bind_vars)
+                return [d for d in cursor]
+            except Exception as e:
+                logger.error(f"Error getting nodes by type: {e}")
+                return []
+                
+        return await asyncio.to_thread(_execute)
+
     async def _query_arangodb(self, query: str, params: Dict[str, Any]) -> List[Dict[str, Any]]:
         """Execute AQL query."""
         aql_query, aql_params = query, params
@@ -1158,12 +1319,15 @@ class KnowledgeGraphManager:
             
             query = f"""
             FOR v, e IN 1..1 {direction_kw} @start_id {edge_clause}
-            RETURN {{ neighbor_id: v.id, neighbor: v, rel_props: MERGE(e, {{type: SPLIT(e._id, '/')[0]}}) }}
+            RETURN {{ neighbor_id: v._id, neighbor: v, rel_props: MERGE(e, {{type: SPLIT(e._id, '/')[0]}}) }}
             """
             cursor = self.db.aql.execute(query, bind_vars={'start_id': start_doc['_id']})
             result = []
             for d in cursor:
-                result.append((d['neighbor_id'], d['rel_props']))
+                # Store the full neighbor node in rel_props for visualization enrichment
+                rel_props = d['rel_props']
+                rel_props['_neighbor_node'] = d['neighbor']
+                result.append((d['neighbor_id'], rel_props))
             return result
         return await asyncio.to_thread(_execute)
 
@@ -1177,16 +1341,48 @@ class KnowledgeGraphManager:
          return {} # Placeholder for brevity or implement fully
 
     async def _get_stats_arangodb(self) -> GraphStats:
-        """Get stats"""
+        """Get stats from ArangoDB"""
         def _execute():
-            # Count
-            # Iterate collections
             total_nodes = 0
             total_edges = 0
+            nodes_by_type = {}
+            relationships_by_type = {}
             
-            return GraphStats(
+            try:
+                # Count nodes from document collections
+                for col_info in self.db.collections():
+                    col_name = col_info['name']
+                    if col_name.startswith('_'):
+                        continue
+                    
+                    col = self.db.collection(col_name)
+                    count = col.count()
+                    
+                    if col_info['type'] == 'document':
+                        total_nodes += count
+                        nodes_by_type[col_name] = count
+                    elif col_info['type'] == 'edge':
+                        total_edges += count
+                        relationships_by_type[col_name] = count
+                
+                # Calculate average degree
+                avg_degree = 0.0
+                if total_nodes > 0:
+                    avg_degree = round((2 * total_edges) / total_nodes, 2)
+                
+                return GraphStats(
                     total_nodes=total_nodes,
                     total_relationships=total_edges,
+                    nodes_by_type=nodes_by_type,
+                    relationships_by_type=relationships_by_type,
+                    avg_degree=avg_degree,
+                    max_depth=0
+                )
+            except Exception as e:
+                logger.error(f"Failed to get ArangoDB stats: {e}")
+                return GraphStats(
+                    total_nodes=0,
+                    total_relationships=0,
                     nodes_by_type={},
                     relationships_by_type={},
                     avg_degree=0.0,
@@ -1211,23 +1407,61 @@ class KnowledgeGraphManager:
     
     async def _clear_arangodb(self) -> bool:
         # TRUNCATE collections
-        return True
+        def _execute():
+            try:
+                collections = self.db.collections()
+                for col in collections:
+                    if not col['name'].startswith('_'): # Skip system collections
+                         self.db.collection(col['name']).truncate()
+                logger.info("Cleared all ArangoDB collections")
+                return True
+            except Exception as e:
+                logger.error(f"Failed to clear ArangoDB: {e}")
+                return False
+        return await asyncio.to_thread(_execute)
 
     def _get_node_arangodb_sync(self, node_id: str):
         # Helper for internal use (sync)
-        # Get all document collections that don't start with underscore
+        if not node_id:
+            return None
+            
+        # 1. Try direct lookup by _id or _key if it looks like one
+        if '/' in node_id:
+            try:
+                # Direct check for Collection/Key
+                doc = self.db.document(node_id)
+                if doc:
+                    doc['node_type'] = node_id.split('/')[0]
+                    return doc
+            except Exception:
+                pass
+            
+        # 2. Try sanitizing and searching all document collections
+        import re
+        sanitized_key = re.sub(r'[^a-zA-Z0-9_\-:.@()+,=;$!*\'%]', '_', node_id)
+        
+        # If it had a collection prefix, also try direct collection/sanitized_key
+        if '/' in node_id:
+            col, key_part = node_id.split('/', 1)
+            sanitized_key_part = re.sub(r'[^a-zA-Z0-9_\-:.@()+,=;$!*\'%]', '_', key_part)
+            try:
+                doc = self.db.document(f"{col}/{sanitized_key_part}")
+                if doc:
+                    doc['node_type'] = col
+                    return doc
+            except Exception:
+                pass
+
+        
+        # 3. Search all document collections for doc.id == node_id OR doc._key == sanitized_id
         collections = [c['name'] for c in self.db.collections() if c['type'] == 'document' and not c['name'].startswith('_')]
         
         if not collections:
             return None
             
-        # Build UNION query properly using AQL UNION function
-        # UNION(array1, array2, ...)
-        # Each subquery must interact with one collection and return an array of results
         subqueries = []
         for col in collections:
-            # Wrap in parentheses to make it a subquery expression returning an array
-            subqueries.append(f"(FOR doc IN {col} FILTER doc.id == @id RETURN MERGE(doc, {{node_type: '{col}'}}))")
+            subqueries.append(f"(FOR doc IN {col} FILTER doc.id == @id OR doc._key == @id OR doc._key == @sanitized_id RETURN MERGE(doc, {{node_type: '{col}'}}))")
         
         if len(subqueries) == 1:
             full_query = f"FOR result IN {subqueries[0]} RETURN result"
@@ -1236,9 +1470,10 @@ class KnowledgeGraphManager:
             full_query = f"FOR result IN UNION({combined_subqueries}) RETURN result"
         
         try:
-            cursor = self.db.aql.execute(full_query, bind_vars={'id': node_id})
+            cursor = self.db.aql.execute(full_query, bind_vars={'id': node_id, 'sanitized_id': sanitized_key})
             res = [d for d in cursor]
             return res[0] if res else None
+
         except Exception as e:
             logger.error(f"Error finding node {node_id} in ArangoDB: {e}")
             return None

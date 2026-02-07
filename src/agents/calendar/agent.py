@@ -7,8 +7,10 @@ Responsible for handling all calendar-related queries:
 - Rescheduling
 - Availability checks
 """
+import re
 from typing import Dict, Any, Optional
 from src.utils.logger import setup_logger
+from src.utils.performance import LatencyMonitor
 from ..base import BaseAgent
 from ..constants import (
     TOOL_ALIASES_CALENDAR,
