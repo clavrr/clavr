@@ -38,6 +38,11 @@ class WebhookEventType(str, enum.Enum):
     USER_CREATED = "user.created"
     USER_SETTINGS_UPDATED = "user.settings.updated"
     
+    # Slack events
+    SLACK_MESSAGE_RECEIVED = "slack.message.received"
+    SLACK_REACTION_ADDED = "slack.reaction.added"
+    SLACK_CHANNEL_CREATED = "slack.channel.created"
+    
     # System events
     EXPORT_COMPLETED = "export.completed"
     SYNC_COMPLETED = "sync.completed"

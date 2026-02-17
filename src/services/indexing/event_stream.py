@@ -32,6 +32,16 @@ class EventType(str, Enum):
     DRIVE_UPDATE = "drive_update"  # Google Drive file changes
 
 
+# Maps internal stream event types → outbound WebhookEventType values.
+# Used to automatically trigger outbound webhooks after successful indexing.
+EVENT_TO_WEBHOOK_TYPE: Dict[str, str] = {
+    EventType.SLACK_MESSAGE: "slack.message.received",
+    EventType.SLACK_REACTION: "slack.reaction.added",
+    EventType.GMAIL_PUSH: "email.received",
+    EventType.CALENDAR_UPDATE: "calendar.event.updated",
+}
+
+
 class EventStreamHandler:
     """
     Processes real-time events from webhooks for immediate graph updates.
@@ -162,6 +172,15 @@ class EventStreamHandler:
                     result["insights"] = insights
                     
             result["status"] = "processed"
+            
+            # 5. Trigger outbound webhooks if a mapping exists
+            self._trigger_outbound_webhook(
+                event_type=event_type,
+                event_id=event_id,
+                payload=payload,
+                user_id=user_id,
+            )
+            
             return result
             
         except Exception as e:
@@ -964,6 +983,40 @@ class EventStreamHandler:
         except Exception as e:
             logger.warning(f"[EventStream] Urgent insight delivery failed: {e}")
         
+    def _trigger_outbound_webhook(
+        self,
+        event_type: str,
+        event_id: str,
+        payload: Dict[str, Any],
+        user_id: int,
+    ):
+        """
+        If *event_type* has a matching outbound webhook type, queue a Celery
+        task to deliver the webhook to all active subscribers.
+        
+        This is fire-and-forget — errors are logged but never break the
+        indexing pipeline.
+        """
+        webhook_type_value = EVENT_TO_WEBHOOK_TYPE.get(event_type)
+        if not webhook_type_value:
+            return
+
+        try:
+            from src.workers.tasks.webhook_tasks import deliver_webhook_task
+
+            deliver_webhook_task.delay(
+                event_type=webhook_type_value,
+                event_id=event_id,
+                payload=payload,
+                user_id=user_id,
+            )
+            logger.debug(
+                f"[EventStream] Queued outbound webhook {webhook_type_value} "
+                f"for event {event_id}"
+            )
+        except Exception as e:
+            logger.warning(f"[EventStream] Failed to queue outbound webhook: {e}")
+
     def _cleanup_old_events(self):
         """Remove old events from dedup cache"""
         now = datetime.utcnow()
