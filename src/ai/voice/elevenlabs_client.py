@@ -32,8 +32,20 @@ class ElevenLabsLiveClient(BaseVoiceClient):
         self.tools = tools or []
         self.tool_map = {t.name: t for t in self.tools}
         self._ws_lock = asyncio.Lock() # Lock for concurrent websocket writes
+        self._signed_url_cache = None
              
         logger.info(f"[ELEVENLABS] Initialized for agent: {self.agent_id}")
+
+    async def warmup(self) -> None:
+        """Pre-fetch the signed URL to reduce latency when stream_audio starts."""
+        try:
+            if not self._signed_url_cache:
+                self._signed_url_cache = await self._get_signed_url()
+                if self._signed_url_cache:
+                    logger.info("[ELEVENLABS] Warmup successful: Signed URL cached")
+        except Exception as e:
+            logger.warning(f"[ELEVENLABS] Warmup failed: {e}")
+
 
     async def _get_signed_url(self) -> Optional[str]:
         """Get a signed WebSocket URL from ElevenLabs API."""
@@ -63,8 +75,14 @@ class ElevenLabsLiveClient(BaseVoiceClient):
             yield {"type": "error", "message": "Missing ElevenLabs Agent ID"}
             return
 
-        # Get signed WebSocket URL
-        ws_url = await self._get_signed_url()
+        # Get signed WebSocket URL (use cache if warmed up)
+        ws_url = self._signed_url_cache
+        if not ws_url:
+            ws_url = await self._get_signed_url()
+        
+        # Clear cache after use as URLs are one-time or short-lived
+        self._signed_url_cache = None
+        
         if not ws_url:
             yield {"type": "error", "message": "Failed to get signed URL from ElevenLabs"}
             return

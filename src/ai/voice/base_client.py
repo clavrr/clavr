@@ -26,4 +26,10 @@ class BaseVoiceClient(ABC):
         Yields:
             Dictionary containing response parts (audio, text, tool_call, etc.)
         """
+    async def warmup(self) -> None:
+        """
+        Optional warmup method to prepare the client (e.g. pre-fetch auth tokens).
+        This can be called in parallel with other initialization tasks.
+        """
         pass
+
