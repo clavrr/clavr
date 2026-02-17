@@ -168,6 +168,19 @@ class ServiceConstants:
     
     VOICE_ENERGY_THRESHOLD = 100  # Minimum RMS energy to process chunk
     
+    # Wake-word detection
+    WAKE_WORD_CONFIDENCE_THRESHOLD = 0.85  # Minimum confidence for verification
+    WAKE_WORD_MAX_AUDIO_SECONDS = 3        # Max audio snippet length
+    WAKE_WORD_VERIFICATION_TIMEOUT = 2.0   # Seconds before timeout
+    WAKE_WORD_COOLDOWN_SECONDS = 2         # Prevent rapid re-triggers
+    WAKE_WORD_PHRASES = ["hey clavr", "hey clevr", "okay clavr", "hey clover", "clavr", "clevr"]
+    
+    # Proactive nudges
+    NUDGE_MEETING_MINUTES_BEFORE = 5    # Nudge when meeting is this close
+    NUDGE_DEADLINE_MINUTES_BEFORE = 60  # Nudge when deadline is this close
+    NUDGE_COOLDOWN_MINUTES = 15         # Minimum minutes between nudges
+    NUDGE_CHECK_INTERVAL_SECONDS = 60   # How often Celery checks for nudges
+    
     # ===================================================================
     # CONFLICT DETECTOR CONSTANTS
     # ===================================================================

@@ -145,15 +145,34 @@ async def websocket_transcribe(
                 transcoder.stop()
 
         # 4. Signal readiness and start processing
+        # Check if this session was triggered by wake-word
+        trigger = websocket.query_params.get("trigger", "manual")
+        wake_word_extras = ""
+        if trigger == "wake_word":
+            try:
+                from src.services.voice_proactivity import VoiceProactivityService
+                from src.ai.prompts.voice_prompts import WAKE_WORD_GREETING_TEMPLATE
+                
+                proactivity_svc = VoiceProactivityService(config=config)
+                nudges = await proactivity_svc.check_proactive_triggers(user.id)
+                proactive_context = nudges[0].spoken_text if nudges else "No pending items."
+                wake_word_extras = WAKE_WORD_GREETING_TEMPLATE.format(
+                    proactive_context=proactive_context
+                )
+            except Exception as e:
+                logger.debug(f"[WS] Wake-word context injection error: {e}")
+
         await websocket.send_json({
             "type": "ready",
-            "message": "Connected to Gemini Live"
+            "message": "Connected to Gemini Live",
+            "trigger": trigger
         })
 
         await voice_service.process_voice_stream(
             user=user,
             audio_generator=audio_generator(),
-            websocket=websocket
+            websocket=websocket,
+            system_extras=wake_word_extras if wake_word_extras else None
         )
                     
     except Exception as e:
