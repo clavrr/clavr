@@ -995,6 +995,22 @@ class GraphRAGIntegrationService:
             if field in node.properties:
                 metadata[field] = node.properties[field]
         
+        # Notion/Asana source metadata (for cross-app filtering)
+        source_fields = ['source', 'doc_type', 'notion_page_id', 'notion_database_id',
+                         'asana_task_id', 'status', 'priority', 'completed']
+        for field in source_fields:
+            if field in node.properties and node.properties[field] is not None:
+                metadata[field] = node.properties[field]
+        
+        # Flatten top-level schema_properties into metadata with sp_ prefix
+        # Qdrant doesn't support nested object filtering, so we flatten simple values
+        schema_props = node.properties.get('schema_properties', {})
+        if isinstance(schema_props, dict):
+            for key, value in schema_props.items():
+                # Only include simple types (str, int, float, bool) - skip lists/dicts
+                if isinstance(value, (str, int, float, bool)):
+                    metadata[f'sp_{key}'] = value
+        
         # User ID for filtering (always include)
         if 'user_id' in node.properties:
             metadata['user_id'] = node.properties['user_id']

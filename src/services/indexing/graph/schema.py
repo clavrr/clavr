@@ -335,13 +335,15 @@ class GraphSchema:
             "docling_metadata", "summary", "document_type", "key_points", "entities",
             "topics", "action_items", "financial_data", "parsed_at", "parser",
             # Drive-specific metadata
-            "owner_email", "owners", "parent_folder_id", "web_link", "shared_with_count"
+            "owner_email", "owners", "parent_folder_id", "web_link", "shared_with_count",
+            # Flexible Schema Ingestion
+            "schema_properties"
         },
         NodeType.FOLDER: {
             "folder_id", "parent_folder_id", "web_link", "owner_email"
         },
         NodeType.RECEIPT: {"items", "tax", "tip", "category", "location", "subtotal", "time", "payment_method", "currency", "receipt_number"},
-        NodeType.ACTION_ITEM: {"priority", "due_date", "assigned_to", "urgency", "amount", "type"},
+        NodeType.ACTION_ITEM: {"priority", "due_date", "assigned_to", "urgency", "amount", "type", "schema_properties"},
         NodeType.TOPIC: {
             "category", "keywords", "description", "source", "confidence",
             "related_apps", "entity_count", "last_mentioned"
@@ -612,6 +614,8 @@ class GraphSchema:
         "related_apps": PropertyType.ARRAY,
         "entity_count": PropertyType.INTEGER,
         "last_mentioned": PropertyType.DATETIME,
+        # Flexible Schema Ingestion
+        "schema_properties": PropertyType.OBJECT,
     }
     
     # Valid relationship constraints (from_type -> rel_type -> to_type)

@@ -18,6 +18,7 @@ import asyncio
 from src.services.indexing.base_indexer import BaseIndexer
 from src.services.indexing.parsers.base import ParsedNode, Relationship
 from src.services.indexing.graph.schema import NodeType, RelationType
+from src.services.service_constants import ServiceConstants
 from src.utils.logger import setup_logger
 
 logger = setup_logger(__name__)
@@ -57,7 +58,6 @@ class NotionCrawler(BaseIndexer):
         self._page_cache = {}  # Cache page IDs to avoid re-indexing
         
         # Notion-specific settings from ServiceConstants
-        from src.services.service_constants import ServiceConstants
         self.sync_interval = ServiceConstants.NOTION_SYNC_INTERVAL
     
     @property
@@ -171,6 +171,9 @@ class NotionCrawler(BaseIndexer):
             if not searchable_text or len(searchable_text) < 10:
                 return None
             
+            # Extract schema properties for valid mapping
+            schema_props = self._extract_schema_properties(properties)
+            
             # Create Document node for page
             node_id = f"notion_page_{page_id.replace('-', '_')}"
             
@@ -189,6 +192,7 @@ class NotionCrawler(BaseIndexer):
                     'created_at': created_time,
                     'url': item.get('url'),
                     'doc_type': 'notion_page',
+                    'schema_properties': schema_props,
                 },
                 searchable_text=searchable_text[:10000],  # Limit searchable text
                 relationships=[]
@@ -209,6 +213,90 @@ class NotionCrawler(BaseIndexer):
         except Exception as e:
             logger.warning(f"[NotionCrawler] Transform failed for page: {e}")
             return None
+            
+    def _extract_schema_properties(self, properties: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Extract and normalize Notion database properties into a flat schema dictionary.
+        
+        Handles:
+        - Select / Multi-select (extracts names)
+        - Date (extracts start date)
+        - People (extracts names)
+        - Files (extracts URLs)
+        - Checkbox, URL, Email, Phone (direct values)
+        - Formula/Rollup (extracts computed values if simple)
+        """
+        schema_props = {}
+        
+        for name, prop in properties.items():
+            if not isinstance(prop, dict):
+                continue
+                
+            prop_type = prop.get('type')
+            value = None
+            
+            try:
+                if prop_type == 'select':
+                    select = prop.get('select')
+                    if select:
+                        value = select.get('name')
+                
+                elif prop_type == 'multi_select':
+                    multi_select = prop.get('multi_select', [])
+                    value = [item.get('name') for item in multi_select]
+                
+                elif prop_type == 'date':
+                    date_obj = prop.get('date')
+                    if date_obj:
+                        # Store as string or dict? String is safer for simple schema props
+                        value = date_obj.get('start')
+                        if date_obj.get('end'):
+                            value = f"{value} to {date_obj.get('end')}"
+                
+                elif prop_type == 'checkbox':
+                    value = prop.get('checkbox')
+                
+                elif prop_type == 'url':
+                    value = prop.get('url')
+                
+                elif prop_type == 'email':
+                    value = prop.get('email')
+                
+                elif prop_type == 'phone_number':
+                    value = prop.get('phone_number')
+                
+                elif prop_type == 'number':
+                    value = prop.get('number')
+                    
+                elif prop_type == 'rich_text':
+                    rich_text = prop.get('rich_text', [])
+                    value = ''.join([t.get('plain_text', '') for t in rich_text])
+                    
+                elif prop_type == 'status':
+                    status = prop.get('status')
+                    if status:
+                        value = status.get('name')
+                        
+                elif prop_type == 'files':
+                    files = prop.get('files', [])
+                    value = [f.get('name') for f in files]
+                    
+                # Skip title (already handled) and people (handled in relationships)
+                # unless we want them in schema_props too? 
+                # Let's keep them out to avoid duplication, or add names as text.
+                elif prop_type == 'people':
+                   people = prop.get('people', [])
+                   value = [p.get('name') for p in people]
+
+                if value is not None and value != "" and value != []:
+                    # Sanitize key/value if needed
+                    schema_props[name] = value
+                    
+            except Exception as e:
+                logger.debug(f"Failed to process property {name} ({prop_type}): {e}")
+                continue
+                
+        return schema_props
     
     def _extract_title(self, properties: Dict[str, Any]) -> Optional[str]:
         """Extract title from Notion page properties."""
