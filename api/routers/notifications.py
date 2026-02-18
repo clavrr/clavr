@@ -17,7 +17,7 @@ from api.dependencies import get_current_user_required
 
 logger = setup_logger(__name__)
 
-router = APIRouter(prefix="/api/notifications", tags=["notifications"])
+router = APIRouter(prefix="/notifications", tags=["notifications"])
 
 
 # ==================== Response Models ====================

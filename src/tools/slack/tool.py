@@ -46,6 +46,9 @@ class SlackTool(BaseTool):
     def __init__(self, config: Optional[Config] = None, user_id: int = None, **kwargs):
         if user_id is None:
             raise ValueError("user_id is required for SlackTool - cannot default to 1 for multi-tenancy")
+        kwargs['user_id'] = user_id
+        if config:
+            kwargs['config'] = config
         super().__init__(**kwargs)
         self.config = config or load_config()
         self.user_id = user_id
@@ -53,11 +56,20 @@ class SlackTool(BaseTool):
 
     @property
     def slack_client(self):
-        """Lazy initialization of Slack client."""
+        """Lazy initialization of Slack client with user-specific OAuth token."""
         if self._slack_client is None:
             try:
                 from ...integrations.slack.client import SlackClient
-                self._slack_client = SlackClient()
+                from ...core.integration_tokens import get_integration_token
+                
+                # Get user-specific token from UserIntegration
+                access_token = get_integration_token(self.user_id, 'slack')
+                if not access_token:
+                    logger.debug(f"[SlackTool] No Slack token for user {self.user_id}")
+                    return None
+                
+                # Use OAuth token (no Socket Mode for OAuth-based bots)
+                self._slack_client = SlackClient(bot_token=access_token, skip_socket_mode=True)
             except Exception as e:
                 logger.error(f"Failed to initialize SlackClient: {e}")
                 self._slack_client = None
@@ -112,11 +124,19 @@ class SlackTool(BaseTool):
                 if not slack_user_id:
                     return "Error: Could not resolve your Slack user ID. Please ensure Slack integration is configured."
 
+                # Get user's OAuth token for status updates (requires users.profile:write scope)
+                from ...core.integration_tokens import get_integration_token
+                user_token = get_integration_token(self.user_id, 'slack')
+                
+                if not user_token:
+                    return "[INTEGRATION_REQUIRED] Slack permission not granted. Please reconnect Slack with the 'users.profile:write' scope."
+
                 resp = self.slack_client.set_user_status(
                     user_id=slack_user_id,
                     status_text=status_text,
                     status_emoji=status_emoji,
-                    expiration=expiration
+                    expiration=expiration,
+                    user_token=user_token
                 )
                 
                 if resp.get('ok'):

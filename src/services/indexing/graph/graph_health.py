@@ -15,6 +15,7 @@ import asyncio
 from src.utils.logger import setup_logger
 from src.utils.config import Config
 from src.services.indexing.graph.manager import KnowledgeGraphManager
+from src.services.indexing.graph.schema import NodeType, RelationType
 
 logger = setup_logger(__name__)
 

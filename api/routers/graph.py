@@ -17,7 +17,7 @@ from src.database.models import User
 from src.services.graph_search_service import GraphSearchService
 
 logger = setup_logger(__name__)
-router = APIRouter(prefix="/api/graph", tags=["knowledge_graph"])
+router = APIRouter(prefix="/graph", tags=["knowledge_graph"])
 
 # ============================================
 # REQUEST/RESPONSE MODELS
@@ -48,8 +48,8 @@ class SpendingAnalysisRequest(BaseModel):
 class GraphVisualizationRequest(BaseModel):
     """Request for graph visualization data"""
     center_node: Optional[str] = Field(None, description="Center node ID")
-    depth: int = Field(2, ge=1, le=5, description="Traversal depth")
-    max_nodes: int = Field(50, ge=10, le=200)
+    depth: int = Field(2, ge=0, le=20, description="Traversal depth")
+    max_nodes: int = Field(150, ge=0, le=5000)
 
 
 class InsightsRequest(BaseModel):
@@ -317,7 +317,7 @@ async def get_graph_stats(
             user_id=current_user.id
         )
         
-        stats = await search_service.graph.get_statistics()
+        stats = await search_service.graph.get_stats()
         
         return {
             'success': True,

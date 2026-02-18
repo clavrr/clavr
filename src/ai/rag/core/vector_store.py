@@ -44,8 +44,52 @@ except ImportError:
 from ....utils.config import Config, RAGConfig
 from ....utils.logger import setup_logger
 from .embedding_provider import EmbeddingProvider
+from ....utils.encryption import encrypt_token, decrypt_token
 
 logger = setup_logger(__name__)
+
+# Sensitive metadata keys that should be encrypted in the vector store payload
+SENSITIVE_METADATA_KEYS = {
+    'title', 'subject', 'sender', 'sender_email', 'recipients', 
+    'snippet', 'body', 'name', 'email', 'description', 'summary',
+    'text', 'file_name', 'topic', 'reason'
+}
+
+def _encrypt_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Encrypt sensitive fields in a document payload."""
+    if not payload:
+        return payload
+    
+    new_payload = payload.copy()
+    
+    # Encrypt content if present
+    if 'content' in new_payload and isinstance(new_payload['content'], str):
+        new_payload['content'] = encrypt_token(new_payload['content'])
+    
+    # Encrypt sensitive metadata
+    for key in SENSITIVE_METADATA_KEYS:
+        if key in new_payload and isinstance(new_payload[key], str):
+            new_payload[key] = encrypt_token(new_payload[key])
+            
+    return new_payload
+
+def _decrypt_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Decrypt sensitive fields in a document payload."""
+    if not payload:
+        return payload
+    
+    new_payload = payload.copy()
+    
+    # Decrypt content
+    if 'content' in new_payload and isinstance(new_payload['content'], str):
+        new_payload['content'] = decrypt_token(new_payload['content'])
+        
+    # Decrypt sensitive metadata
+    for key in SENSITIVE_METADATA_KEYS:
+        if key in new_payload and isinstance(new_payload[key], str):
+            new_payload[key] = decrypt_token(new_payload[key])
+            
+    return new_payload
 
 
 class VectorStore(ABC):
@@ -158,9 +202,10 @@ class PostgresVectorStore(VectorStore):
     
     def add_document(self, doc_id: str, content: str, metadata: Optional[Dict[str, Any]] = None) -> None:
         """Add a single document to the vector store."""
+        # Prepare encrypted document
         doc = Document(
-            page_content=content,
-            metadata=metadata or {},
+            page_content=encrypt_token(content) if content else "",
+            metadata=_encrypt_payload(metadata or {}),
             id=doc_id
         )
         self.store.add_documents([doc])
@@ -199,9 +244,13 @@ class PostgresVectorStore(VectorStore):
         
         formatted_results = []
         for doc, score in results:
+            # Decrypt payload
+            decrypted_metadata = _decrypt_payload(doc.metadata)
+            decrypted_content = decrypt_token(doc.page_content)
+            
             formatted_results.append({
-                'content': doc.page_content,
-                'metadata': doc.metadata,
+                'content': decrypted_content,
+                'metadata': decrypted_metadata,
                 'distance': float(score),
                 'id': doc.id if hasattr(doc, 'id') else None
             })
@@ -457,6 +506,9 @@ class QdrantVectorStore(VectorStore):
         payload['original_id'] = doc_id  # Store original ID for retrieval
         payload['indexed_at'] = datetime.utcnow().isoformat()
         
+        # Encrypt payload before storage
+        encrypted_payload = _encrypt_payload(payload)
+        
         # Upsert
         self.client.upsert(
             collection_name=self.collection_name,
@@ -464,7 +516,7 @@ class QdrantVectorStore(VectorStore):
                 self.models.PointStruct(
                     id=str(uuid.uuid5(uuid.NAMESPACE_DNS, doc_id)) if not self._is_valid_uuid(doc_id) else doc_id,
                     vector=embedding,
-                    payload=payload
+                    payload=encrypted_payload
                 )
             ]
         )
@@ -533,10 +585,13 @@ class QdrantVectorStore(VectorStore):
             payload['original_id'] = doc_id # Store original ID if we hashed it
             payload['indexed_at'] = datetime.utcnow().isoformat()
             
+            # Encrypt payload
+            encrypted_payload = _encrypt_payload(payload)
+            
             points.append(self.models.PointStruct(
                 id=point_id,
                 vector=embeddings[i],
-                payload=payload
+                payload=encrypted_payload
             ))
             
         # Batch upsert
@@ -573,12 +628,14 @@ class QdrantVectorStore(VectorStore):
             formatted_results = []
             for res in results:
                 payload = res.payload or {}
-                content = payload.pop('content', '')
-                original_id = payload.pop('original_id', str(res.id))
+                # Decrypt payload
+                decrypted_payload = _decrypt_payload(payload)
+                decrypted_content = decrypted_payload.pop('content', '')
+                original_id = decrypted_payload.pop('original_id', str(res.id))
                 
                 formatted_results.append({
-                    'content': content,
-                    'metadata': payload,
+                    'content': decrypted_content,
+                    'metadata': decrypted_payload,
                     'distance': res.score, # Cosine similarity
                     'score': res.score,
                     'id': original_id

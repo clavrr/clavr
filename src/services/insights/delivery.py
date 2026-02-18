@@ -336,11 +336,15 @@ class InsightDeliveryService:
             # 1. WebSocket for in-app real-time notifications
             await self._deliver_via_websocket(user_id, insight, priority)
             
-            # 2. Email notification for urgent insights
+            # 2. Push notification for urgent/high priority insights
             if priority in (InsightPriority.URGENT, InsightPriority.HIGH):
+                await self._deliver_via_push(user_id, insight, priority)
+            
+            # 3. Email notification for urgent insights only
+            if priority == InsightPriority.URGENT:
                 await self._deliver_via_email(user_id, insight, priority)
             
-            # 3. Queue medium priority for digest delivery
+            # 4. Queue medium priority for digest delivery
             elif priority == InsightPriority.MEDIUM:
                 await self._queue_for_digest(user_id, insight)
             
@@ -388,6 +392,48 @@ class InsightDeliveryService:
             logger.debug("[InsightDelivery] WebSocket dependencies not available")
         except Exception as e:
             logger.warning(f"[InsightDelivery] WebSocket delivery failed: {e}")
+    
+    async def _deliver_via_push(
+        self,
+        user_id: int,
+        insight: Dict[str, Any],
+        priority: InsightPriority
+    ) -> bool:
+        """
+        Deliver insight via push notification to mobile devices.
+        
+        Integrates with PushNotificationService for Firebase Cloud Messaging.
+        """
+        try:
+            from src.services.notifications.push_service import get_push_service, init_push_service
+            
+            # Get or initialize push service
+            push_service = get_push_service()
+            if not push_service:
+                push_service = init_push_service(self.config)
+            
+            if not push_service or not push_service.is_available:
+                logger.debug("[InsightDelivery] Push service not available")
+                return False
+            
+            # Send the notification
+            success = await push_service.send_insight_notification(
+                user_id=user_id,
+                insight=insight,
+                priority="high" if priority == InsightPriority.URGENT else "normal"
+            )
+            
+            if success:
+                logger.info(f"[InsightDelivery] Push notification sent to user {user_id}")
+            
+            return success
+            
+        except ImportError:
+            logger.debug("[InsightDelivery] Push notification dependencies not available")
+            return False
+        except Exception as e:
+            logger.warning(f"[InsightDelivery] Push delivery failed: {e}")
+            return False
     
     async def _deliver_via_email(
         self,

@@ -13,7 +13,7 @@ This bridge:
 Vector Store: RAGEngine (Qdrant/PostgreSQL)
 Graph Store: ArangoDB or NetworkX
 """
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Tuple
 import asyncio
 
 from src.ai.rag import RAGEngine
@@ -183,11 +183,101 @@ class GraphRAGIntegrationService:
         self.adapter = RAGVectorAdapter(rag_engine)
         logger.info("GraphRAGIntegrationService initialized")
     
+    async def index_batch(
+        self, 
+        nodes: List[ParsedNode],
+        index_in_graph: bool = True,
+        index_in_vector: bool = True
+    ) -> Tuple[int, int]:
+        """
+        Index multiple nodes in batch.
+        
+        IMPROVED: Solves the relationship race condition by:
+        1. Adding all nodes to the graph first
+        2. Indexing all nodes in vector store
+        3. Adding all relationships AFTER both nodes are guaranteed to exist
+        4. Retrying deferred relationships that failed in first pass
+        
+        Args:
+            nodes: List of parsed nodes
+            index_in_graph: Whether to index in graph
+            index_in_vector: Whether to index in vector store
+            
+        Returns:
+            Tuple of (successful_count, failed_count)
+        """
+        successful = 0
+        failed = 0
+        
+        # Step 1: Add all nodes to graph and vector store first
+        for node in nodes:
+            try:
+                # Optimized index (nodes only, no relationships yet)
+                node_indexed = await self.index_parsed_node(
+                    node, 
+                    index_in_graph=index_in_graph, 
+                    index_in_vector=index_in_vector,
+                    skip_relationships=True # New parameter
+                )
+                if node_indexed:
+                    successful += 1
+                else:
+                    failed += 1
+            except Exception as e:
+                logger.error(f"Failed to index node {node.node_id} in batch step 1: {e}")
+                failed += 1
+        
+        # Step 2: Add all relationships now that nodes are likely present
+        all_deferred = []  # Collect deferred relationships for retry
+        if index_in_graph:
+            for node in nodes:
+                try:
+                    deferred = await self._index_node_relationships(node)
+                    all_deferred.extend(deferred)
+                except Exception as e:
+                    logger.debug(f"Failed to add relationships for node {node.node_id} in batch step 2: {e}")
+        
+        # Step 3: Retry deferred relationships (nodes may now exist)
+        if all_deferred:
+            from .graph.schema import RelationType
+            retry_success = 0
+            for rel in all_deferred:
+                try:
+                    from_node = rel.get('from_node')
+                    to_node = rel.get('to_node')
+                    
+                    # Check if nodes now exist
+                    source_exists = await self.graph.get_node(from_node)
+                    target_exists = await self.graph.get_node(to_node)
+                    
+                    if source_exists and target_exists:
+                        await self.graph.add_relationship(
+                            from_node=from_node,
+                            to_node=to_node,
+                            rel_type=RelationType(rel.get('rel_type')),
+                            properties=rel.get('properties', {})
+                        )
+                        retry_success += 1
+                    else:
+                        logger.warning(
+                            f"Dropping relationship {from_node} -> {to_node}: "
+                            f"nodes still don't exist after batch indexing"
+                        )
+                except Exception as e:
+                    logger.debug(f"Failed to retry deferred relationship: {e}")
+            
+            if retry_success > 0:
+                logger.info(f"Batch retry: {retry_success}/{len(all_deferred)} deferred relationships indexed")
+        
+        logger.info(f"Batch indexed: {successful} successful, {failed} failed")
+        return successful, failed
+
     async def index_parsed_node(
         self,
         node: ParsedNode,
         index_in_graph: bool = True,
-        index_in_vector: bool = True
+        index_in_vector: bool = True,
+        skip_relationships: bool = False
     ) -> bool:
         """
         Index a parsed node in both graph and vector stores.
@@ -196,6 +286,7 @@ class GraphRAGIntegrationService:
             node: Parsed node to index
             index_in_graph: Whether to index in graph
             index_in_vector: Whether to index in vector store
+            skip_relationships: If True, only add the node, not its relationships
             
         Returns:
             True if successful
@@ -206,7 +297,7 @@ class GraphRAGIntegrationService:
         # Try to index in graph first (primary store)
         if index_in_graph:
             try:
-                await self._index_node_in_graph(node)
+                await self._index_node_in_graph(node, skip_relationships=skip_relationships)
                 graph_indexed = True
             except ValueError as e:
                 # Validation error - log but continue to vector indexing
@@ -733,7 +824,7 @@ class GraphRAGIntegrationService:
         
         return True
     
-    async def _index_node_in_graph(self, node: ParsedNode) -> None:
+    async def _index_node_in_graph(self, node: ParsedNode, skip_relationships: bool = False) -> None:
         """Index node in knowledge graph."""
         from .graph.schema import NodeType, RelationType
         
@@ -745,39 +836,57 @@ class GraphRAGIntegrationService:
         )
         
         # Add relationships - fail if target doesn't exist (no placeholders)
+        if not skip_relationships:
+            await self._index_node_relationships(node)
+
+    async def _index_node_relationships(self, node: ParsedNode) -> List[Dict[str, Any]]:
+        """Index relationships for a node.
+        
+        Returns:
+            List of relationships that could not be indexed (deferred for retry)
+        """
+        from .graph.schema import RelationType
+        
+        deferred = []  # Relationships to retry after all nodes indexed
+        
         for relationship in node.relationships:
             # Handle both Relationship objects and dicts
             if isinstance(relationship, dict):
                 to_node = relationship.get('to_node')
+                from_node = relationship.get('from_node')
             else:
                 to_node = relationship.to_node
+                from_node = relationship.from_node
             
-            if not to_node:
+            if not to_node or not from_node:
                 continue
-                
+            
+            # FIXED: Check BOTH source and target nodes exist
+            source_exists = await self.graph.get_node(from_node)
             target_exists = await self.graph.get_node(to_node)
-            if not target_exists:
-                # Extract from_node for error message
+            
+            if not source_exists or not target_exists:
+                # Defer for batch-level retry instead of silently skipping
                 if isinstance(relationship, dict):
-                    from_node = relationship.get('from_node')
+                    deferred.append(relationship)
                 else:
-                    from_node = relationship.from_node
-                
-                # This is expected when indexing emails before their related nodes (Contacts, Documents)
-                # The related nodes will be indexed separately, and relationships can be created later
+                    deferred.append({
+                        'from_node': from_node,
+                        'to_node': to_node,
+                        'rel_type': relationship.rel_type,
+                        'properties': relationship.properties or {}
+                    })
                 logger.debug(
-                    f"Skipping relationship from {from_node} to {to_node}: "
-                    f"target node not yet indexed (will be created when target node is indexed)"
+                    f"Deferring relationship {from_node} -> {to_node}: "
+                    f"source_exists={bool(source_exists)}, target_exists={bool(target_exists)}"
                 )
                 continue
             
             # Extract relationship details
             if isinstance(relationship, dict):
-                from_node = relationship.get('from_node')
                 rel_type = relationship.get('rel_type')
                 rel_properties = relationship.get('properties', {})
             else:
-                from_node = relationship.from_node
                 rel_type = relationship.rel_type
                 rel_properties = relationship.properties
             
@@ -788,6 +897,8 @@ class GraphRAGIntegrationService:
                 rel_type=RelationType(rel_type),
                 properties=rel_properties
             )
+        
+        return deferred
     
     async def _index_node_in_vector(self, node: ParsedNode) -> None:
         """

@@ -92,8 +92,8 @@ class ProactiveServiceFactory:
     def get_context_service(cls, config, db=None):
         """Get or create ContextService singleton."""
         if cls._context_service is None:
-            from src.services.proactive.context_service import ContextService
-            cls._context_service = ContextService(config, db)
+            from src.services.proactive.context_service import ProactiveContextService
+            cls._context_service = ProactiveContextService(config, db)
         return cls._context_service
     
     @classmethod

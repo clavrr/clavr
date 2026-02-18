@@ -372,7 +372,11 @@ class DynamicContextInjector:
                     )
                     
                     if connected:
-                        connections = [n.get('name', n.get('_id', ''))[:30] for n in connected]
+                        # n is (neighbor_id, rel_props) where rel_props['_neighbor_node'] exists
+                        connections = [
+                            props.get('_neighbor_node', {}).get('name', nid.split('/')[-1])[:30] 
+                            for nid, props in connected
+                        ]
                         context = f"{entity}: related to {', '.join(connections)}"
                         chunks.append(ContextChunk(
                             content=context,

@@ -26,7 +26,7 @@ from src.integrations.google_calendar.service import CalendarService
 
 logger = setup_logger(__name__)
 
-router = APIRouter(prefix="/api/dashboard", tags=["dashboard"])
+router = APIRouter(prefix="/dashboard", tags=["dashboard"])
 
 
 @router.get("/stats")

@@ -9,10 +9,12 @@ from pydantic import BaseModel, EmailStr
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import func, desc, text, or_, select
 
-from src.auth import get_admin_user
+from api.dependencies import get_current_user
+from src.auth import get_admin_user, log_auth_event, AuditEventType
 from src.database import get_async_db
 from src.database.models import User, Session as DBSession, BlogPost, ConversationMessage
 from src.utils.logger import setup_logger
+from fastapi import Request
 
 logger = setup_logger(__name__)
 router = APIRouter(prefix="/admin", tags=["admin"])
@@ -79,6 +81,7 @@ class AdminUserUpdate(BaseModel):
 
 @router.get("/users", response_model=UserListResponse)
 async def list_users(
+    request: Request,
     page: int = Query(1, ge=1, description="Page number"),
     page_size: int = Query(50, ge=1, le=100, description="Items per page"),
     search: Optional[str] = Query(None, description="Search by email or name (case-insensitive partial match)"),
@@ -88,35 +91,18 @@ async def list_users(
 ):
     """
     List all users with pagination and search (admin only)
-    
-    **Features:**
-    - **Pagination**: Returns paginated results with metadata
-    - **Search**: Case-insensitive search by email or name (partial match)
-    - **Filtering**: Filter by admin status
-    - **Sorting**: Ordered by creation date (newest first)
-    
-    **Query Parameters:**
-    - **page**: Page number (default: 1, minimum: 1)
-    - **page_size**: Items per page (default: 50, minimum: 1, maximum: 100)
-    - **search**: Search term for email or name (optional, case-insensitive)
-    - **admin_only**: Filter to admin users only (default: false)
-    
-    **Response:**
-    Returns a paginated response with:
-    - `users`: List of user summaries
-    - `total`: Total number of users matching the filters
-    - `page`: Current page number
-    - `page_size`: Items per page
-    - `total_pages`: Total number of pages
-    
-    **Examples:**
-    - Get all users: `GET /admin/users`
-    - Search by email: `GET /admin/users?search=manikoanthony@gmail.com`
-    - Search by name: `GET /admin/users?search=Anthony`
-    - Admin users only: `GET /admin/users?admin_only=true`
-    - Paginated: `GET /admin/users?page=2&page_size=25`
     """
     try:
+        # Log admin activity
+        await log_auth_event(
+            db=db,
+            event_type=AuditEventType.ADMIN_ACTION,
+            user_id=admin.id,
+            request=request,
+            action="list_users",
+            details={"page": page, "search": search, "admin_only": admin_only}
+        )
+        
         stmt = select(User)
         
         # Filter by admin status
@@ -184,6 +170,7 @@ async def list_users(
 @router.get("/users/{user_id}", response_model=UserDetail)
 async def get_user(
     user_id: int,
+    request: Request,
     db: AsyncSession = Depends(get_async_db),
     admin: User = Depends(get_admin_user)
 ):
@@ -191,6 +178,16 @@ async def get_user(
     Get detailed user information (admin only)
     """
     try:
+        # Log admin activity
+        await log_auth_event(
+            db=db,
+            event_type=AuditEventType.ADMIN_ACTION,
+            user_id=admin.id,
+            request=request,
+            action="get_user_details",
+            target_user_id=user_id
+        )
+        
         stmt = select(User).where(User.id == user_id)
         result = await db.execute(stmt)
         user = result.scalar_one_or_none()
@@ -317,6 +314,18 @@ async def update_user_admin_status(
         await db.commit()
         await db.refresh(user)
         
+        # Log critical admin action
+        await log_auth_event(
+            db=db,
+            event_type=AuditEventType.ADMIN_ACTION,
+            user_id=admin.id,
+            request=request,
+            action="update_admin_status",
+            target_user_id=user_id,
+            target_user_email=user.email,
+            new_status=update.is_admin
+        )
+        
         logger.warning(f"Admin {admin.email} updated admin status for user {user.email}: {update.is_admin}")
         
         return UserSummary.model_validate(user)
@@ -335,6 +344,7 @@ async def update_user_admin_status(
 @router.delete("/users/{user_id}/sessions", status_code=status.HTTP_204_NO_CONTENT)
 async def revoke_user_sessions(
     user_id: int,
+    request: Request,
     db: AsyncSession = Depends(get_async_db),
     admin: User = Depends(get_admin_user)
 ):
@@ -361,6 +371,18 @@ async def revoke_user_sessions(
             await db.delete(session)
         
         await db.commit()
+        
+        # Log critical admin action
+        await log_auth_event(
+            db=db,
+            event_type=AuditEventType.ADMIN_ACTION,
+            user_id=admin.id,
+            request=request,
+            action="revoke_sessions",
+            target_user_id=user_id,
+            target_user_email=user.email,
+            session_count=count
+        )
         
         logger.warning(f"Admin {admin.email} revoked {count} sessions for user {user.email}")
         

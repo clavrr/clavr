@@ -46,13 +46,13 @@ class TasksCrawler(BaseIndexer):
             user_id: User ID to index for
             task_service: TaskService instance
         """
+        from src.services.service_constants import ServiceConstants
         super().__init__(config, user_id, **kwargs)
         self.task_service = task_service
         self.last_sync_time = datetime.now() - timedelta(days=ServiceConstants.INITIAL_LOOKBACK_DAYS)
         self._task_cache = {}  # Cache task IDs with update timestamps
         
         # Tasks-specific settings from ServiceConstants
-        from src.services.service_constants import ServiceConstants
         self.sync_interval = ServiceConstants.TASK_SYNC_INTERVAL
     
     @property
@@ -146,27 +146,52 @@ class TasksCrawler(BaseIndexer):
             # Create ActionItem node
             node_id = f"gtask_{task_id.replace('-', '_')}"
             
+            properties = {
+                'id': task_id, # REQUIRED by schema
+                'title': title, # GoogleTask uses title
+                'description': notes[:2000] if notes else '', # Map notes to description
+                'status': status,
+                'notes': notes[:2000] if notes else '',
+                'google_task_id': task_id,
+                'source': 'google_tasks',
+                'user_id': self.user_id,
+                'timestamp': item.get('updated'),
+                'position': position,
+                'parent_id': parent,
+                'tasklist_id': item.get('tasklist_id', '@default'),
+            }
+            
+            # Add optional fields only if they exist (to avoid NoneType validation errors)
+            if due_date:
+                properties['due'] = due_date # Schema expects 'due' or 'due_date'? Schema says 'due' in OPTIONAL for GOOGLE_TASK
+                properties['due_date'] = due_date # Keep generic too?
+            
+            created = item.get('created')
+            if created:
+                properties['created_at'] = created
+                
+            completed = item.get('completed')
+            if completed:
+                properties['completed'] = completed
+                properties['completed_at'] = completed # Map to standard
+            
             task_node = ParsedNode(
                 node_id=node_id,
-                node_type=NodeType.ACTION_ITEM,
-                properties={
-                    'description': title,
-                    'status': status,
-                    'notes': notes[:2000] if notes else '',
-                    'due_date': due_date,
-                    'google_task_id': task_id,
-                    'source': 'google_tasks',
-                    'user_id': self.user_id,
-                    'timestamp': item.get('updated'),
-                    'created_at': item.get('created'),
-                    'completed_at': item.get('completed'),
-                    'position': position,
-                    'parent_id': parent,
-                    'tasklist_id': item.get('tasklist_id', '@default'),
-                },
+                node_type=NodeType.GOOGLE_TASK,
+                properties=properties,
                 searchable_text=searchable_text[:5000],
                 relationships=[]
             )
+            
+            # FIXED: Link to User for graph connectivity
+            # ActionItem BELONGS_TO User - ensures tasks appear in visualization
+            from src.services.indexing.graph.schema import RelationType
+            task_node.relationships.append({
+                'from_node': node_id,
+                'to_node': f"User/{self.user_id}",
+                'rel_type': RelationType.BELONGS_TO.value,
+                'properties': {'source': 'google_tasks'}
+            })
             
             return [task_node]
             

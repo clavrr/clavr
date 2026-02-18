@@ -55,6 +55,7 @@ from .constants import (
     ERROR_GENERAL_UNAVAILABLE,
     ERROR_GENERAL_FAILURE,
     DOMAIN_ALIASES,
+    DOMAIN_DISPLAY_NAMES,
     PROVIDER_MAPPINGS,
     DOMAIN_START_MESSAGES
 )
@@ -522,21 +523,42 @@ CRITICAL ROUTING RULES:
             
         return provider in active_providers
 
-    async def _inject_urgent_insights(self, response: str, user_id: Optional[int]) -> str:
-        """Inject urgent insights (P1 Feature) into the response."""
+    async def _inject_urgent_insights(self, response: str, user_id: Optional[int], query: str = None) -> str:
+        """Inject urgent AND contextual insights into the response."""
         if not user_id or not get_insight_service:
             return response
             
         try:
             insight_service = get_insight_service()
-            if insight_service:
-                urgent_insights = await insight_service.get_urgent_insights(user_id)
-                if urgent_insights:
-                    formatted = await insight_service.format_insights_for_response(urgent_insights)
-                    if formatted:
-                        return f"{response}\n\n{formatted}"
+            if not insight_service:
+                return response
+                
+            # 1. Get urgent insights (existing behavior)
+            urgent_insights = await insight_service.get_urgent_insights(user_id)
+            
+            # 2. Get contextually-relevant insights based on query
+            contextual_insights = []
+            if query:
+                contextual_insights = await insight_service.get_contextual_insights(
+                    user_id=user_id,
+                    current_context=query,
+                    max_insights=2
+                )
+            
+            # Combine and deduplicate (urgent insights take priority)
+            urgent_ids = {i.get('id') for i in urgent_insights if i.get('id')}
+            all_insights = urgent_insights + [
+                i for i in contextual_insights 
+                if i.get('id') not in urgent_ids
+            ]
+            
+            if all_insights:
+                formatted = await insight_service.format_insights_for_response(all_insights)
+                if formatted:
+                    return f"{response}\n\n{formatted}"
+                    
         except Exception as e:
-            logger.debug(f"Failed to inject urgent insights: {e}")
+            logger.debug(f"Failed to inject insights: {e}")
             
         return response
 
@@ -696,8 +718,8 @@ CRITICAL ROUTING RULES:
             # Formatting cleanup if not enhanced (remove step markers)
             final_result = re.sub(r'\[Step \d+ Result\]:\s*', '', final_result).strip()
             
-        # 7. Inject Urgent Insights
-        final_result = await self._inject_urgent_insights(final_result, user_id)
+        # 7. Inject Urgent and Contextual Insights
+        final_result = await self._inject_urgent_insights(final_result, user_id, query=query)
         
         # 8. Perfect Memory Learning
         # 8. Record interaction for learning

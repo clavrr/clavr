@@ -9,15 +9,17 @@ import json
 import hmac
 import hashlib
 from typing import Dict, Any, Optional
-from fastapi import APIRouter, Request, HTTPException, Header, status, Body
+from fastapi import APIRouter, Request, HTTPException, Header, status, Body, BackgroundTasks, Depends
 from pydantic import BaseModel
 
 from src.utils.logger import setup_logger
-from src.workers.tasks.indexing_tasks import index_new_email_notification
+from src.services.indexing.event_stream import EventStreamHandler
+from src.database.webhook_models import WebhookEventType
+from api.dependencies import get_event_stream_handler
 
 logger = setup_logger(__name__)
 
-router = APIRouter(prefix="/api/gmail/push", tags=["gmail-push"])
+router = APIRouter(prefix="/gmail/push", tags=["gmail-push"])
 
 
 class GmailPushNotification(BaseModel):
@@ -29,6 +31,8 @@ class GmailPushNotification(BaseModel):
 @router.post("/notification")
 async def receive_gmail_push_notification(
     request: Request,
+    background_tasks: BackgroundTasks,
+    event_handler: EventStreamHandler = Depends(get_event_stream_handler),
     x_goog_channel_id: Optional[str] = Header(None, alias="X-Goog-Channel-Id"),
     x_goog_channel_token: Optional[str] = Header(None, alias="X-Goog-Channel-Token"),
     x_goog_message_number: Optional[str] = Header(None, alias="X-Goog-Message-Number"),
@@ -89,17 +93,29 @@ async def receive_gmail_push_notification(
                 user_id = _extract_user_id_from_uri(x_goog_resource_uri)
             
             if user_id:
-                # Trigger async indexing task
+                # Trigger async indexing via EventStreamHandler
                 try:
-                    task_result = index_new_email_notification.delay(
-                        user_id=user_id,
-                        history_id=x_goog_resource_id,  # Use resource ID as history ID hint
-                        channel_id=x_goog_channel_id,
-                        resource_state=x_goog_resource_state
-                    )
-                    logger.info(f"✅ Indexing task queued: {task_result.id}")
+                    # Convert to int
+                    user_id_int = int(user_id) if str(user_id).isdigit() else 1  # Default to 1 on failure
+                    
+                    if event_handler:
+                        background_tasks.add_task(
+                            _process_gmail_event,
+                            event_handler=event_handler,
+                            payload={
+                                "historyId": x_goog_resource_id,
+                                "channelId": x_goog_channel_id,
+                                "resourceState": x_goog_resource_state
+                            },
+                            user_id=user_id_int,
+                            event_id=x_goog_channel_id or "gmail_push",
+                        )
+                        logger.info(f"✅ Gmail event queued for user {user_id}")
+                    else:
+                         logger.error("EventStreamHandler not available")
+                         
                 except Exception as e:
-                    logger.error(f"❌ Failed to queue indexing task: {e}", exc_info=True)
+                    logger.error(f"❌ Failed to queue Gmail event: {e}", exc_info=True)
                     # Don't fail the webhook - Gmail will retry if we return error
             else:
                 logger.warning(
@@ -127,6 +143,42 @@ async def receive_gmail_push_notification(
             "status": "error",
             "message": str(e)
         }
+
+
+async def _process_gmail_event(
+    event_handler: EventStreamHandler,
+    payload: Dict[str, Any],
+    user_id: int,
+    event_id: str,
+):
+    """
+    Background processing for a Gmail push notification:
+    1. Route through EventStreamHandler for immediate indexing.
+    2. Trigger outbound email.received webhook via Celery.
+    """
+    # 1. Real-time indexing
+    try:
+        await event_handler.handle_event(
+            event_type="gmail_push",
+            payload=payload,
+            user_id=user_id,
+        )
+    except Exception as e:
+        logger.error(f"[GmailPush] EventStreamHandler error: {e}")
+
+    # 2. Outbound webhook delivery
+    try:
+        from src.workers.tasks.webhook_tasks import deliver_webhook_task
+
+        deliver_webhook_task.delay(
+            event_type=WebhookEventType.EMAIL_RECEIVED.value,
+            event_id=event_id,
+            payload=payload,
+            user_id=user_id,
+        )
+        logger.info(f"[GmailPush] Queued email.received webhook for user {user_id}")
+    except Exception as e:
+        logger.error(f"[GmailPush] Failed to queue webhook: {e}")
 
 
 def _extract_user_id_from_token(token: Optional[str]) -> Optional[str]:

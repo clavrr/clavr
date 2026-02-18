@@ -2,11 +2,15 @@
 Proactive Services Package
 
 Services for proactive intelligence delivery:
-- ContextService: Meeting prep and attendee context
+- ProactiveContextService: Meeting prep and attendee context
 - CrossStackContext: 360° topic summaries across all sources
 """
-from .context_service import ContextService
+from .context_service import ProactiveContextService
+
+# Backward-compatible alias (deprecated)
+ContextService = ProactiveContextService
 
 __all__ = [
-    "ContextService",
+    "ProactiveContextService",
+    "ContextService",  # Deprecated alias for backward compatibility
 ]

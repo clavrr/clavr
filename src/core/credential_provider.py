@@ -233,7 +233,6 @@ class CredentialProvider:
         try:
             from ..database.models import UserIntegration
             from ..database import get_db_context
-            from ..utils import decrypt_token
             import os
             
             # Use provided session or create new context
@@ -259,16 +258,9 @@ class CredentialProvider:
                 logger.warning(f"Integration {provider} for user {user_id} has no access token")
                 return None
             
-            # Try to decrypt tokens, fallback to raw value if not encrypted
-            # (UserIntegration tokens may be stored unencrypted)
-            try:
-                access_token = decrypt_token(integration.access_token)
-                refresh_token = decrypt_token(integration.refresh_token) if integration.refresh_token else None
-            except Exception as e:
-                # Tokens might be unencrypted - use directly
-                logger.debug(f"Using unencrypted tokens for {provider} (decrypt failed: {e})")
-                access_token = integration.access_token
-                refresh_token = integration.refresh_token
+            # Access tokens (model handles decryption automatically)
+            access_token = integration.access_token
+            refresh_token = integration.refresh_token
             
             # Get OAuth client credentials
             client_id = os.getenv('GOOGLE_CLIENT_ID')
@@ -320,16 +312,11 @@ class CredentialProvider:
                     credentials.refresh(Request())
                     logger.info(f"Refreshed {provider} credentials for user {user_id}")
                     
-                    # Update tokens in database
-                    from ..utils import encrypt_token
-                    encrypted_access = encrypt_token(credentials.token)
-                    encrypted_refresh = encrypt_token(credentials.refresh_token) if credentials.refresh_token else None
-                    
                     if db_session:
-                        integration.access_token = encrypted_access
-                        if encrypted_refresh and encrypted_refresh != integration.refresh_token:
+                        integration.access_token = credentials.token
+                        if credentials.refresh_token and credentials.refresh_token != integration.refresh_token:
                             logger.info(f"Refresh token rotated for {provider} (user {user_id}) - saving new token")
-                            integration.refresh_token = encrypted_refresh
+                            integration.refresh_token = credentials.refresh_token
                         
                         if credentials.expiry:
                             integration.expires_at = credentials.expiry.replace(tzinfo=None)
@@ -340,10 +327,10 @@ class CredentialProvider:
                                 UserIntegration.id == integration.id
                             ).first()
                             if db_integration:
-                                db_integration.access_token = encrypted_access
-                                if encrypted_refresh and encrypted_refresh != db_integration.refresh_token:
+                                db_integration.access_token = credentials.token
+                                if credentials.refresh_token and credentials.refresh_token != db_integration.refresh_token:
                                     logger.info(f"Refresh token rotated for {provider} (user {user_id}) - saving new token")
-                                    db_integration.refresh_token = encrypted_refresh
+                                    db_integration.refresh_token = credentials.refresh_token
                                     
                                 if credentials.expiry:
                                     db_integration.expires_at = credentials.expiry.replace(tzinfo=None)
@@ -370,12 +357,9 @@ class CredentialProvider:
                             credentials.refresh(Request())
                             logger.info(f"Refreshed {provider} credentials (implicit scopes) for user {user_id}")
                             
-                            # Proceed to save updates
-                            from ..utils import encrypt_token
-                            encrypted_access = encrypt_token(credentials.token)
-                            
+                            # Proceed to save updates (model handles encryption)
                             if db_session:
-                                integration.access_token = encrypted_access
+                                integration.access_token = credentials.token
                                 if credentials.expiry:
                                     integration.expires_at = credentials.expiry.replace(tzinfo=None)
                                 db_session.commit()
@@ -385,7 +369,7 @@ class CredentialProvider:
                                         UserIntegration.id == integration.id
                                     ).first()
                                     if db_integration:
-                                        db_integration.access_token = encrypted_access
+                                        db_integration.access_token = credentials.token
                                         if credentials.expiry:
                                             db_integration.expires_at = credentials.expiry.replace(tzinfo=None)
                                         db.commit()

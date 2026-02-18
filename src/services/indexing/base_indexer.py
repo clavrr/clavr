@@ -33,6 +33,23 @@ if TYPE_CHECKING:
 
 logger = setup_logger(__name__)
 
+from dataclasses import dataclass, field
+
+@dataclass
+class IndexingStats:
+    created: int = 0
+    updated: int = 0
+    deleted: int = 0
+    errors: int = 0
+    skipped: int = 0
+
+@dataclass
+class IndexingResult:
+    success: bool
+    stats: IndexingStats
+    errors: Optional[List[str]] = None
+
+
 class BaseIndexer(ABC):
     """
     Abstract base class for background indexing services.
@@ -59,7 +76,8 @@ class BaseIndexer(ABC):
         relationship_manager: Optional['RelationshipStrengthManager'] = None,
         cross_app_correlator: Optional['CrossAppCorrelator'] = None,
         entity_resolver: Optional['EntityResolutionService'] = None,
-        observer_service: Optional['GraphObserverService'] = None
+        observer_service: Optional['GraphObserverService'] = None,
+        **kwargs
     ):
         self.config = config
         self.user_id = user_id
@@ -71,6 +89,8 @@ class BaseIndexer(ABC):
         self.cross_app_correlator = cross_app_correlator  # Cross-app correlation
         self.entity_resolver = entity_resolver  # Event-driven entity resolution
         self.observer_service = observer_service  # Real-time insight generation
+        self.token_saver_callback = kwargs.get('token_saver_callback')
+
         
         # Initialize hybrid coordinator if both engines are available
         if rag_engine and graph_manager:
@@ -233,14 +253,24 @@ class BaseIndexer(ABC):
         """
         Extract topics from indexed nodes using TopicExtractor.
         
-        Only processes content-bearing nodes (Email, Message, Document).
+        Only processes content-bearing nodes (Email, Message, Document, CalendarEvent, ActionItem).
         Topic extraction is non-blocking - failures don't affect indexing.
         """
         if not self.topic_extractor:
             return
             
         # Node types that contain meaningful content for topic extraction
-        content_types = {'Email', 'Message', 'Document', 'Calendar_Event'}
+        # Must match NodeType enum values in schema.py
+        content_types = {
+            'Email', 
+            'Message', 
+            'Document', 
+            'CalendarEvent',
+            'ActionItem',
+            'Project', 
+            'Conversation',
+            'BlogPost'
+        }
         
         for node in nodes:
             try:
@@ -392,19 +422,21 @@ class BaseIndexer(ABC):
                         create_from = rel_data.get('_create_from_node')
                         if create_from:
                             # Check if Person node exists; create if not
-                            existing = self.graph_manager.get_node(create_from['node_id'])
+                            existing = await self.graph_manager.get_node(create_from['node_id'])
                             if not existing:
-                                self.graph_manager.add_node(
+                                await self.graph_manager.add_node(
                                     node_id=create_from['node_id'],
                                     node_type=create_from['node_type'],
                                     properties=create_from['properties']
                                 )
                                 logger.debug(f"[{self.name}] Created {create_from['node_type']} node: {create_from['node_id']}")
+
                         
                         # Check if target node exists (for STORED_IN relationships)
                         # Folder nodes might not exist yet if processed in wrong order
                         if rel_type == RelationType.STORED_IN:
-                            target_exists = self.graph_manager.get_node(to_id)
+                            target_exists = await self.graph_manager.get_node(to_id)
+
                             if not target_exists:
                                 # Create a placeholder Folder node
                                 # Real folder data will update it when folder is processed

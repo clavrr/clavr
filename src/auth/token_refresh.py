@@ -15,7 +15,6 @@ from google.auth.transport.requests import Request
 
 from ..database.models import Session as DBSession
 from ..utils.logger import setup_logger
-from ..utils import decrypt_token, encrypt_token
 from .oauth import LOGIN_SCOPES, SCOPES
 from .audit import log_auth_event, AuditEventType
 
@@ -70,28 +69,27 @@ async def refresh_token_with_retry(
         logger.debug(f"Session {session.id} token already known to be invalid - skipping refresh attempt")
         return False, None
     
-    # Decrypt tokens from database
-    try:
-        access_token = decrypt_token(session.gmail_access_token)
-        refresh_token = decrypt_token(session.gmail_refresh_token)
-    except Exception as e:
+    # Access raw tokens (model handles decryption automatically)
+    access_token = session.gmail_access_token
+    refresh_token = session.gmail_refresh_token
+    
+    if not access_token or not refresh_token:
         # Decryption failed - token may be encrypted with different key or corrupted
         # This is expected for stale sessions or after encryption key changes
-        error_type = type(e).__name__
-        error_msg = str(e) if str(e) else "Unknown decryption error"
         logger.debug(
-            f"Failed to decrypt tokens for session {session.id} (stale/corrupted token): "
-            f"{error_type} - {error_msg}. Session will need re-authentication."
+            f"Failed to decrypt tokens for session {session.id} (stale/corrupted token). "
+            f"Session will need re-authentication."
         )
         await log_auth_event(
             db=db,
             event_type=AuditEventType.TOKEN_REFRESH_FAILURE,
             user_id=session.user_id,
             success=False,
-            error_message=f"Token decryption failed: {error_type} - {error_msg}",
+            error_message="Token decryption failed: tokens are None or empty",
             session_id=session.id
         )
         return False, None
+
     
     # Create credentials object
     client_id = os.getenv('GOOGLE_CLIENT_ID')
@@ -146,14 +144,13 @@ async def refresh_token_with_retry(
             credentials.refresh(Request())
             logger.info(f"Successfully refreshed token for session {session.id} (attempt {attempt + 1})")
             
-            # Encrypt and save refreshed tokens to database
+            # Save refreshed tokens to database (model handles encryption)
             # Google may rotate the refresh token, so we should check for it
-            encrypted_access_token = encrypt_token(credentials.token)
-            session.gmail_access_token = cast(str, encrypted_access_token)
+            session.gmail_access_token = credentials.token
             
             if credentials.refresh_token and credentials.refresh_token != refresh_token:
                 logger.info(f"Refresh token rotated for session {session.id} - saving new token")
-                session.gmail_refresh_token = cast(str, encrypt_token(credentials.refresh_token))
+                session.gmail_refresh_token = credentials.refresh_token
             
             if credentials.expiry:
                 session.token_expiry = credentials.expiry.replace(tzinfo=None)
@@ -201,12 +198,11 @@ async def refresh_token_with_retry(
                     credentials.refresh(Request())
                     logger.info(f"Successfully refreshed token for session {session.id} using implicit scopes")
                     
-                    # Update tokens in database
-                    encrypted_access_token = encrypt_token(credentials.token)
-                    session.gmail_access_token = cast(str, encrypted_access_token)
+                    # Update tokens in database (model handles encryption)
+                    session.gmail_access_token = credentials.token
                     
                     if credentials.refresh_token and credentials.refresh_token != refresh_token:
-                        session.gmail_refresh_token = cast(str, encrypt_token(credentials.refresh_token))
+                        session.gmail_refresh_token = credentials.refresh_token
                     
                     if credentials.expiry:
                         session.token_expiry = credentials.expiry.replace(tzinfo=None)
@@ -400,20 +396,8 @@ def get_valid_credentials(
     if not session.gmail_access_token:
         return None
     
-    # Decrypt tokens from database
-    try:
-        access_token = decrypt_token(session.gmail_access_token)
-        refresh_token = decrypt_token(session.gmail_refresh_token) if session.gmail_refresh_token else None
-    except Exception as e:
-        # Decryption failed - token may be encrypted with different key or corrupted
-        # This is expected for stale sessions or after encryption key changes
-        error_type = type(e).__name__
-        error_msg = str(e) if str(e) else "Unknown decryption error"
-        logger.debug(
-            f"Failed to decrypt tokens for session {session.id} (stale/corrupted token): "
-            f"{error_type} - {error_msg}. Session will need re-authentication."
-        )
-        return None
+    access_token = session.gmail_access_token
+    refresh_token = session.gmail_refresh_token
     
     if not auto_refresh:
         # Just create credentials without refreshing
@@ -502,20 +486,8 @@ async def get_valid_credentials_async(
     if not session.gmail_access_token:
         return None
     
-    # Decrypt tokens from database
-    try:
-        access_token = decrypt_token(session.gmail_access_token)
-        refresh_token = decrypt_token(session.gmail_refresh_token) if session.gmail_refresh_token else None
-    except Exception as e:
-        # Decryption failed - token may be encrypted with different key or corrupted
-        # This is expected for stale sessions or after encryption key changes
-        error_type = type(e).__name__
-        error_msg = str(e) if str(e) else "Unknown decryption error"
-        logger.debug(
-            f"Failed to decrypt tokens for session {session.id} (stale/corrupted token): "
-            f"{error_type} - {error_msg}. Session will need re-authentication."
-        )
-        return None
+    access_token = session.gmail_access_token
+    refresh_token = session.gmail_refresh_token
     
     if not auto_refresh:
         # Just create credentials without refreshing

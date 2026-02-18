@@ -118,7 +118,7 @@ class VoiceService:
             logger.error(f"Failed to fetch integration status: {e}")
             return ""
     
-    async def _get_dynamic_variables(self, user: User) -> dict:
+    async def get_voice_configuration(self, user: User) -> dict:
         """
         Gather dynamic variables for ElevenLabs personalization.
         These populate {{variable}} placeholders in the ElevenLabs system prompt.
@@ -253,18 +253,20 @@ class VoiceService:
         self, 
         user: User, 
         audio_generator: AsyncGenerator[bytes, None],
-        websocket: Any
+        websocket: Any,
+        system_extras: Optional[str] = None
     ):
         """
         Handle the bidirectional audio stream between client and AI providers with fallback.
+        Optimized for near-instant latency by parallelizing initialization.
         """
         from api.dependencies import AppState
+        import time
         
-        # Initialize tools
+        start_time = time.time()
         user_first_name = extract_first_name(user.name, user.email)
-        tools = AppState.get_all_tools(user_id=user.id, user_first_name=user_first_name)
         
-        # Decide which providers to try
+        # 1. Decide provider
         primary_provider = "elevenlabs" if os.environ.get("ELEVENLABS_AGENT_ID") else "gemini"
         providers_to_try = [primary_provider]
         if primary_provider == "elevenlabs":
@@ -272,28 +274,95 @@ class VoiceService:
             
         session_id = f"voice_{user.id}_{uuid.uuid4().hex[:8]}"
         assistant_response_buffer = ""
-        system_instruction_extras = await self.get_voice_context(user)
         
         for provider_name in providers_to_try:
-            logger.info(f"[VoiceService] Attempting voice stream with provider: {provider_name}")
+            logger.info(f"[VoiceService] Preparing session with {provider_name}...")
+            
+            # 2. Instantiate Client Early (empty tools)
             client = None
-            try:
-                if provider_name == "elevenlabs":
-                    client = ElevenLabsLiveClient(tools=tools)
-                    dynamic_variables = await self._get_dynamic_variables(user)
-                    if dynamic_variables:
-                        for key, val in dynamic_variables.items():
-                            if isinstance(val, str) and len(val) > 1000:
-                                dynamic_variables[key] = val[:1000] + "..."
-                else:
-                    client = GeminiLiveClient(tools=tools)
-                    # Also fetch variables for Gemini to format the prompt locally
-                    dynamic_variables = await self._get_dynamic_variables(user)
+            if provider_name == "elevenlabs":
+                client = ElevenLabsLiveClient(tools=[])
+            else:
+                client = GeminiLiveClient(tools=[])
+            
+            # 3. Parallel Initialization (Warmup, Tools, Context, Config)
+            # This is the key optimization: Network calls and compute happen concurrently
+            
+            async def load_tools():
+                t0 = time.time()
+                # Run sync tool loading in a thread to avoid blocking the loop
+                t = await asyncio.to_thread(
+                    AppState.get_all_tools, 
+                    user_id=user.id, 
+                    user_first_name=user_first_name
+                )
+                logger.debug(f"[Latency] Tools loaded in {(time.time()-t0)*1000:.0f}ms")
+                return t
                 
+            async def load_context():
+                t0 = time.time()
+                # Use passed system_extras if available, but usually we need full context
+                # If system_extras was passed (e.g. from wake word), append it to the full fetch
+                base_ctx = await self.get_voice_context(user)
+                if system_extras:
+                    base_ctx += f"\n\n[Wake Word Interaction]:\n{system_extras}"
+                logger.debug(f"[Latency] Context loaded in {(time.time()-t0)*1000:.0f}ms")
+                return base_ctx
+
+            async def load_config():
+                t0 = time.time()
+                c = await self.get_voice_configuration(user)
+                if provider_name == "elevenlabs" and c:
+                    # Truncate for 11Labs constraints
+                    for key, val in c.items():
+                        if isinstance(val, str) and len(val) > 1000:
+                            c[key] = val[:1000] + "..."
+                logger.debug(f"[Latency] Config loaded in {(time.time()-t0)*1000:.0f}ms")
+                return c
+                
+            async def run_warmup():
+                t0 = time.time()
+                await client.warmup()
+                logger.debug(f"[Latency] Client warmup done in {(time.time()-t0)*1000:.0f}ms")
+            
+            # Execute all tasks concurrently
+            tasks = [
+                asyncio.create_task(load_tools()),
+                asyncio.create_task(load_context()),
+                asyncio.create_task(load_config()),
+                asyncio.create_task(run_warmup())
+            ]
+            
+            # Wait for all
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            
+            # Unpack results (handling potential exceptions)
+            tools_res, context_res, config_res, _ = results
+            
+            # Check for critical failures in tool/context loading
+            if isinstance(tools_res, Exception):
+                logger.error(f"[VoiceService] Failed to load tools: {tools_res}")
+                tools_res = [] # Fallback to no tools
+            if isinstance(context_res, Exception):
+                logger.error(f"[VoiceService] Failed to load context: {context_res}")
+                context_res = system_extras or ""
+            if isinstance(config_res, Exception):
+                logger.error(f"[VoiceService] Failed to load config: {config_res}")
+                config_res = {}
+            
+            # 4. Inject initialized tools into client
+            client.tools = tools_res
+            client.tool_map = {t.name: t for t in client.tools}
+            
+            init_duration = (time.time() - start_time) * 1000
+            logger.info(f"[VoiceService] Session ready in {init_duration:.0f}ms. Starting stream...")
+            
+            # 5. Start Streaming
+            try:
                 async for response in client.stream_audio(
                     audio_generator, 
-                    system_instruction_extras=system_instruction_extras,
-                    dynamic_variables=dynamic_variables
+                    system_instruction_extras=context_res,
+                    dynamic_variables=config_res
                 ):
                     # Check for quota errors that trigger fallback
                     if response.get("type") == "error" and response.get("error_code") == "quota_exceeded":

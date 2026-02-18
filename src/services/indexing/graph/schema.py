@@ -228,6 +228,8 @@ class RelationType(str, Enum):
     # NEW: Business Intelligence relationships
     INTERESTED_IN = "INTERESTED_IN"  # Lead INTERESTED_IN Topic/Project
     
+    # NEW: Ownership relationships for ensuring graph connectivity
+    BELONGS_TO = "BELONGS_TO"  # Any node with user_id BELONGS_TO User (prevents orphans)
     # NEW: Relationship Intelligence (for RelationshipGardener)
     COMMUNICATES_WITH = "COMMUNICATES_WITH"  # User COMMUNICATES_WITH Person (tracks interaction strength)
 
@@ -258,6 +260,14 @@ class GraphSchema:
     
     # Schema version
     VERSION = SCHEMA_VERSION
+    
+    # Properties that should be encrypted at rest in the graph
+    SENSITIVE_PROPERTIES: Set[str] = {
+        "subject", "body", "content", "full_text", "summary", 
+        "text", "description", "notes", "sender", "recipients", 
+        "cc", "bcc", "name", "email", "phone", "address", 
+        "key_points", "entities", "financial_data", "items", "attachment_info"
+    }
     
     # Required properties for each node type
     REQUIRED_PROPERTIES: Dict[NodeType, Set[str]] = {
@@ -308,7 +318,8 @@ class GraphSchema:
             "email_id", "thread_id", "sender_domain", "timestamp", "labels",
             "is_unread", "is_important", "has_attachments", "folder",
             "attachment_info", "intents", "has_action_items", "has_questions",
-            "sender_email", "sender_name", "financial_info", "is_receipt", "total_amount"
+            "sender_email", "sender_name", "financial_info", "is_receipt", "total_amount",
+            "parsing_failed"
         },
         NodeType.CONTACT: {"name", "phone", "company", "last_contact", "value", "verified", "primary"},
         NodeType.PERSON: {"email", "phone", "title", "company", "user_id", "value", "verified", "primary"},  # user_id for multi-user support
@@ -429,22 +440,20 @@ class GraphSchema:
         "sender": PropertyType.STRING,
         "body": PropertyType.STRING,
         "email": PropertyType.STRING,
+        "assigned_to": PropertyType.STRING,
         "name": PropertyType.STRING,
         "filename": PropertyType.STRING,
         "merchant": PropertyType.STRING,
         "description": PropertyType.STRING,
         "title": PropertyType.STRING,
         "thread_id": PropertyType.STRING,
-        "status": PropertyType.STRING,
         "category": PropertyType.STRING,
         "location": PropertyType.STRING,
         "time": PropertyType.STRING,
         "payment_method": PropertyType.STRING,
         "currency": PropertyType.STRING,
         "receipt_number": PropertyType.STRING,
-        # Document properties
         "doc_type": PropertyType.STRING,
-        "content": PropertyType.STRING,
         "content_type": PropertyType.STRING,
         "full_text": PropertyType.STRING,
         "summary": PropertyType.STRING,
@@ -497,6 +506,7 @@ class GraphSchema:
         "has_attachments": PropertyType.BOOLEAN,
         "has_action_items": PropertyType.BOOLEAN,
         "has_questions": PropertyType.BOOLEAN,
+        "parsing_failed": PropertyType.BOOLEAN,
         
         # Object properties
         "financial_data": PropertyType.OBJECT,
@@ -599,6 +609,9 @@ class GraphSchema:
         "value": PropertyType.STRING,
         "verified": PropertyType.BOOLEAN,
         "primary": PropertyType.BOOLEAN,
+        "related_apps": PropertyType.ARRAY,
+        "entity_count": PropertyType.INTEGER,
+        "last_mentioned": PropertyType.DATETIME,
     }
     
     # Valid relationship constraints (from_type -> rel_type -> to_type)

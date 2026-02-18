@@ -21,7 +21,6 @@ def create_token_saver_callback(target_id: int, target_type: str = "integration"
     def save_tokens(creds: Any):
         try:
             from src.database import get_db_context
-            from src.utils import encrypt_token
             from sqlalchemy import update
             from src.database.models import UserIntegration, Session
             
@@ -31,15 +30,12 @@ def create_token_saver_callback(target_id: int, target_type: str = "integration"
                 refresh_col = "refresh_token" if target_type == "integration" else "gmail_refresh_token"
                 expiry_col = "expires_at" if target_type == "integration" else "token_expiry"
                 
-                enc_access = encrypt_token(creds.token)
-                enc_refresh = encrypt_token(creds.refresh_token) if creds.refresh_token else None
-                
                 values = {
-                    access_col: enc_access,
+                    access_col: creds.token,
                     expiry_col: creds.expiry.replace(tzinfo=None) if creds.expiry else None
                 }
-                if enc_refresh:
-                    values[refresh_col] = enc_refresh
+                if creds.refresh_token:
+                    values[refresh_col] = creds.refresh_token
                     
                 model = UserIntegration if target_type == "integration" else Session
                 db.execute(

@@ -23,7 +23,7 @@ from src.workers.tasks import run_workflow
 
 logger = setup_logger(__name__)
 
-router = APIRouter(prefix="/api/workflows", tags=["workflows"])
+router = APIRouter(prefix="/workflows", tags=["workflows"])
 
 # Global workflow executor instance
 _executor: Optional[WorkflowExecutor] = None

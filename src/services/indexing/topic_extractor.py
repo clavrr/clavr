@@ -20,6 +20,7 @@ from src.utils.config import Config
 from src.ai.llm_factory import LLMFactory
 from src.services.indexing.graph.manager import KnowledgeGraphManager
 from src.services.indexing.graph.schema import NodeType, RelationType
+from src.services.indexing.parsers.base import ParsedNode, Relationship
 from src.services.indexing.graph.schema_constants import (
     CROSS_APP_LINKING_TITLE_SIMILARITY_THRESHOLD,
     MIN_ENTITY_RESOLUTION_CONFIDENCE,
@@ -79,7 +80,7 @@ class TopicExtractor:
         source: str = "unknown",
         source_node_id: Optional[str] = None,
         user_id: Optional[int] = None
-    ) -> List[Dict[str, Any]]:
+    ) -> List[ParsedNode]:
         """
         Extract topics from content and create/update Topic nodes.
         
@@ -140,12 +141,32 @@ class TopicExtractor:
                     
             return result_topics
             
-        except json.JSONDecodeError as e:
-            logger.warning(f"Failed to parse topic extraction response: {e}")
-            return []
         except Exception as e:
             logger.error(f"Topic extraction failed: {e}")
             return []
+
+    async def get_or_create_topic(
+        self,
+        name: str,
+        source: str,
+        source_node_id: Optional[str] = None,
+        user_id: Optional[int] = None,
+        confidence: float = 1.0
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Public method to register a topic found by another parser.
+        Example: EmailParser finds a topic, EmailCrawler calls this to link it.
+        """
+        return await self._create_or_link_topic(
+            topic_data={
+                "name": name, 
+                "confidence": confidence, 
+                "keywords": [] # Keywords unknown if not from extraction
+            },
+            source=source,
+            source_node_id=source_node_id,
+            user_id=user_id
+        )
     
     async def _create_or_link_topic(
         self,
@@ -153,12 +174,9 @@ class TopicExtractor:
         source: str,
         source_node_id: Optional[str],
         user_id: Optional[int]
-    ) -> Optional[Dict[str, Any]]:
+    ) -> Optional[ParsedNode]:
         """
-        Create a new Topic node or find existing and link.
-        
-        Uses fuzzy matching to find similar existing topics and
-        creates RELATED_TO links between them.
+        Create a new Topic node or find existing and return a ParsedNode.
         """
         name = topic_data.get("name", "").strip()
         if not name:
@@ -166,31 +184,58 @@ class TopicExtractor:
             
         name_lower = name.lower()
         
-        # Check cache first
-        if name_lower in self._topic_cache:
-            existing_id = self._topic_cache[name_lower]
-            # Link source node to existing topic
-            if source_node_id:
-                await self._link_to_topic(source_node_id, existing_id, source)
-            return {"node_id": existing_id, "name": name, "is_new": False}
-        
-        # Search for similar existing topics
-        similar_topic = await self._find_similar_topic(
-            name, 
-            user_id,
-            keywords=topic_data.get("keywords", [])
-        )
-        
-        if similar_topic:
-            # Found a similar topic - link them
-            self._topic_cache[name_lower] = similar_topic["id"]
-            if source_node_id:
-                await self._link_to_topic(source_node_id, similar_topic["id"], source)
-            return {"node_id": similar_topic["id"], "name": similar_topic["name"], "is_new": False}
-        
-        # Create new topic node
+        # Determine topic ID
         topic_id = f"topic:{name_lower.replace(' ', '_')}:{user_id or 'global'}"
         
+        # Check if it already exists in cache to skip similar search
+        is_existing = name_lower in self._topic_cache
+        
+        if not is_existing:
+            # Search for similar existing topics
+            similar_topic = await self._find_similar_topic(
+                name, 
+                user_id,
+                keywords=topic_data.get("keywords", [])
+            )
+            
+            if similar_topic:
+                topic_id = similar_topic["id"]
+                name = similar_topic["name"]
+                is_existing = True
+                
+        # Prepare relationships
+        relationships = []
+        if source_node_id:
+            # Create relationship object to be added by Indexer
+            relationships.append(Relationship(
+                from_node=source_node_id,
+                to_node=topic_id,
+                rel_type=RelationType.DISCUSSES.value,
+                properties={
+                    "source": source,
+                    "strength": 0.5
+                }
+            ))
+
+        # Update cache
+        self._topic_cache[name_lower] = topic_id
+        
+        if is_existing:
+            # Force update topic metadata even if existing
+            await self._update_topic_stats(topic_id, source)
+            
+            # Return partial ParsedNode (Indexer handles merge/update)
+            return ParsedNode(
+                node_id=topic_id,
+                node_type=NodeType.TOPIC.value,
+                properties={
+                    "name": name,
+                    "last_mentioned": datetime.utcnow().isoformat()
+                },
+                relationships=relationships
+            )
+        
+        # Prepare new Topic properties
         properties = {
             "name": name,
             "category": topic_data.get("category", "general"),
@@ -204,20 +249,37 @@ class TopicExtractor:
         if user_id:
             properties["user_id"] = user_id
             
+        return ParsedNode(
+            node_id=topic_id,
+            node_type=NodeType.TOPIC.value,
+            properties=properties,
+            relationships=relationships
+        )
+
+    async def _update_topic_stats(self, topic_id: str, source: str):
+        """Update existing topic stats in ArangoDB."""
         try:
-            await self.graph.add_node(topic_id, NodeType.TOPIC, properties)
-            self._topic_cache[name_lower] = topic_id
-            
-            # Link source node to topic
-            if source_node_id:
-                await self._link_to_topic(source_node_id, topic_id, source)
-                
-            logger.info(f"Created new Topic node: {name} [{topic_id}]")
-            return {"node_id": topic_id, "name": name, "is_new": True}
-            
+            update_query = """
+            FOR t IN Topic
+                FILTER t.id == @topic_id
+                LET new_apps = (
+                    @source IN (t.related_apps == null ? [] : t.related_apps) 
+                    ? t.related_apps 
+                    : APPEND(t.related_apps == null ? [] : t.related_apps, @source)
+                )
+                UPDATE t WITH {
+                    entity_count: (t.entity_count == null ? 1 : t.entity_count + 1),
+                    last_mentioned: @now,
+                    related_apps: new_apps
+                } IN Topic
+            """
+            await self.graph.query(update_query, {
+                "topic_id": topic_id,
+                "source": source,
+                "now": datetime.utcnow().isoformat()
+            })
         except Exception as e:
-            logger.error(f"Failed to create Topic node: {e}")
-            return None
+            logger.debug(f"Failed to update topic stats: {e}")
     
     async def _find_similar_topic(
         self, 

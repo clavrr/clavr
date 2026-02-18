@@ -20,7 +20,8 @@ from .models import (
     UserSettings,
     AuditLog,
     OAuthState,
-    UserWritingProfile
+    UserWritingProfile,
+    MessageClassification
 )
 from .webhook_models import WebhookSubscription, WebhookDelivery, WebhookEventType, WebhookDeliveryStatus
 from .database import get_db, get_db_session, init_db

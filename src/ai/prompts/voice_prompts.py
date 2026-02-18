@@ -132,6 +132,17 @@ If a tool returns "[INTEGRATION_REQUIRED]", you MUST:
 4. Keep it under 2 sentences.
 """
 
+WAKE_WORD_GREETING_TEMPLATE = """The user just activated you with a wake word.
+Respond with a SHORT, warm acknowledgment like "Hey!" or "What's up?" and wait for them to speak.
+If there is proactive context below, briefly weave it in naturally.
+PROACTIVE CONTEXT: {proactive_context}"""
+
+NUDGE_GREETING_TEMPLATE = """You are proactively reaching out to the user about something time-sensitive.
+Lead with the nudge naturally, as if you're a thoughtful assistant.
+NUDGE: {nudge_text}
+Keep it to ONE sentence. Wait for their response."""
+
+
 def get_voice_conversational_prompt(query: str, raw_results: str) -> str:
     """Get prompt for voice response generation."""
     return BasePromptBuilder.build_conversational_prompt(

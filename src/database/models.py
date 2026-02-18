@@ -2,8 +2,10 @@
 SQLAlchemy models for multi-user authentication and settings
 """
 from datetime import datetime, timedelta
-from sqlalchemy import Column, Integer, String, Boolean, DateTime, Text, ForeignKey, JSON, Index, Float
+from sqlalchemy import Column, Integer, String, Boolean, DateTime, Text, ForeignKey, JSON, Index, Float, or_
 from sqlalchemy.orm import DeclarativeBase, relationship
+from sqlalchemy.ext.hybrid import hybrid_property
+from .types import EncryptedString, EncryptedJSON
 
 class Base(DeclarativeBase):
     pass
@@ -16,8 +18,8 @@ class User(Base):
     id = Column(Integer, primary_key=True, index=True)
     google_id = Column(String(255), unique=True, nullable=False, index=True)
     email = Column(String(255), unique=True, nullable=False, index=True)
-    name = Column(String(255))
-    picture_url = Column(Text)
+    name = Column(EncryptedString)
+    picture_url = Column(EncryptedString)
     created_at = Column(DateTime, default=datetime.utcnow, index=True)  # Indexed for analytics
     
     # Email indexing tracking (legacy fields - kept for backward compatibility)
@@ -36,8 +38,22 @@ class User(Base):
     total_emails_indexed = Column(Integer, default=0)  # Total count of indexed emails
     indexing_progress_percent = Column(Float, default=0.0)  # Progress indicator (0-100)
     
-    # Admin access
-    is_admin = Column(Boolean, default=False, nullable=False, index=True)
+    # Admin access (private column, exposed via hybrid property)
+    _is_admin = Column("is_admin", Boolean, default=False, nullable=False, index=True)
+
+    @hybrid_property
+    def is_admin(self) -> bool:
+        """Check if user has admin privileges (from DB or clavr.me domain)"""
+        return self._is_admin or (self.email and self.email.endswith('clavr.me'))
+
+    @is_admin.setter
+    def is_admin(self, value: bool):
+        self._is_admin = value
+
+    @is_admin.expression
+    def is_admin(cls):
+        """SQL expression for admin check (enables filtering in queries)"""
+        return or_(cls._is_admin == True, cls.email.like('%clavr.me'))
     
     # Relationships
     sessions = relationship("Session", back_populates="user", cascade="all, delete-orphan")
@@ -65,8 +81,8 @@ class Session(Base):
     id = Column(Integer, primary_key=True, index=True)
     user_id = Column(Integer, ForeignKey('users.id'), nullable=False)
     session_token = Column(String(255), unique=True, nullable=False, index=True)  # Stores SHA-256 hash (64 chars)
-    gmail_access_token = Column(Text)
-    gmail_refresh_token = Column(Text)
+    gmail_access_token = Column(EncryptedString)
+    gmail_refresh_token = Column(EncryptedString)
     granted_scopes = Column(Text, nullable=True)  # Comma-separated list of OAuth scopes granted by user
     token_expiry = Column(DateTime)
     last_active_at = Column(DateTime, default=datetime.utcnow, index=True)  # Track inactivity
@@ -105,7 +121,7 @@ class InteractionSession(Base):
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False, index=True)
     
     # Context tracking (NEW)
-    session_context = Column(JSON, default={})  # Current conversation context (entities, preferences)
+    session_context = Column(EncryptedJSON, default={})  # Current conversation context (entities, preferences)
     active_topics = Column(JSON, default=[])    # Topics discussed in this session
     last_intent = Column(String(100))           # Last detected intent (e.g., "schedule_meeting")
     turn_count = Column(Integer, default=0)     # Number of conversation turns
@@ -158,8 +174,8 @@ class UserIntegration(Base):
     provider = Column(String(50), nullable=False)  # 'slack', 'notion', 'asana'
     
     # Auth data
-    access_token = Column(Text, nullable=False)
-    refresh_token = Column(Text, nullable=True)
+    access_token = Column(EncryptedString, nullable=False)
+    refresh_token = Column(EncryptedString, nullable=True)
     expires_at = Column(DateTime, nullable=True)
     token_type = Column(String(50), default='Bearer')
     
@@ -230,11 +246,11 @@ class ConversationMessage(Base):
     session_id = Column(String(255), nullable=False, index=True)
     
     role = Column(String(50), nullable=False)  # 'user' or 'assistant'
-    content = Column(Text, nullable=False)
+    content = Column(EncryptedString, nullable=False)
     
     # Metadata from query router
     intent = Column(String(100))
-    entities = Column(JSON)  # Extracted entities
+    entities = Column(EncryptedJSON)  # Extracted entities
     confidence = Column(String(20))  # confidence score as string
     
     # Multi-Agent State (NEW)
@@ -259,10 +275,10 @@ class BlogPost(Base):
     id = Column(Integer, primary_key=True, index=True)
     
     # Core content
-    title = Column(String(500), nullable=False)  # Main blog post title
+    title = Column(EncryptedString, nullable=False)  # Main blog post title
     slug = Column(String(500), unique=True, nullable=False, index=True)  # URL-friendly identifier
-    description = Column(Text)  # Subtitle/lead paragraph (shown below title, before content)
-    content = Column(Text, nullable=False)  # Full blog post content (markdown or HTML)
+    description = Column(EncryptedString)  # Subtitle/lead paragraph (shown below title, before content)
+    content = Column(EncryptedString, nullable=False)  # Full blog post content (markdown or HTML)
     # Content supports: headings (# ## ###), bold (**text**), italic (*text*), 
     # lists (-, *, 1.), code blocks (```code```), links [text](url), paragraphs, HTML tags
     
@@ -347,7 +363,7 @@ class UserWritingProfile(Base):
     
     # Profile data (JSON from ProfileBuilder.build_profile())
     # Contains: writing_style, response_patterns, preferences, common_phrases
-    profile_data = Column(JSON, nullable=False)
+    profile_data = Column(EncryptedJSON, nullable=False)
     
     # Metadata
     sample_size = Column(Integer, default=0)  # Number of emails analyzed
@@ -378,7 +394,7 @@ class AgentFact(Base):
     id = Column(Integer, primary_key=True, index=True)
     user_id = Column(Integer, ForeignKey('users.id'), nullable=False, index=True)
     
-    content = Column(Text, nullable=False)  # The fact string (e.g. "Likes aisle seats")
+    content = Column(EncryptedString, nullable=False)  # The fact string (e.g. "Likes aisle seats")
     category = Column(String(50), index=True)  # preference, personal_detail, work_context, etc.
     source = Column(String(50))  # which agent or tool learned this
     confidence = Column(Float, default=1.0)
@@ -406,8 +422,8 @@ class AgentGoal(Base):
     id = Column(Integer, primary_key=True, index=True)
     user_id = Column(Integer, ForeignKey('users.id'), nullable=False, index=True)
     
-    title = Column(String(255), nullable=False)
-    description = Column(Text)
+    title = Column(EncryptedString, nullable=False)
+    description = Column(EncryptedString)
     status = Column(String(50), default='pending', index=True) # pending, active, completed, archived
     deadline = Column(DateTime, nullable=True)
     
@@ -463,9 +479,9 @@ class MeetingTemplate(Base):
     id = Column(Integer, primary_key=True, index=True)
     user_id = Column(Integer, ForeignKey('users.id'), nullable=False, index=True)
     name = Column(String(255), nullable=False)
-    title = Column(String(500))
+    title = Column(EncryptedString(500))
     duration_minutes = Column(Integer, default=60)
-    description = Column(Text)
+    description = Column(EncryptedString)
     location = Column(String(500))
     default_attendees = Column(JSON)  # List of email addresses
     recurrence = Column(String(100))  # e.g., "DAILY", "WEEKLY", "MONTHLY", "YEARLY"
@@ -515,8 +531,8 @@ class TaskTemplate(Base):
     id = Column(Integer, primary_key=True, index=True)
     user_id = Column(Integer, ForeignKey('users.id'), nullable=False, index=True)
     name = Column(String(255), nullable=False)
-    description = Column(String(500))  # Template display name
-    task_description = Column(Text, nullable=False)  # Task description (supports {variables})
+    description = Column(EncryptedString(500))  # Template display name
+    task_description = Column(EncryptedString, nullable=False)  # Task description (supports {variables})
     priority = Column(String(20), default='medium')  # 'low', 'medium', 'high'
     category = Column(String(100))  # e.g., 'work', 'personal', 'project'
     tags = Column(JSON)  # List of tags
@@ -569,8 +585,8 @@ class EmailTemplate(Base):
     id = Column(Integer, primary_key=True, index=True)
     user_id = Column(Integer, ForeignKey('users.id'), nullable=False, index=True)
     name = Column(String(255), nullable=False)
-    subject = Column(String(500))  # Email subject (supports {variables})
-    body = Column(Text, nullable=False)  # Email body (supports {variables})
+    subject = Column(EncryptedString(500))  # Email subject (supports {variables})
+    body = Column(EncryptedString, nullable=False)  # Email body (supports {variables})
     to_recipients = Column(JSON)  # Default recipients (list of email addresses)
     cc_recipients = Column(JSON)  # Default CC recipients
     bcc_recipients = Column(JSON)  # Default BCC recipients
@@ -624,7 +640,7 @@ class ActionableItem(Base):
     id = Column(String, primary_key=True)
     user_id = Column(Integer, ForeignKey('users.id'), index=True)
     
-    title = Column(String(500), nullable=False)
+    title = Column(EncryptedString, nullable=False)
     item_type = Column(String(50))  # bill, appointment, deadline, task
     due_date = Column(DateTime, nullable=False, index=True)
     amount = Column(Float, nullable=True)
@@ -770,8 +786,8 @@ class InAppNotification(Base):
     user_id = Column(Integer, ForeignKey('users.id'), nullable=False, index=True)
     
     # Notification content
-    title = Column(String(255), nullable=False)
-    message = Column(Text, nullable=False)
+    title = Column(EncryptedString, nullable=False)
+    message = Column(EncryptedString, nullable=False)
     notification_type = Column(String(50), nullable=False, index=True)  # 'action_executed', 'approval_needed', 'action_undone', 'system'
     
     # Priority and display
@@ -829,8 +845,8 @@ class GhostDraft(Base):
     user_id = Column(Integer, ForeignKey('users.id'), nullable=False, index=True)
     
     # Draft Content
-    title = Column(String(255), nullable=False)
-    description = Column(Text)
+    title = Column(EncryptedString, nullable=False)
+    description = Column(EncryptedString)
     status = Column(String(50), default='draft', index=True) # draft, approved, dismissed, posted
     
     # Metadata
@@ -849,3 +865,51 @@ class GhostDraft(Base):
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
     
     user = relationship("User", backref="ghost_drafts")
+
+
+class MessageClassification(Base):
+    """
+    LLM-classified messages for intelligent reminders.
+    
+    Stores classification results from Gemini analysis of emails, Slack messages,
+    and Linear issues. Used by BriefService to generate smart reminders.
+    """
+    __tablename__ = 'message_classifications'
+    
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey('users.id'), nullable=False, index=True)
+    
+    # Source identification
+    source_type = Column(String(50), nullable=False, index=True)  # 'email', 'slack', 'linear'
+    source_id = Column(String(255), nullable=False, index=True)   # Unique message/thread ID
+    
+    # Classification results (from LLM)
+    needs_response = Column(Boolean, default=False, nullable=False, index=True)
+    urgency = Column(String(20), default='low', index=True)  # 'high', 'medium', 'low'
+    classification_reason = Column(EncryptedString)  # LLM explanation
+    suggested_action = Column(String(50))  # 'reply', 'schedule', 'delegate', 'review', 'none'
+    
+    # Display content
+    title = Column(EncryptedString, nullable=False)  # Message subject/title
+    sender = Column(EncryptedString)  # From field
+    snippet = Column(EncryptedString)  # Preview text
+    
+    # Metadata
+    source_date = Column(DateTime)  # Original message date
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False, index=True)
+    classified_at = Column(DateTime, default=datetime.utcnow, nullable=False, index=True)
+    
+    # Status tracking
+    is_dismissed = Column(Boolean, default=False, index=True)  # User dismissed
+    dismissed_at = Column(DateTime, nullable=True)
+    
+    # Relationship
+    user = relationship("User", backref="message_classifications")
+    
+    __table_args__ = (
+        Index('idx_classification_user_needs_response', 'user_id', 'needs_response', 'classified_at'),
+        Index('idx_classification_source', 'user_id', 'source_type', 'source_id', unique=True),
+    )
+    
+    def __repr__(self):
+        return f"<MessageClassification(id={self.id}, source={self.source_type}, needs_response={self.needs_response}, urgency='{self.urgency}')>"

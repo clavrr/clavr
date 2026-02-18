@@ -12,6 +12,10 @@ console = Console()
 
 
 from src.utils.system import check_port_available, kill_process_on_port
+from dotenv import load_dotenv
+
+# Load environment variables (CRITICAL for encryption keys)
+load_dotenv()
 
 
 @click.command()

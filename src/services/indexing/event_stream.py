@@ -32,6 +32,16 @@ class EventType(str, Enum):
     DRIVE_UPDATE = "drive_update"  # Google Drive file changes
 
 
+# Maps internal stream event types → outbound WebhookEventType values.
+# Used to automatically trigger outbound webhooks after successful indexing.
+EVENT_TO_WEBHOOK_TYPE: Dict[str, str] = {
+    EventType.SLACK_MESSAGE: "slack.message.received",
+    EventType.SLACK_REACTION: "slack.reaction.added",
+    EventType.GMAIL_PUSH: "email.received",
+    EventType.CALENDAR_UPDATE: "calendar.event.updated",
+}
+
+
 class EventStreamHandler:
     """
     Processes real-time events from webhooks for immediate graph updates.
@@ -162,6 +172,15 @@ class EventStreamHandler:
                     result["insights"] = insights
                     
             result["status"] = "processed"
+            
+            # 5. Trigger outbound webhooks if a mapping exists
+            self._trigger_outbound_webhook(
+                event_type=event_type,
+                event_id=event_id,
+                payload=payload,
+                user_id=user_id,
+            )
+            
             return result
             
         except Exception as e:
@@ -194,6 +213,7 @@ class EventStreamHandler:
             properties={
                 'text': text,
                 'slack_message_ts': ts,
+                'slack_thread_ts': event.get('thread_ts'),  # Track thread for detection
                 'slack_user_id': slack_user_id,
                 'slack_channel_id': channel_id,
                 'timestamp': datetime.fromtimestamp(float(ts)).isoformat(),
@@ -202,6 +222,19 @@ class EventStreamHandler:
             },
             searchable_text=text
         )
+        
+        # Check for heated thread (potential bug report without ticket)
+        heated_insight = await self._detect_heated_thread(event, user_id)
+        if heated_insight:
+            # Store as insight for delivery
+            if self.insight_service:
+                try:
+                    await self.insight_service.store_insight(heated_insight, user_id)
+                except Exception as e:
+                    logger.debug(f"[EventStream] Failed to store heated thread insight: {e}")
+            # Trigger immediate delivery for high priority
+            if heated_insight.get('priority') in ('critical', 'high'):
+                await self._deliver_urgent_insights([heated_insight], user_id)
         
         logger.debug(f"[EventStream] Processed Slack message in channel {channel_id}")
         return [message_node]
@@ -568,6 +601,16 @@ class EventStreamHandler:
             except Exception as e:
                 logger.debug(f"[EventStream] Insight generation failed for {node.node_id}: {e}")
         
+        # Classify priority for each insight
+        for insight in insights:
+            insight_type = insight.get('type', '')
+            if insight_type in ('calendar_conflict', 'urgent_action'):
+                insight['priority'] = 'critical'
+            elif insight_type in ('topic_connection', 'person_ooo'):
+                insight['priority'] = 'high'
+            else:
+                insight['priority'] = 'medium'
+        
         # Store high-confidence insights in the graph
         if self.insight_service and insights:
             for insight in insights:
@@ -576,6 +619,11 @@ class EventStreamHandler:
                         await self.insight_service.store_insight(insight, user_id)
                     except Exception as e:
                         logger.debug(f"[EventStream] Failed to store insight: {e}")
+        
+        # PRIORITY BYPASS: Immediately deliver critical insights
+        critical_insights = [i for i in insights if i.get('priority') == 'critical']
+        if critical_insights:
+            await self._deliver_urgent_insights(critical_insights, user_id)
         
         return insights
 
@@ -618,15 +666,23 @@ class EventStreamHandler:
             })
             
             for conflict in result or []:
+                new_title = node.properties.get('title', 'New event')
+                conflict_title = conflict.get('title', 'existing event')
                 insights.append({
                     'type': 'calendar_conflict',
-                    'title': f"Scheduling conflict detected",
-                    'description': f"'{node.properties.get('title', 'New event')}' overlaps with '{conflict.get('title', 'existing event')}'",
+                    'title': "Scheduling conflict detected",
+                    'description': f"'{new_title}' overlaps with '{conflict_title}'",
+                    'content': f"'{new_title}' overlaps with '{conflict_title}'. Would you like to reschedule?",
                     'source_node_id': node.node_id,
                     'related_node_id': conflict.get('id'),
                     'confidence': 0.95,
                     'urgency': 'high',
-                    'timestamp': datetime.utcnow().isoformat()
+                    'timestamp': datetime.utcnow().isoformat(),
+                    'actions': [
+                        {'type': 'reschedule', 'label': f"Reschedule '{new_title}'", 'event_id': node.node_id},
+                        {'type': 'decline', 'label': f"Decline '{new_title}'", 'event_id': node.node_id},
+                        {'type': 'dismiss', 'label': 'Keep both'}
+                    ]
                 })
                 
         except Exception as e:
@@ -773,6 +829,86 @@ class EventStreamHandler:
         
         # Return unique keywords
         return list(dict.fromkeys(keywords))[:20]
+    
+    async def _detect_heated_thread(
+        self,
+        event: Dict[str, Any],
+        user_id: int
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Detect if a Slack thread looks like a bug report without an associated ticket.
+        
+        This is the "Ghost Collaborator" feature - watching for signals that suggest
+        a bug/issue is being discussed but no ticket has been created.
+        """
+        text = event.get('text', '').lower()
+        thread_ts = event.get('thread_ts') or event.get('ts')
+        channel_id = event.get('channel')
+        
+        if not text or not thread_ts:
+            return None
+        
+        # Simple keyword heuristics for bug/issue detection
+        bug_signals = [
+            'bug', 'broken', 'not working', 'error', 'crash', 'regression',
+            'urgent', 'blocker', 'fix this', 'critical', 'production down',
+            'failing', 'exception', 'null pointer', 'cannot access'
+        ]
+        
+        # Check if message contains bug signals
+        has_bug_signal = any(signal in text for signal in bug_signals)
+        if not has_bug_signal:
+            return None
+        
+        # Check if there's already a Linear issue linked to this thread
+        if self.graph_manager:
+            try:
+                query = """
+                FOR m IN Message
+                    FILTER m.slack_thread_ts == @thread_ts
+                    FOR edge IN REFERENCES
+                        FILTER edge._from == m._id
+                        LET linked = DOCUMENT(edge._to)
+                        FILTER linked.node_type == 'LinearIssue'
+                        LIMIT 1
+                        RETURN linked
+                """
+                existing = await self.graph_manager.execute_query(query, {'thread_ts': thread_ts})
+                
+                if existing:
+                    # Already has a ticket, skip
+                    return None
+                    
+            except Exception as e:
+                logger.debug(f"[EventStream] Linear check failed: {e}")
+        
+        # Generate insight with action drafts
+        logger.info(f"[EventStream] Detected heated thread in channel {channel_id}")
+        return {
+            'type': 'bug_report_candidate',
+            'title': 'Potential bug report detected',
+            'content': "This Slack thread looks like a bug report. Should I draft a Linear issue?",
+            'description': f"Detected in channel, thread contains: '{text[:100]}...'",
+            'confidence': 0.75,
+            'priority': 'high',
+            'timestamp': datetime.utcnow().isoformat(),
+            'metadata': {
+                'thread_ts': thread_ts,
+                'channel': channel_id,
+                'snippet': text[:200]
+            },
+            'actions': [
+                {
+                    'type': 'create_linear_issue',
+                    'label': 'Create Linear issue',
+                    'metadata': {'thread_ts': thread_ts, 'channel': channel_id}
+                },
+                {
+                    'type': 'dismiss',
+                    'label': 'Not a bug'
+                }
+            ]
+        }
 
     def _extract_emails(self, text: str) -> List[str]:
         """Extract email addresses from text."""
@@ -798,7 +934,89 @@ class EventStreamHandler:
     def _is_duplicate(self, event_id: str) -> bool:
         """Check if event was recently processed"""
         return event_id in self._processed_events
+    
+    async def _deliver_urgent_insights(
+        self,
+        insights: List[Dict[str, Any]],
+        user_id: int
+    ) -> None:
+        """
+        Immediately deliver critical insights via WebSocket/notification.
         
+        This bypasses the normal delivery queue for time-sensitive insights
+        like calendar conflicts or urgent action items.
+        """
+        try:
+            from src.services.insights.delivery import InsightDeliveryService
+            from src.services.insights.delivery import InsightPriority
+            
+            # Get or create delivery service
+            delivery = InsightDeliveryService(self.config, self.graph_manager)
+            
+            for insight in insights:
+                try:
+                    # Attempt WebSocket delivery for real-time notification
+                    await delivery._deliver_via_websocket(
+                        user_id=user_id,
+                        insight=insight,
+                        priority=InsightPriority.URGENT
+                    )
+                    logger.info(
+                        f"[EventStream] Urgent insight delivered via WebSocket: "
+                        f"{insight.get('type')} for user {user_id}"
+                    )
+                except Exception as ws_error:
+                    logger.debug(f"[EventStream] WebSocket delivery failed: {ws_error}")
+                    
+                    # Fallback: queue for email delivery
+                    try:
+                        await delivery._deliver_via_email(
+                            user_id=user_id,
+                            insight=insight,
+                            priority=InsightPriority.URGENT
+                        )
+                    except Exception as email_error:
+                        logger.debug(f"[EventStream] Email delivery also failed: {email_error}")
+                        
+        except ImportError:
+            logger.debug("[EventStream] InsightDeliveryService not available for urgent delivery")
+        except Exception as e:
+            logger.warning(f"[EventStream] Urgent insight delivery failed: {e}")
+        
+    def _trigger_outbound_webhook(
+        self,
+        event_type: str,
+        event_id: str,
+        payload: Dict[str, Any],
+        user_id: int,
+    ):
+        """
+        If *event_type* has a matching outbound webhook type, queue a Celery
+        task to deliver the webhook to all active subscribers.
+        
+        This is fire-and-forget — errors are logged but never break the
+        indexing pipeline.
+        """
+        webhook_type_value = EVENT_TO_WEBHOOK_TYPE.get(event_type)
+        if not webhook_type_value:
+            return
+
+        try:
+            from src.workers.tasks.webhook_tasks import deliver_webhook_task
+
+            deliver_webhook_task.delay(
+                event_type=webhook_type_value,
+                event_id=event_id,
+                payload=payload,
+                user_id=user_id,
+            )
+            logger.debug(
+                f"[EventStream] Queued outbound webhook {webhook_type_value} "
+                f"for event {event_id}"
+            )
+        except Exception as e:
+            logger.warning(f"[EventStream] Failed to queue outbound webhook: {e}")
+
     def _cleanup_old_events(self):
         """Remove old events from dedup cache"""
         now = datetime.utcnow()

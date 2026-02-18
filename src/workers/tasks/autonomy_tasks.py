@@ -184,8 +184,8 @@ def _process_user_autonomy(db, config, user_id: int) -> Dict[str, Any]:
         logger.info(f"[Thinking] 💤 No action needed. (Reason: {reason})")
         
     # Phase 7: Proactive Insight Generation
-    from ...services.proactive.context_service import ContextService
-    context_service = ContextService(config, db_session=db, graph_manager=graph_manager)
+    from ...services.proactive.context_service import ProactiveContextService
+    context_service = ProactiveContextService(config, db_session=db, graph_manager=graph_manager)
     
     insight_result = asyncio.run(context_service.generate_proactive_insight(user_id))
     if insight_result and insight_result.get('insight'):

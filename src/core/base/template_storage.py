@@ -8,6 +8,7 @@ from pathlib import Path
 import json
 
 from ...utils.logger import setup_logger
+from ...utils.file_encryption import load_encrypted_json, save_encrypted_json
 
 logger = setup_logger(__name__)
 
@@ -241,14 +242,7 @@ class BaseTemplateStorage(ABC):
         Returns:
             Loaded data or default value
         """
-        try:
-            if file_path.exists():
-                with open(file_path, 'r') as f:
-                    return json.load(f)
-            return default_value
-        except Exception as e:
-            logger.error(f"Failed to load JSON file {file_path}: {e}")
-            return default_value
+        return load_encrypted_json(file_path, default=default_value)
     
     def _save_json_file(self, file_path: Path, data: Any, indent: int = 2):
         """
@@ -260,8 +254,7 @@ class BaseTemplateStorage(ABC):
             indent: JSON indentation
         """
         try:
-            with open(file_path, 'w') as f:
-                json.dump(data, f, indent=indent)
+            save_encrypted_json(file_path, data)
         except Exception as e:
             logger.error(f"Failed to save JSON file {file_path}: {e}")
             raise

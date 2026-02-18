@@ -18,6 +18,7 @@ import asyncio
 from src.services.indexing.base_indexer import BaseIndexer
 from src.services.indexing.parsers.base import ParsedNode, Relationship
 from src.services.indexing.graph.schema import NodeType, RelationType
+from src.services.service_constants import ServiceConstants
 from src.utils.logger import setup_logger
 
 logger = setup_logger(__name__)

@@ -10,6 +10,7 @@ from api.dependencies import get_db, get_integration_service, get_config, get_cu
 from src.database.models import User
 from src.utils.logger import setup_logger
 from src.utils.config import Config, get_frontend_url
+from src.auth.audit import log_auth_event, AuditEventType
 import hmac
 import hashlib
 import json
@@ -22,10 +23,20 @@ async def auth_provider(
     provider: str,
     redirect_to: Optional[str] = Query(None),
     user: User = Depends(get_current_user),
-    integration_service = Depends(get_integration_service)
+    integration_service = Depends(get_integration_service),
+    db: Session = Depends(get_db),
+    request: Request = None # Optional, will be populated by FastAPI
 ):
     """Initiate OAuth flow for a provider - redirects to OAuth consent screen."""
     try:
+        # Log initiation (optional, but good for tracking intent)
+        await log_auth_event(
+            db=db,
+            event_type=AuditEventType.ADMIN_ACTION,
+            user_id=user.id,
+            action="init_integration_auth",
+            provider=provider
+        )
         url = await integration_service.get_auth_url(provider, user.id, user.email, redirect_to=redirect_to)
         return RedirectResponse(url=url)
     except ValueError as e:
@@ -37,11 +48,21 @@ async def auth_callback(
     code: str = Query(...),
     state: str = Query(...),
     integration_service = Depends(get_integration_service),
-    config: Config = Depends(get_config)
+    config: Config = Depends(get_config),
+    db: Session = Depends(get_db)
 ):
     """Handle OAuth callback for a provider."""
     try:
-        real_provider, _ = await integration_service.handle_callback(provider, code, state)
+        real_provider, user_id = await integration_service.handle_callback(provider, code, state)
+        
+        # Log successful connection
+        await log_auth_event(
+            db=db,
+            event_type=AuditEventType.INTEGRATION_CONNECTED,
+            user_id=user_id,
+            provider=real_provider
+        )
+        
         f_url = get_frontend_url(config)
         return RedirectResponse(url=f"{f_url}/integrations?success=true&provider={real_provider}")
     except Exception as e:
@@ -53,11 +74,21 @@ async def auth_callback(
 async def disconnect_integration(
     provider: str,
     user: User = Depends(get_current_user),
-    integration_service = Depends(get_integration_service)
+    integration_service = Depends(get_integration_service),
+    db: Session = Depends(get_db)
 ):
     """Disconnect an integration."""
     try:
         await integration_service.disconnect(user.id, provider)
+        
+        # Log disconnection
+        await log_auth_event(
+            db=db,
+            event_type=AuditEventType.INTEGRATION_DISCONNECTED,
+            user_id=user.id,
+            provider=provider
+        )
+        
         return {"success": True}
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))

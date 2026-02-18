@@ -43,6 +43,15 @@ class AuditEventType:
     ADMIN_ACTION = "admin_action"
     USER_SETTINGS_UPDATED = "user_settings_updated"
     
+    # Data export events
+    DATA_EXPORT_REQUEST = "data_export_request"
+    DATA_EXPORT_DOWNLOAD = "data_export_download"
+    
+    # Integration events
+    INTEGRATION_CONNECTED = "integration_connected"
+    INTEGRATION_DISCONNECTED = "integration_disconnected"
+    INTEGRATION_TOGGLED = "integration_toggled"
+    
     # Security events
     UNAUTHORIZED_ACCESS_ATTEMPT = "unauthorized_access_attempt"
     RATE_LIMIT_EXCEEDED = "rate_limit_exceeded"

@@ -44,7 +44,8 @@ from api.routers import (
     integrations, webhooks,
     notifications, blog, dashboard,
     analytics, proactive, health,
-    admin, ghost, ai_features, data_export, profile, conversations
+    admin, ghost, ai_features, data_export, profile, conversations,
+    slack_events
 )
 from api.routers.gmail_push import router as gmail_push_router
 # from api.auth_routes import router as google_auth_router  # DEPRECATED
@@ -53,6 +54,11 @@ try:
     from api.routers import voice
 except ImportError:
     voice = None
+
+try:
+    from api.routers import voice_proactivity
+except ImportError:
+    voice_proactivity = None
 
 logger = setup_logger(__name__)
 
@@ -202,12 +208,14 @@ app.include_router(conversations.router, prefix="/api")
 app.include_router(data_export.router, prefix="/api")
 app.include_router(webhooks.router, prefix="/api")
 app.include_router(gmail_push_router, prefix="/api")
+app.include_router(slack_events.router, prefix="/api")
 app.include_router(chat.router, prefix="/api")
 app.include_router(chat.query_router, prefix="/api")  # Legacy /api/query/*
 
 # Base Routes (Without prefix)
 app.include_router(auth.router)
 app.include_router(health.router)
+app.include_router(integrations.router)   # Also at /integrations for frontend compatibility
 app.include_router(chat.router)          # Chat and query endpoints
 app.include_router(blog.router)          # Blog management
 # Voice router for voice input processing
@@ -219,6 +227,16 @@ except ImportError as e:
     logger.warning(f"[WARNING] Voice router not available: {e}")
 except Exception as e:
     logger.warning(f"[WARNING] Voice router not available: {e}")
+
+# Voice proactivity router (wake-word + nudges)
+try:
+    from api.routers import voice_proactivity
+    app.include_router(voice_proactivity.router)  # Wake-word + proactive nudges
+    logger.info("[OK] Voice proactivity router enabled")
+except ImportError as e:
+    logger.warning(f"[WARNING] Voice proactivity router not available: {e}")
+except Exception as e:
+    logger.warning(f"[WARNING] Voice proactivity router not available: {e}")
 
 # Workflows router for productivity automation
 try:
@@ -251,9 +269,7 @@ except Exception as e:
     logger.warning(f"[WARNING] Notifications router not available: {e}")
 
 
-# ============================================
 # APPLICATION INFO
-# ============================================
 
 port = int(os.getenv("PORT", "8000"))
 host = os.getenv("HOST", "0.0.0.0")

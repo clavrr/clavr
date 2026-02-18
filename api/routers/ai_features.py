@@ -17,7 +17,7 @@ from src.features.meeting_notes import MeetingNotesGenerator
 from src.utils.logger import setup_logger
 
 logger = setup_logger(__name__)
-router = APIRouter(prefix="/api/ai", tags=["ai_features"])
+router = APIRouter(prefix="/ai", tags=["ai_features"])
 
 
 # ============================================

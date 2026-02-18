@@ -19,6 +19,7 @@ import asyncio
 from collections import defaultdict
 
 from src.utils.logger import setup_logger
+from src.memory.goal_tracker import GoalStatus
 
 logger = setup_logger(__name__)
 

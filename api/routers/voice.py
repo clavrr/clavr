@@ -7,6 +7,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 import json
 import asyncio
 import base64
+from typing import Dict, Any
 
 import re
 
@@ -18,10 +19,46 @@ from src.database.models import User
 from src.services.voice_service import VoiceService
 from src.utils.audio_transcoder import StreamingTranscoder
 from src.services.service_constants import ServiceConstants
+from api.auth import get_current_user_required
 
 logger = setup_logger(__name__)
-router = APIRouter(prefix="/api/voice", tags=["voice"])
+router = APIRouter(prefix="/voice", tags=["voice"])
 
+
+@router.post("/introduction")
+async def get_voice_introduction(
+    current_user: User = Depends(get_current_user_required),
+    db: AsyncSession = Depends(get_async_db),
+    config = Depends(get_config)
+) -> Dict[str, Any]:
+    """
+    Get initialization data for the voice interface.
+    
+    Returns:
+        - User details (name, context)
+        - Connected integrations
+        - Proactive reminders/suggestions for the greeting
+        - Capability summary
+    """
+    try:
+        voice_service = VoiceService(db, config)
+        config_data = await voice_service.get_voice_configuration(current_user)
+        
+        return {
+            "success": True,
+            "introduction": config_data
+        }
+    except Exception as e:
+        logger.error(f"[VoiceAPI] Error getting introduction: {e}", exc_info=True)
+        # Return partial/fallback data on error instead of 500
+        return {
+            "success": False,
+            "error": str(e),
+            "introduction": {
+                "user_name": extract_first_name(current_user.name, current_user.email),
+                "proactive_reminder": ""
+            }
+        }
 
 
 @router.websocket("/ws/transcribe")
@@ -49,6 +86,7 @@ async def websocket_transcribe(
                 logger.debug(f"[WS] Auth message receive error: {e}")
         
         auth_service = AppState.get_auth_service(db)
+        user = None
         if token:
             user = await auth_service.validate_session_token(token)
         
@@ -107,15 +145,34 @@ async def websocket_transcribe(
                 transcoder.stop()
 
         # 4. Signal readiness and start processing
+        # Check if this session was triggered by wake-word
+        trigger = websocket.query_params.get("trigger", "manual")
+        wake_word_extras = ""
+        if trigger == "wake_word":
+            try:
+                from src.services.voice_proactivity import VoiceProactivityService
+                from src.ai.prompts.voice_prompts import WAKE_WORD_GREETING_TEMPLATE
+                
+                proactivity_svc = VoiceProactivityService(config=config)
+                nudges = await proactivity_svc.check_proactive_triggers(user.id)
+                proactive_context = nudges[0].spoken_text if nudges else "No pending items."
+                wake_word_extras = WAKE_WORD_GREETING_TEMPLATE.format(
+                    proactive_context=proactive_context
+                )
+            except Exception as e:
+                logger.debug(f"[WS] Wake-word context injection error: {e}")
+
         await websocket.send_json({
             "type": "ready",
-            "message": "Connected to Gemini Live"
+            "message": "Connected to Gemini Live",
+            "trigger": trigger
         })
 
         await voice_service.process_voice_stream(
             user=user,
             audio_generator=audio_generator(),
-            websocket=websocket
+            websocket=websocket,
+            system_extras=wake_word_extras if wake_word_extras else None
         )
                     
     except Exception as e:

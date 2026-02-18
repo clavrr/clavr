@@ -25,6 +25,7 @@ class ExtractedItem:
     amount: Optional[float] = None
     urgency: str = "medium"
     suggested_action: str = "Review"
+    assigned_to: Optional[str] = None  # Name or email of person responsible
 
 class ActionableItemExtractor:
     """
@@ -48,7 +49,7 @@ class ActionableItemExtractor:
             return []
             
         # Quick keyword check to avoid expensive LLM calls
-        triggers = ["due", "invoice", "bill", "appointment", "schedule", "deadline", "payment", "expire", "by EOD", "meeting", "meet"]
+        triggers = ["due", "invoice", "bill", "appointment", "schedule", "deadline", "payment", "expire", "by EOD", "meeting", "meet", "action"]
         if not any(t in text.lower() for t in triggers):
             return []
             
@@ -70,6 +71,7 @@ class ActionableItemExtractor:
         - amount: Float value if it's a bill, else null
         - urgency: "high", "medium", "low"
         - suggested_action: "Pay", "RSVP", "Sign", "Book", "Review"
+        - assigned_to: Name or email of the person responsible (if mentioned), or "User" if implied. Null if unclear.
         
         If no actionable items are found, return empty array [].
         ONLY return the JSON array.
@@ -102,7 +104,8 @@ class ActionableItemExtractor:
                     due_date=item.get("due_date"),
                     amount=item.get("amount"),
                     urgency=item.get("urgency", "medium"),
-                    suggested_action=item.get("suggested_action", "Review")
+                    suggested_action=item.get("suggested_action", "Review"),
+                    assigned_to=item.get("assigned_to")
                 ))
             
             if items:

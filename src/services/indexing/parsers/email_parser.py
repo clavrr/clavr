@@ -457,12 +457,12 @@ Respond ONLY with the JSON, no other text."""
         Build relationships from email to other nodes
         
         Relationships created:
-        - Email FROM Contact
-        - Email TO Contact(s)
-        - Email CONTAINS ActionItem (for each action)
-        - Email MENTIONS Company/Topic
+        - Email FROM Person (sender)
+        - Email TO Person(s)
+        - Email CONTAINS ActionItem
         """
         relationships = []
+        from src.services.indexing.node_id_utils import generate_person_id
         
         email_node_id = self.generate_node_id('Email', email_data.get('id', ''))
 
@@ -472,7 +472,7 @@ Respond ONLY with the JSON, no other text."""
         if sender_email:
             relationships.append(Relationship(
                 from_node=email_node_id,
-                to_node=self.generate_node_id('Contact', sender_email),
+                to_node=generate_person_id(email=sender_email),
                 rel_type='FROM'
             ))
         
@@ -483,7 +483,7 @@ Respond ONLY with the JSON, no other text."""
             if recipient_email:
                 relationships.append(Relationship(
                     from_node=email_node_id,
-                    to_node=self.generate_node_id('Contact', recipient_email),
+                    to_node=generate_person_id(email=recipient_email),
                     rel_type='TO'
                 ))
         
@@ -498,49 +498,9 @@ Respond ONLY with the JSON, no other text."""
                     properties={'action_description': action}
                 ))
         
-        # MENTIONS Topic relationships
-        if intents and intents.topics:
-            for topic in intents.topics[:5]:  # Limit to top 5 topics
-                relationships.append(Relationship(
-                    from_node=email_node_id,
-                    to_node=self.generate_node_id('Topic', topic.lower()),
-                    rel_type='DISCUSSES'
-                ))
-        
-        # LEAD relationships
-        if intents and intents.leads:
-            for lead in intents.leads:
-                # Generate a unique ID for the lead (based on name/company or sender)
-                lead_key = f"{lead.name or sender_email}"
-                lead_node_id = self.generate_node_id('Lead', lead_key)
-                
-                # Email RELATED_TO Lead
-                relationships.append(Relationship(
-                    from_node=email_node_id,
-                    to_node=lead_node_id,
-                    rel_type='RELATED_TO',
-                    properties={
-                        'interest_level': lead.interest_level,
-                        'topic': lead.topic
-                    }
-                ))
-                
-                # Person(Sender) -> Lead
-                if sender_email:
-                    relationships.append(Relationship(
-                        from_node=self.generate_node_id('Contact', sender_email),
-                        to_node=lead_node_id,
-                        rel_type='RELATED_TO'
-                    ))
-                
-                # Lead INTERESTED_IN Topic
-                if lead.topic:
-                    topic_node_id = self.generate_node_id('Topic', lead.topic)
-                    relationships.append(Relationship(
-                        from_node=lead_node_id,
-                        to_node=topic_node_id,
-                        rel_type='INTERESTED_IN'
-                    ))
+        # NOTE: Topics and Leads are handled by EmailCrawler using centralized TopicExtractor
+        # to ensure ID consistency/deduplication across the application.
+        # Original internal topic creation removed to prevent 'Disconnected Graph' issues.
 
         return relationships
     

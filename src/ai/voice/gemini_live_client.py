@@ -66,6 +66,10 @@ class GeminiLiveClient(BaseVoiceClient):
         
         logger.info(f"[GEMINI_LIVE] Initialized with model: {self.model}")
         
+    async def warmup(self) -> None:
+        """No-op for Gemini currently."""
+        pass
+        
     async def stream_audio(
         self, 
         audio_stream: AsyncGenerator[bytes, None],

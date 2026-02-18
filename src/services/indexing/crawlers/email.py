@@ -90,6 +90,17 @@ class EmailCrawler(BaseIndexer):
         self.INITIAL_INDEXING_DAYS = ServiceConstants.INITIAL_INDEXING_DAYS
         self.BATCH_SIZE = 50
         
+        # Fetch user's email for SENT/RECEIVED linking
+        self.user_email = None
+        try:
+            with get_db_context() as db:
+                user = db.execute(select(User).where(User.id == user_id)).scalars().first()
+                if user:
+                    self.user_email = user.email
+                    logger.debug(f"[{self.name}] Initialized with user email: {self.user_email}")
+        except Exception as e:
+            logger.warning(f"[{self.name}] Could not fetch user email: {e}")
+        
     @property
     def name(self) -> str:
         return "email"
@@ -420,6 +431,10 @@ class EmailCrawler(BaseIndexer):
             if not att_id:
                 continue
                 
+            # Skip calendar invites (handled by calendar crawler) and unknown formats
+            if filename.lower().endswith('.ics'):
+                continue
+
             try:
                 # Download
                 att_data = self.google_client.get_attachment_data(email_id, att_id)
@@ -468,7 +483,23 @@ class EmailCrawler(BaseIndexer):
         identity_nodes = await self._build_identity_graph(email_node)
         nodes.extend(identity_nodes)
             
-        # 2. Action Items (LLM Extraction)
+        # 2. Topic Extraction (Cross-App Linking)
+        if self.topic_extractor:
+            try:
+                body_text = email_node.properties.get('body') or email_node.properties.get('content')
+                if body_text and len(body_text) > 50:
+                    topic_nodes = await self.topic_extractor.extract_topics(
+                        content=body_text,
+                        source="gmail",
+                        source_node_id=email_node.node_id,
+                        user_id=self.user_id
+                    )
+                    if topic_nodes:
+                        nodes.extend(topic_nodes)
+            except Exception as e:
+                logger.warning(f"[EmailCrawler] Topic extraction failed: {e}")
+
+        # 3. Action Items (LLM Extraction)
         try:
             body_text = email_node.properties.get('body', '') or email_node.properties.get('content', '')
             if body_text:
@@ -480,7 +511,7 @@ class EmailCrawler(BaseIndexer):
                 if items:
                     with get_db_context() as session:
                         for item in items:
-                            # 2.1 Persistence to SQL
+                            # 3.1 Persistence to SQL
                             sql_id = f"act_{hashlib.md5((item.title + email_node.node_id + 'sql').encode()).hexdigest()}"
                             
                             due_dt = None
@@ -508,25 +539,59 @@ class EmailCrawler(BaseIndexer):
                             )
                             session.merge(act_item)
                             
-                            # 2.2 Graph Node Creation
+                            # 3.2 Graph Node Creation
                             action_id = f"Action_{hashlib.md5((item.title + email_node.node_id).encode()).hexdigest()[:12]}"
+                            
+                            # Prepare relationships
+                            relationships = [{
+                                'from_node': email_node.node_id,
+                                'to_node': action_id,
+                                'rel_type': RelationType.CONTAINS.value,
+                                'properties': {}
+                            }]
+                            
+                            # 3.3 Link to Assignee (Person) if found
+                            if item.assigned_to:
+                                assignee_name = item.assigned_to.lower()
+                                assignee_id = None
+                                
+                                # Skip self-assignment which is implied
+                                if assignee_name not in ['me', 'myself', 'user', 'self', 'i']:
+                                    # Try to match against extracted identity nodes (Sender/Recipients)
+                                    for p_node in identity_nodes:
+                                        if p_node.node_type != NodeType.PERSON.value:
+                                            continue
+                                            
+                                        p_name = str(p_node.properties.get('name', '')).lower()
+                                        p_email = str(p_node.properties.get('email', '')).lower()
+                                        
+                                        # Simple substring match
+                                        if (assignee_name in p_name) or (assignee_name in p_email):
+                                            assignee_id = p_node.node_id
+                                            break
+                                
+                                if assignee_id:
+                                    relationships.append({
+                                        'from_node': action_id,  # Action -> Person
+                                        'to_node': assignee_id,
+                                        'rel_type': RelationType.ASSIGNED_TO.value,
+                                        'properties': {'confidence': 0.8}
+                                    })
+
                             action_node = ParsedNode(
                                 node_id=action_id,
                                 node_type=NodeType.ACTION_ITEM.value,
                                 properties={
+                                    'title': item.title, # Added for graph display consistency
                                     'description': item.title, 
                                     'status': 'pending', 
                                     'due_date': due_dt.isoformat(),
                                     'urgency': item.urgency,
                                     'type': item.item_type,
-                                    'amount': item.amount
+                                    'amount': item.amount,
+                                    'assigned_to': item.assigned_to
                                 },
-                                relationships=[{
-                                    'from_node': email_node.node_id,
-                                    'to_node': action_id,
-                                    'rel_type': RelationType.CONTAINS.value,
-                                    'properties': {}
-                                }]
+                                relationships=relationships
                             )
                             nodes.append(action_node)
                             
@@ -586,14 +651,14 @@ class EmailCrawler(BaseIndexer):
 
     async def _build_identity_graph(self, email_node: ParsedNode) -> List[ParsedNode]:
         """
-        Build Person, Identity nodes and KNOWS relationships from email.
+        Build Person, Identity nodes and relationships from email.
         
-        This enables contact resolution queries like "Schedule a 1:1 with Carol"
-        by creating:
+        Creates:
         - Person node for each unique email contact
         - Identity node for their email address
         - HAS_IDENTITY relationship (Person -> Identity)
         - KNOWS relationship (User -> Person) with aliases property
+        - FROM/TO/CC relationships (Email -> Person) for graph connectivity
         
         The alias is extracted from the From header: "Carol Smith" <carol@company.com>
         """
@@ -610,11 +675,12 @@ class EmailCrawler(BaseIndexer):
                 contacts_to_process.append({
                     'email': email.lower(),
                     'name': name,
-                    'is_sender': True
+                    'is_sender': True,
+                    'is_cc': False
                 })
         
-        # Recipients (To, CC)
-        for field in ['recipients', 'to', 'cc']:
+        # Recipients (To)
+        for field in ['recipients', 'to']:
             recipients = email_node.properties.get(field, [])
             if isinstance(recipients, str):
                 recipients = [r.strip() for r in recipients.split(',')]
@@ -625,8 +691,24 @@ class EmailCrawler(BaseIndexer):
                         contacts_to_process.append({
                             'email': email.lower(),
                             'name': name,
-                            'is_sender': False
+                            'is_sender': False,
+                            'is_cc': False
                         })
+        
+        # CC Recipients
+        cc_recipients = email_node.properties.get('cc', [])
+        if isinstance(cc_recipients, str):
+            cc_recipients = [r.strip() for r in cc_recipients.split(',')]
+        for recipient in cc_recipients:
+            if recipient:
+                name, email = self._parse_email_address(recipient)
+                if email:
+                    contacts_to_process.append({
+                        'email': email.lower(),
+                        'name': name,
+                        'is_sender': False,
+                        'is_cc': True
+                    })
         
         # Track which emails we've processed to avoid duplicates
         processed_emails = set()
@@ -636,6 +718,31 @@ class EmailCrawler(BaseIndexer):
             if email in processed_emails:
                 continue
             processed_emails.add(email)
+            
+            # Check if this is the user themselves to link directly to User node
+            is_user = self.user_email and email.lower() == self.user_email.lower()
+            
+            if is_user:
+                # Link Email to User directly via SENT/RECEIVED
+                if contact['is_sender']:
+                    # User SENT Email
+                    email_node.relationships.append({
+                        'from_node': f"User/{self.user_id}",
+                        'to_node': email_node.node_id,
+                        'rel_type': RelationType.SENT.value,
+                        'properties': {'timestamp': email_node.properties.get('date', '')}
+                    })
+                else:
+                    # User RECEIVED Email
+                    email_node.relationships.append({
+                        'from_node': f"User/{self.user_id}",
+                        'to_node': email_node.node_id,
+                        'rel_type': RelationType.RECEIVED.value,
+                        'properties': {'timestamp': email_node.properties.get('date', '')}
+                    })
+                # We still want to see the user in the graph, but as a User node
+                # Continue if we don't want a shadow Person node for the user
+                continue
             
             # 1. Create Person node with standardized ID
             from src.services.indexing.node_id_utils import generate_person_id, generate_identity_id
@@ -658,6 +765,45 @@ class EmailCrawler(BaseIndexer):
             # 2. Create Identity node (for the email address)
             identity_id = generate_identity_id('email', email)
             
+            # Build relationships for identity node
+            identity_relationships = [
+                # Person HAS_IDENTITY Identity
+                {
+                    'from_node': person_id,
+                    'to_node': identity_id,
+                    'rel_type': RelationType.HAS_IDENTITY.value,
+                    'properties': {'source': 'gmail'}
+                }
+            ]
+            
+            # 3. Add Email -> Person relationship (FROM, TO, or CC)
+            # FIXED: Attach to email_node.relationships (not identity_relationships)
+            # This ensures edges appear in graph visualization
+            if contact['is_sender']:
+                # Email FROM Person (sender)
+                email_node.relationships.append({
+                    'from_node': email_node.node_id,
+                    'to_node': person_id,
+                    'rel_type': RelationType.FROM.value,
+                    'properties': {'timestamp': email_node.properties.get('date', '')}
+                })
+            elif contact['is_cc']:
+                # Email CC Person
+                email_node.relationships.append({
+                    'from_node': email_node.node_id,
+                    'to_node': person_id,
+                    'rel_type': RelationType.CC.value,
+                    'properties': {}
+                })
+            else:
+                # Email TO Person (recipient)
+                email_node.relationships.append({
+                    'from_node': email_node.node_id,
+                    'to_node': person_id,
+                    'rel_type': RelationType.TO.value,
+                    'properties': {}
+                })
+            
             identity_node = ParsedNode(
                 node_id=identity_id,
                 node_type=NodeType.IDENTITY.value,
@@ -668,17 +814,11 @@ class EmailCrawler(BaseIndexer):
                     'source': 'gmail',
                     'verified': True  # Verified since we received/sent email
                 },
-                # Add relationship: Person HAS_IDENTITY Identity
-                relationships=[{
-                    'from_node': person_id,
-                    'to_node': identity_id,
-                    'rel_type': RelationType.HAS_IDENTITY.value,
-                    'properties': {'source': 'gmail'}
-                }]
+                relationships=identity_relationships
             )
             nodes.append(identity_node)
             
-            # 3. Build pending KNOWS relationship (User -> Person with aliases)
+            # 4. Build pending KNOWS relationship (User -> Person with aliases)
             # The alias is the display name from the email
             if name and name != email.split('@')[0]:
                 aliases = [name]
@@ -693,8 +833,8 @@ class EmailCrawler(BaseIndexer):
                 
                 person_node._pending_relationships.append({
                     'rel_type': RelationType.KNOWS.value,
-                    'from_type': 'user',
-                    'from_id': f"user_{self.user_id}",
+                    'from_id': f"User/{self.user_id}",
+                    'to_id': person_id,
                     'properties': {
                         'aliases': aliases,
                         'frequency': 1,  # Will be incremented on subsequent emails
