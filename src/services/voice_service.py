@@ -266,11 +266,11 @@ class VoiceService:
         start_time = time.time()
         user_first_name = extract_first_name(user.name, user.email)
         
-        # 1. Decide provider
-        primary_provider = "elevenlabs" if os.environ.get("ELEVENLABS_AGENT_ID") else "gemini"
-        providers_to_try = [primary_provider]
-        if primary_provider == "elevenlabs":
-            providers_to_try.append("gemini")
+        # 1. Decide provider — Gemini Live is primary (cheaper, lower latency)
+        #    ElevenLabs is fallback when configured
+        providers_to_try = ["gemini"]
+        if os.environ.get("ELEVENLABS_AGENT_ID"):
+            providers_to_try.append("elevenlabs")
             
         session_id = f"voice_{user.id}_{uuid.uuid4().hex[:8]}"
         assistant_response_buffer = ""
