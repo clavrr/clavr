@@ -1,0 +1,15 @@
+# =============================================================================
+# Clavr Backend — Heavy / Optional ML Dependencies
+# =============================================================================
+# These are large packages (torch ~2GB, docling ~500MB+) that are NOT required
+# to run the core app. They are imported with try/except guards and degrade
+# gracefully when missing.
+#
+# Install:  pip install -r requirements-ml.txt
+# =============================================================================
+
+# Local embeddings (pulls in torch — ~2GB download)
+sentence-transformers==3.3.1
+
+# Advanced document parsing (IBM Docling — large dep tree)
+docling==2.14.0

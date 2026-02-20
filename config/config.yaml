@@ -57,7 +57,7 @@ database:
 rag:
   # Embedding configuration
   embedding_provider: "gemini"  # "gemini" or "sentence-transformers"
-  embedding_model: "models/embedding-001"  # Gemini embedding model
+  embedding_model: "${RAG_EMBEDDING_MODEL:-models/text-embedding-004}"  # Gemini embedding model
   embedding_dimension: 768  # 768 for Gemini/all-mpnet-base-v2
   
   # Vector store configuration
