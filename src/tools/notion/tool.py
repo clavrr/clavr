@@ -177,9 +177,32 @@ class NotionTool(BaseTool):
                 return f"Unknown action: {action}. Supported: search, query, create, update"
                 
         except Exception as e:
+            err_str = str(e)
+            if "401" in err_str or "403" in err_str or "unauthorized" in err_str.lower() or "Unauthorized" in err_str:
+                logger.warning(f"[NotionTool] Provider returned auth error for user {self.user_id}, marking inactive: {e}")
+                self._mark_integration_inactive()
+                return "[INTEGRATION_REQUIRED] Notion access revoked. Please reconnect Notion in Settings."
             logger.error(f"[NotionTool] Error: {e}", exc_info=True)
             return f"Error: {str(e)}"
     
+    def _mark_integration_inactive(self) -> None:
+        """Mark the Notion integration as inactive in DB after a provider 401/403."""
+        if not self.user_id:
+            return
+        try:
+            from ...database import get_db_context
+            from ...database.models import UserIntegration
+            with get_db_context() as db:
+                row = db.query(UserIntegration).filter(
+                    UserIntegration.user_id == self.user_id,
+                    UserIntegration.provider == "notion"
+                ).first()
+                if row:
+                    row.is_active = False
+                    logger.info(f"[NotionTool] Marked notion integration inactive for user {self.user_id}")
+        except Exception as ex:
+            logger.warning(f"[NotionTool] Could not mark integration inactive: {ex}")
+
     def _extract_page_title(self, page: dict) -> str:
         """Extract title from a Notion page object."""
         properties = page.get('properties', {})

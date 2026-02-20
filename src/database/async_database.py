@@ -64,6 +64,14 @@ def _get_async_database_url() -> str:
         # Replace with asyncpg driver
         async_url = db_url.replace('postgresql://', 'postgresql+asyncpg://')
         async_url = async_url.replace('postgres://', 'postgresql+asyncpg://')
+        # Remove sslmode from URL query params — asyncpg uses 'ssl' connect arg instead
+        from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
+        parsed = urlparse(async_url)
+        params = parse_qs(parsed.query)
+        params.pop('sslmode', None)
+        params.pop('channel_binding', None)
+        clean_query = urlencode({k: v[0] for k, v in params.items()})
+        async_url = urlunparse(parsed._replace(query=clean_query))
         return async_url
     elif db_url.startswith('sqlite://'):
         # Convert to aiosqlite for async SQLite
@@ -107,7 +115,8 @@ def get_async_engine() -> AsyncEngine:
                 pool_recycle=3600,        # Recycle connections after 1 hour
                 pool_pre_ping=True,       # Test connections before use
                 poolclass=AsyncAdaptedQueuePool,
-                echo=False
+                echo=False,
+                connect_args={"ssl": True}  # Required for Neon/cloud PostgreSQL
             )
             
             # Add connection logging for monitoring

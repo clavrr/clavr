@@ -5,6 +5,8 @@ Abstract interface for embedding generation with concrete implementations
 for Gemini and Sentence Transformers.
 """
 import hashlib
+import math
+import re
 import time
 from abc import ABC, abstractmethod
 from typing import List, Optional, Tuple
@@ -52,7 +54,7 @@ class GeminiEmbeddingProvider(EmbeddingProvider):
     - Separate task types for documents and queries
     """
     
-    def __init__(self, api_key: str, model_name: str = "models/embedding-001", 
+    def __init__(self, api_key: str, model_name: str = "models/text-embedding-004", 
                  cache_size: int = 1000, cache_ttl_hours: int = 24,
                  max_retries: int = 3, retry_base_delay: float = 1.0):
         """
@@ -82,7 +84,7 @@ class GeminiEmbeddingProvider(EmbeddingProvider):
         except ImportError:
             raise ImportError("google-generativeai package is required for Gemini embeddings")
         
-        self.model_name = model_name
+        self.model_name = self._normalize_model_name(model_name)
         
         # Use shared TTLCache
         from .cache import TTLCache
@@ -95,6 +97,24 @@ class GeminiEmbeddingProvider(EmbeddingProvider):
         # Shared ThreadPoolExecutor for batch processing
         max_workers = int(os.environ.get('EMBEDDING_PARALLEL_WORKERS', '10'))
         self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=max_workers)
+
+    @staticmethod
+    def _normalize_model_name(model_name: str) -> str:
+        """Normalize known legacy aliases and ensure Gemini API model format."""
+        normalized = model_name.strip()
+
+        legacy_aliases = {
+            "embedding-001": "models/text-embedding-004",
+            "models/embedding-001": "models/text-embedding-004",
+            "gemini-embedding-001": "models/text-embedding-004",
+            "models/gemini-embedding-001": "models/text-embedding-004",
+        }
+
+        normalized = legacy_aliases.get(normalized, normalized)
+        if not normalized.startswith("models/"):
+            normalized = f"models/{normalized}"
+
+        return normalized
     
     def get_dimension(self) -> int:
         """Get embedding dimension."""
@@ -104,6 +124,38 @@ class GeminiEmbeddingProvider(EmbeddingProvider):
         """Generate cache key for text and task type."""
         content = f"{text}:{task_type}"
         return hashlib.md5(content.encode()).hexdigest()
+
+    @staticmethod
+    def _is_model_unavailable_error(error_message: str) -> bool:
+        """Detect non-retriable model availability errors from Gemini API."""
+        lowered = error_message.lower()
+        return (
+            "not found" in lowered
+            or "not supported for embedcontent" in lowered
+            or "is not supported for embedcontent" in lowered
+            or "unsupported model" in lowered
+            or "404 models/" in lowered
+        )
+
+    def _build_local_fallback_embedding(self, text: str) -> List[float]:
+        """Build deterministic fallback embedding when remote model is unavailable."""
+        vector = [0.0] * self._dimension
+        tokens = re.findall(r"\w+", text.lower())
+
+        if not tokens:
+            return vector
+
+        for token in tokens:
+            digest = hashlib.sha256(token.encode("utf-8")).digest()
+            bucket = int.from_bytes(digest[:4], "big") % self._dimension
+            sign = 1.0 if digest[4] % 2 == 0 else -1.0
+            vector[bucket] += sign
+
+        norm = math.sqrt(sum(v * v for v in vector))
+        if norm == 0:
+            return vector
+
+        return [v / norm for v in vector]
     
     def _get_cached(self, cache_key: str) -> Optional[List[float]]:
         """Get cached embedding if valid."""
@@ -183,6 +235,17 @@ class GeminiEmbeddingProvider(EmbeddingProvider):
             logger.warning(f"Failed to generate embedding after {self._max_retries} attempts: Server error ({error_msg[:100]})")
         else:
             logger.warning(f"Failed to generate embedding after {self._max_retries} attempts: {error_msg[:200]}")
+
+        # If the configured Gemini embedding model is unavailable for this API key/version,
+        # use a deterministic local fallback vector instead of hard-failing indexing.
+        if self._is_model_unavailable_error(error_msg):
+            logger.warning(
+                "Gemini embedding model unavailable; using deterministic local fallback embedding "
+                "for degraded-but-functional semantic indexing."
+            )
+            fallback_embedding = self._build_local_fallback_embedding(text)
+            self._set_cached(cache_key, fallback_embedding)
+            return fallback_embedding
         
         raise Exception(f"Failed to generate embedding after {self._max_retries} attempts: {last_error}")
     
@@ -408,11 +471,18 @@ def create_embedding_provider(config: Config, rag_config: Optional[RAGConfig] = 
         rag_config = RAGConfig()
     
     provider_name = rag_config.embedding_provider.lower()
+
+    def _sentence_transformer_fallback_model() -> str:
+        """Choose a safe sentence-transformer fallback when Gemini init fails."""
+        candidate = (rag_config.embedding_model or "").strip()
+        if candidate.startswith("models/") or "embedding-" in candidate:
+            return "sentence-transformers/all-mpnet-base-v2"
+        return candidate or "sentence-transformers/all-mpnet-base-v2"
     
     if provider_name == "gemini":
         if not config.ai.api_key:
             logger.warning("Gemini API key not found, falling back to sentence-transformers")
-            return SentenceTransformerEmbeddingProvider(rag_config.embedding_model)
+            return SentenceTransformerEmbeddingProvider(_sentence_transformer_fallback_model())
         
         try:
             return GeminiEmbeddingProvider(
@@ -425,8 +495,8 @@ def create_embedding_provider(config: Config, rag_config: Optional[RAGConfig] = 
             )
         except Exception as e:
             logger.warning(f"Failed to initialize Gemini embeddings: {e}, falling back to sentence-transformers")
-            return SentenceTransformerEmbeddingProvider(rag_config.embedding_model)
+            return SentenceTransformerEmbeddingProvider(_sentence_transformer_fallback_model())
     else:
         # Default to sentence-transformers
-        return SentenceTransformerEmbeddingProvider(rag_config.embedding_model)
+        return SentenceTransformerEmbeddingProvider(_sentence_transformer_fallback_model())
 

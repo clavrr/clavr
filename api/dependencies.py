@@ -253,26 +253,43 @@ class AppState:
         return cls._summarize_tool
     
     @classmethod
-    def get_notion_tool(cls, graph_manager: Optional[Any] = None, rag_engine: Optional[Any] = None) -> NotionTool:
+    def get_notion_tool(
+        cls,
+        graph_manager: Optional[Any] = None,
+        rag_engine: Optional[Any] = None,
+        user_id: Optional[int] = None,
+    ) -> NotionTool:
         """
-        Get or create NotionTool singleton.
-        
+        Get NotionTool.
+
         Args:
             graph_manager: Optional KnowledgeGraphManager for Neo4j
             rag_engine: Optional RAGEngine for Pinecone (defaults to singleton)
+            user_id: Optional user context for OAuth token lookup.
         """
+        config = cls.get_config()
+        if rag_engine is None:
+            rag_engine = cls.get_rag_engine()
+
+        # IMPORTANT: Notion OAuth token is user-specific. Never reuse a singleton
+        # tool for authenticated chat requests, or user_id remains unset.
+        if user_id is not None:
+            return NotionTool(
+                config=config,
+                user_id=user_id,
+                graph_manager=graph_manager,
+                rag_engine=rag_engine,
+            )
+
+        # Backward-compatible singleton for non-user contexts.
         if cls._notion_tool is None:
-            config = cls.get_config()
-            if rag_engine is None:
-                rag_engine = cls.get_rag_engine()
-            
             cls._notion_tool = NotionTool(
                 config=config,
                 graph_manager=graph_manager,
-                rag_engine=rag_engine
+                rag_engine=rag_engine,
             )
             logger.info("[OK] NotionTool initialized")
-        
+
         return cls._notion_tool
     
     @classmethod
@@ -423,7 +440,7 @@ class AppState:
             TimezoneTool(config=config),
             # Slack/Asana might need more user-specific setup if they have their own OAuth
             SlackTool(config=config, user_id=user_id),
-            cls.get_notion_tool(),
+            cls.get_notion_tool(user_id=user_id),
             AsanaTool(config=config, user_id=user_id),
             GhostTool(config=config, user_id=user_id)
         ]

@@ -6,7 +6,10 @@ Includes query expansion, reformulation, and intent understanding.
 """
 import re
 from typing import List, Dict, Any, Optional
-import spacy
+try:
+    import spacy
+except ImportError:
+    spacy = None
 import dateparser
 from ....utils.logger import setup_logger
 from ..utils.utils import extract_keywords
@@ -82,6 +85,9 @@ class QueryEnhancer:
     def _load_spacy_if_needed(self):
         """Lazy load spaCy model."""
         if self.nlp is None:
+            if spacy is None:
+                logger.warning("spaCy not installed. NER features disabled. Install with: pip install spacy")
+                return
             try:
                 self.nlp = spacy.load("en_core_web_sm")
             except OSError:

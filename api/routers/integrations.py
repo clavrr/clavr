@@ -53,7 +53,10 @@ async def auth_callback(
 ):
     """Handle OAuth callback for a provider."""
     try:
-        real_provider, user_id = await integration_service.handle_callback(provider, code, state)
+        callback_result = await integration_service.handle_callback(provider, code, state)
+        real_provider = callback_result.provider
+        user_id = callback_result.user_id
+        redirect_to = callback_result.redirect_to
         
         # Log successful connection
         await log_auth_event(
@@ -64,11 +67,23 @@ async def auth_callback(
         )
         
         f_url = get_frontend_url(config)
-        return RedirectResponse(url=f"{f_url}/integrations?success=true&provider={real_provider}")
+
+        if redirect_to:
+            if not redirect_to.startswith("http"):
+                path = redirect_to if redirect_to.startswith("/") else f"/{redirect_to}"
+                final_redirect = f"{f_url}{path}"
+            else:
+                final_redirect = redirect_to
+
+            separator = "&" if "?" in final_redirect else "?"
+            final_redirect = f"{final_redirect}{separator}status=success&provider={real_provider}"
+            return RedirectResponse(url=final_redirect)
+
+        return RedirectResponse(url=f"{f_url}/settings/integrations?status=success&provider={real_provider}")
     except Exception as e:
         logger.error(f"Integration callback failed for {provider}: {e}", exc_info=True)
         f_url = get_frontend_url(config)
-        return RedirectResponse(url=f"{f_url}/integrations?error=auth_failed")
+        return RedirectResponse(url=f"{f_url}/settings/integrations?error=auth_failed&provider={provider}")
 
 @router.post("/{provider}/disconnect")
 async def disconnect_integration(

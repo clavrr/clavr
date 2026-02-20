@@ -4,6 +4,7 @@ Asana Tool - LangChain tool for Asana task management
 Provides task management capabilities through the AsanaService.
 """
 import asyncio
+import os
 from langchain.tools import BaseTool
 from pydantic import Field, BaseModel
 from typing import Optional, Any, Type
@@ -16,12 +17,13 @@ logger = setup_logger(__name__)
 
 class AsanaInput(BaseModel):
     """Input for AsanaTool."""
-    action: str = Field(description="Action to perform (create, list, complete, search, delete, overdue, projects)")
+    action: str = Field(description="Action to perform (create, list, complete, search, delete, overdue, projects, create_project)")
     query: Optional[str] = Field(default="", description="Query or details for the action.")
     title: Optional[str] = Field(default=None, description="Task title")
     due_date: Optional[str] = Field(default=None, description="Due date (YYYY-MM-DD)")
     notes: Optional[str] = Field(default=None, description="Task notes")
     project_id: Optional[str] = Field(default=None, description="Asana project ID")
+    project_name: Optional[str] = Field(default=None, description="Asana project name")
     assignee: Optional[str] = Field(default=None, description="Task assignee")
     status: Optional[str] = Field(default="pending", description="Task status filter")
     limit: Optional[int] = Field(default=10, description="Result limit")
@@ -115,13 +117,24 @@ class AsanaTool(BaseTool):
             query: Query string or task title
             **kwargs: Additional parameters (title, due_date, task_id, etc.)
         """
-        if not self.asana_service:
+        service = self.asana_service
+
+        if not service:
             return "[INTEGRATION_REQUIRED] Asana permission not granted. Please enable Asana integration in Settings."
-        
-        if not self.asana_service.is_available:
+
+        if not service.is_available:
+            unavailable_reason = getattr(service, "unavailable_reason", None)
+            if unavailable_reason == "sdk_missing":
+                return (
+                    "[SYSTEM_CONFIG_REQUIRED] Asana isn't available on this backend yet. "
+                    "Install backend dependency: pip install asana"
+                )
             return "[INTEGRATION_REQUIRED] Asana permission not granted. Please enable Asana integration in Settings."
         
         try:
+            if action == "list" and "project" in (query or "").lower() and "task" not in (query or "").lower():
+                action = "projects"
+
             if action == "create":
                 return self._handle_create(query, **kwargs)
             elif action == "list":
@@ -136,13 +149,99 @@ class AsanaTool(BaseTool):
                 return self._handle_overdue(**kwargs)
             elif action == "projects":
                 return self._handle_projects(**kwargs)
+            elif action == "create_project":
+                return self._handle_create_project(query, **kwargs)
             else:
-                return f"Unknown action: {action}. Supported: create, list, complete, search, delete"
+                return f"Unknown action: {action}. Supported: create, list, complete, search, delete, projects, create_project"
                 
         except Exception as e:
+            err_str = str(e)
+            if "401" in err_str or "403" in err_str or "unauthorized" in err_str.lower():
+                logger.warning(f"[AsanaTool] Auth error for user {self.user_id}, attempting token refresh: {e}")
+                refreshed = self._refresh_asana_token()
+                if refreshed:
+                    self._service = None
+                    return "[RETRY] Asana token refreshed. Please resend your message."
+                else:
+                    self._mark_asana_inactive()
+                    return "[INTEGRATION_REQUIRED] Asana access expired. Please reconnect Asana in Settings."
             logger.error(f"Asana tool error: {e}", exc_info=True)
             return f"Error executing Asana action: {str(e)}"
     
+    def _refresh_asana_token(self) -> bool:
+        """Attempt to refresh the Asana access token using stored refresh_token."""
+        try:
+            from src.database import get_db_context
+            from src.database.models import UserIntegration
+            import requests as req_lib
+            from datetime import datetime, timedelta
+
+            with get_db_context() as db:
+                row = db.query(UserIntegration).filter(
+                    UserIntegration.user_id == self.user_id,
+                    UserIntegration.provider == "asana"
+                ).first()
+                if not row or not row.refresh_token:
+                    logger.warning("[AsanaTool] No refresh_token stored for Asana")
+                    return False
+
+                client_id = None
+                client_secret = None
+                try:
+                    client_id = self.config.oauth.providers["asana"].client_id
+                    client_secret = self.config.oauth.providers["asana"].client_secret
+                except Exception:
+                    pass
+                client_id = client_id or os.getenv("ASANA_CLIENT_ID")
+                client_secret = client_secret or os.getenv("ASANA_CLIENT_SECRET")
+
+                if not client_id or not client_secret:
+                    logger.warning("[AsanaTool] Asana client_id/secret not configured, cannot refresh")
+                    return False
+
+                resp = req_lib.post(
+                    "https://app.asana.com/-/oauth_token",
+                    data={
+                        "grant_type": "refresh_token",
+                        "client_id": client_id,
+                        "client_secret": client_secret,
+                        "refresh_token": row.refresh_token,
+                    },
+                    timeout=10,
+                )
+                if resp.status_code != 200:
+                    logger.error(f"[AsanaTool] Refresh failed: {resp.status_code} {resp.text[:200]}")
+                    return False
+
+                data = resp.json()
+                row.access_token = data["access_token"]
+                if data.get("refresh_token"):
+                    row.refresh_token = data["refresh_token"]
+                if data.get("expires_in"):
+                    row.expires_at = datetime.utcnow() + timedelta(seconds=data["expires_in"])
+                row.is_active = True
+                logger.info(f"[AsanaTool] Refreshed Asana token for user {self.user_id}")
+                return True
+        except Exception as ex:
+            logger.error(f"[AsanaTool] Exception during token refresh: {ex}")
+            return False
+
+    def _mark_asana_inactive(self) -> None:
+        """Mark Asana integration inactive after unrecoverable auth failure."""
+        try:
+            from src.database import get_db_context
+            from src.database.models import UserIntegration
+            with get_db_context() as db:
+                row = db.query(UserIntegration).filter(
+                    UserIntegration.user_id == self.user_id,
+                    UserIntegration.provider == "asana"
+                ).first()
+                if row:
+                    row.is_active = False
+                    logger.info(f"[AsanaTool] Marked asana inactive for user {self.user_id}")
+        except Exception as ex:
+            logger.warning(f"[AsanaTool] Could not mark asana inactive: {ex}")
+
     def _handle_create(self, query: str, **kwargs) -> str:
         """Handle task creation."""
         title = kwargs.get("title") or query
@@ -154,6 +253,7 @@ class AsanaTool(BaseTool):
             due_date=kwargs.get("due_date"),
             notes=kwargs.get("notes"),
             project_id=kwargs.get("project_id"),
+            project_name=kwargs.get("project_name"),
             assignee=kwargs.get("assignee")
         )
         
@@ -264,6 +364,18 @@ class AsanaTool(BaseTool):
             lines.append(f"- {p['name']}{archived}")
         
         return "\n".join(lines)
+
+    def _handle_create_project(self, query: str, **kwargs) -> str:
+        """Handle Asana project creation."""
+        project_name = kwargs.get("project_name") or query
+        if not project_name:
+            return "Please provide a project name."
+
+        project = self.asana_service.create_project(
+            name=project_name,
+            notes=kwargs.get("notes")
+        )
+        return f"✅ Created Asana project: **{project['name']}**"
     
     async def _arun(
         self,
