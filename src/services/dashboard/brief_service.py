@@ -241,6 +241,7 @@ class BriefService:
             ]
             
             brief_emails = []
+            seen_subjects = set()
             for msg in messages:
                 sender = msg.get('sender', '').lower()
                 subject = msg.get('subject', '').lower()
@@ -254,6 +255,13 @@ class BriefService:
                 if any(pattern in subject for pattern in promo_subjects):
                     logger.info(f"[BriefService] Skipping promo subject: {subject[:50]}")
                     continue
+                
+                # Deduplicate by subject (keep first occurrence only)
+                subj_key = subject.strip()
+                if subj_key in seen_subjects:
+                    logger.info(f"[BriefService] Skipping duplicate subject: {subject[:50]}")
+                    continue
+                seen_subjects.add(subj_key)
                     
                 summary = msg.get('snippet', '') or 'No preview available'
                 
