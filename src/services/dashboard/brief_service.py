@@ -191,56 +191,58 @@ class BriefService:
         }
 
     async def _get_emails(self, user_id: int, fast_mode: bool = False) -> List[Dict]:
-        """Fetch important unread emails using Gmail's IMPORTANT label."""
+        """Fetch important primary-tab emails, excluding promotions, social, forums, and updates."""
         if not self.email_service:
             logger.warning("[BriefService] No email service available")
             return []
             
         try:
-            # Use structured parameters — search_emails builds its own Gmail query internally.
-            # Do NOT pass raw Gmail syntax (e.g. "in:inbox newer_than:2d") as the query arg
-            # because the search service strips/mangles it via junk-word removal.
-            recent_cutoff = (datetime.now() - timedelta(days=7)).strftime("%Y/%m/%d")
+            # Use Gmail's native category filtering to get ONLY primary-tab emails.
+            # This excludes Promotions, Social, Updates, and Forums tabs at the API level.
+            gmail_query = "category:primary newer_than:7d"
             
-            logger.info(f"[BriefService] Searching recent inbox emails since {recent_cutoff}")
+            logger.info(f"[BriefService] Searching primary-tab emails: {gmail_query}")
             
             # Explicitly disable RAG in fast_mode to avoid hitting timeouts (>1s)
             allow_rag = not fast_mode
             
             messages = await asyncio.to_thread(
                 self.email_service.search_emails,
-                query=None,           # No free-text query — just structural filters
-                folder="inbox",       # Inbox only
-                after_date=recent_cutoff,  # Last 7 days
-                is_unread=None,       # Both read AND unread
-                limit=25,             # Fetch more to survive promotional filtering
-                allow_rag=allow_rag
+                query=gmail_query,
+                folder="inbox",
+                limit=30,  # Fetch extra to survive additional filtering
             ) 
             
-            logger.info(f"[BriefService] Found {len(messages)} emails")
+            logger.info(f"[BriefService] Found {len(messages)} primary-tab emails")
             
-            # Promotional sender patterns to exclude (be specific to avoid over-filtering)
-            # Promotional sender patterns to exclude
-            promo_patterns = ConfigDefaults.EMAIL_PROMO_PATTERNS
+            # Second filter: catch stragglers that Gmail miscategorized
+            promo_senders = ConfigDefaults.EMAIL_PROMO_PATTERNS
+            
+            # Subject patterns that indicate newsletters/promos even from primary tab
+            promo_subjects = [
+                'daily digest', 'weekly digest', 'newsletter', 'unsubscribe',
+                'your daily', 'your weekly', 'top stories', 'best stories',
+                'trending', 'recommended for you', 'digest for',
+                'get paid by referring', 'get up to $', 'free credit',
+                'won\'t regret', 'don\'t miss', 'limited time',
+            ]
             
             brief_emails = []
             for msg in messages:
                 sender = msg.get('sender', '').lower()
-                logger.info(f"[BriefService] Checking email from: {sender}")
+                subject = msg.get('subject', '').lower()
                 
-                # Skip promotional emails
-                is_promo = any(pattern in sender for pattern in promo_patterns)
-                
-                if is_promo:
-                    logger.info(f"[BriefService] Skipping promotional email from: {sender}")
+                # Skip by sender pattern
+                if any(pattern in sender for pattern in promo_senders):
+                    logger.info(f"[BriefService] Skipping promo sender: {sender[:50]}")
                     continue
                 
-                # Snippet is the Gmail preview text
-                summary = msg.get('snippet', '')
-                
-                # Fallback if snippet is empty
-                if not summary:
-                    summary = "No preview available"
+                # Skip by subject pattern
+                if any(pattern in subject for pattern in promo_subjects):
+                    logger.info(f"[BriefService] Skipping promo subject: {subject[:50]}")
+                    continue
+                    
+                summary = msg.get('snippet', '') or 'No preview available'
                 
                 brief_emails.append({
                     "id": msg.get('id'),
@@ -253,17 +255,12 @@ class BriefService:
                     "thread_id": msg.get('threadId')
                 })
                 
-                # Limit to 10 filtered emails
                 if len(brief_emails) >= 10:
                     break
                     
-            logger.info(f"[BriefService] Filtered to {len(brief_emails)} non-promotional emails")
+            logger.info(f"[BriefService] Final: {len(brief_emails)} important emails for briefs")
             return brief_emails
             
-        except Exception as e:
-            logger.error(f"[BriefService] Error fetching emails: {e}", exc_info=True)
-            return []
-
         except Exception as e:
             logger.error(f"[BriefService] Error fetching emails: {e}", exc_info=True)
             return []

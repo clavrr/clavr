@@ -24,19 +24,30 @@ class ConfigDefaults:
     EMAIL_FOLDER_ARCHIVE = "Archive"
     EMAIL_FOLDER_PROCESSED = "Processed"
 
-    # Default promo patterns for email filtering
+    # Default promo patterns for email filtering — matches against sender address (lowercased)
     EMAIL_PROMO_PATTERNS = [
         # Newsletter platforms
-        '@substack.com', '@beehiiv.com',
-        '@convertkit.com', '@ghost.io',
-        '@interviewcake.com', 
+        '@substack.com', '@beehiiv.com', '@convertkit.com', '@ghost.io',
+        '@interviewcake.com', '@mailchimp.com', '@sendinblue.com',
+        # Medium
+        '@medium.com', 'noreply@medium.com', 'digest@medium.com',
+        # Google automated / promos
+        'workspace-noreply@google.com', 'google-workspace-alerts',
+        'googlecloud-noreply@google.com', 'ads-noreply@google.com',
+        'google-ads-noreply', 'cloud-noreply@google.com',
         # Social media
-        '@facebookmail.com', 
+        '@facebookmail.com', '@linkedin.com', '@twitter.com',
         # E-commerce / Streaming
         '@primevideo.com', '@email.amazon.com', '@netflix.com',
-        '@spotify.com', '@doordash.com', 
-        # Explicit marketing
-        'newsletter@', 'marketing@',
+        '@spotify.com', '@doordash.com', '@ubereats.com',
+        # Generic automated senders 
+        'noreply@', 'no-reply@', 'no_reply@', 'donotreply@',
+        'notifications@', 'notification@', 'alerts@', 'alert@',
+        'newsletter@', 'marketing@', 'promo@', 'promotions@',
+        'digest@', 'updates@', 'info@', 'news@', 'mailer@',
+        'support@', 'billing@', 'receipts@', 'orders@',
+        # Forum/mailing list senders
+        'forums-noreply@', 'noreply-', '-noreply@',
     ]
     
     # Agent defaults
