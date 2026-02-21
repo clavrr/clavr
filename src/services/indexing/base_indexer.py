@@ -12,6 +12,7 @@ Provides standardized:
 """
 from abc import ABC, abstractmethod
 import asyncio
+import time
 from typing import Optional, List, Dict, Any, Tuple, TYPE_CHECKING
 from datetime import datetime
 
@@ -21,6 +22,7 @@ from src.ai.rag import RAGEngine
 from src.services.indexing.parsers.base import ParsedNode
 from src.services.indexing.graph import KnowledgeGraphManager
 from src.services.indexing.hybrid_index import HybridIndexCoordinator
+from src.services.indexing.enrichment_pipeline import EnrichmentPipeline
 
 # Type checking imports to avoid circular dependencies
 if TYPE_CHECKING:
@@ -42,12 +44,19 @@ class IndexingStats:
     deleted: int = 0
     errors: int = 0
     skipped: int = 0
+    failed_items: List[Dict[str, Any]] = field(default_factory=list)
 
 @dataclass
 class IndexingResult:
     success: bool
     stats: IndexingStats
     errors: Optional[List[str]] = None
+
+# Constants for retry/backoff
+INITIAL_BACKOFF_SECONDS = 60
+MAX_BACKOFF_SECONDS = 3600  # 1 hour
+CIRCUIT_BREAKER_THRESHOLD = 10  # consecutive errors before pausing
+PROCESSING_BATCH_SIZE = 10  # items processed concurrently
 
 
 class BaseIndexer(ABC):
@@ -103,10 +112,99 @@ class BaseIndexer(ABC):
             
         self.is_running = False
         self._task: Optional[asyncio.Task] = None
+        self._consecutive_errors = 0
+        self._last_heartbeat: float = 0.0
+        self._last_stats: Optional[IndexingStats] = None
+        
+        # Persistent sync state (replaces in-memory caches)
+        self._persisted_cache: Dict[str, Any] = {}  # Loaded from CrawlerState.item_cache
+        self._state_loaded = False
+        
+        # Shared enrichment pipeline (replaces inline enrichment methods)
+        self._enrichment = EnrichmentPipeline(
+            indexer_name=self.name,
+            user_id=user_id,
+            topic_extractor=topic_extractor,
+            temporal_indexer=temporal_indexer,
+            relationship_manager=relationship_manager,
+            cross_app_correlator=cross_app_correlator,
+            graph_manager=graph_manager,
+        )
         
         # Use centralized constant for sync interval
         from src.services.service_constants import ServiceConstants
         self.sync_interval = ServiceConstants.SYNC_INTERVAL_DEFAULT
+    
+    async def load_crawler_state(self) -> Dict[str, Any]:
+        """
+        Load persisted sync state from CrawlerState table.
+        Returns the item_cache dict (item_id → update_timestamp).
+        """
+        try:
+            from src.database import get_async_db_context
+            from src.database.models import CrawlerState
+            from sqlalchemy import select
+            
+            async with get_async_db_context() as db:
+                result = await db.execute(
+                    select(CrawlerState).where(
+                        CrawlerState.user_id == self.user_id,
+                        CrawlerState.crawler_name == self.name
+                    )
+                )
+                state = result.scalar_one_or_none()
+                
+                if state:
+                    self._persisted_cache = state.item_cache or {}
+                    self._state_loaded = True
+                    logger.debug(
+                        f"[{self.name}] Loaded {len(self._persisted_cache)} cached items from DB"
+                    )
+                    return self._persisted_cache
+                    
+        except Exception as e:
+            logger.debug(f"[{self.name}] Could not load crawler state: {e}")
+        
+        self._state_loaded = True
+        return {}
+    
+    async def save_crawler_state(self, items_processed: int = 0):
+        """
+        Persist current sync state to CrawlerState table.
+        Called automatically after each sync cycle.
+        """
+        try:
+            from src.database import get_async_db_context
+            from src.database.models import CrawlerState
+            from sqlalchemy import select
+            
+            async with get_async_db_context() as db:
+                result = await db.execute(
+                    select(CrawlerState).where(
+                        CrawlerState.user_id == self.user_id,
+                        CrawlerState.crawler_name == self.name
+                    )
+                )
+                state = result.scalar_one_or_none()
+                
+                if state:
+                    state.item_cache = self._persisted_cache
+                    state.last_sync_time = datetime.utcnow()
+                    state.items_processed = (state.items_processed or 0) + items_processed
+                else:
+                    state = CrawlerState(
+                        user_id=self.user_id,
+                        crawler_name=self.name,
+                        item_cache=self._persisted_cache,
+                        last_sync_time=datetime.utcnow(),
+                        items_processed=items_processed,
+                    )
+                    db.add(state)
+                
+                await db.commit()
+                
+        except Exception as e:
+            logger.debug(f"[{self.name}] Could not save crawler state: {e}")
         
     @property
     @abstractmethod
@@ -142,13 +240,29 @@ class BaseIndexer(ABC):
                 pass
         logger.info(f"[{self.name}] Indexer stopped")
         
+    def is_healthy(self) -> bool:
+        """Check if the indexer loop is alive and responsive."""
+        if not self.is_running:
+            return False
+        if self._last_heartbeat == 0.0:
+            return True  # Not started yet
+        return (time.time() - self._last_heartbeat) < self.sync_interval * 2
+
     async def _run_loop(self):
-        """Main loop that calls sync methods periodically"""
+        """Main loop that calls sync methods periodically with exponential backoff."""
         while self.is_running:
             try:
+                self._last_heartbeat = time.time()
                 logger.debug(f"[{self.name}] Starting sync cycle")
-                count = await self.run_sync_cycle()
-                logger.debug(f"[{self.name}] Sync cycle complete. Indexed {count} items.")
+                result = await self.run_sync_cycle()
+                self._last_stats = result.stats
+                logger.debug(
+                    f"[{self.name}] Sync cycle complete. "
+                    f"created={result.stats.created} errors={result.stats.errors} skipped={result.stats.skipped}"
+                )
+                
+                # Reset consecutive errors on success
+                self._consecutive_errors = 0
                 
                 # Wait for next cycle
                 await asyncio.sleep(self.sync_interval)
@@ -156,80 +270,201 @@ class BaseIndexer(ABC):
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                logger.error(f"[{self.name}] Error in sync loop: {e}", exc_info=True)
-                await asyncio.sleep(60) # Backoff on error
+                self._consecutive_errors += 1
+                backoff = min(
+                    INITIAL_BACKOFF_SECONDS * (2 ** (self._consecutive_errors - 1)),
+                    MAX_BACKOFF_SECONDS
+                )
+                logger.error(
+                    f"[{self.name}] Error in sync loop (attempt {self._consecutive_errors}): {e}",
+                    exc_info=True
+                )
                 
-    async def run_sync_cycle(self) -> int:
+                # Circuit breaker: pause indexer after too many consecutive failures
+                if self._consecutive_errors >= CIRCUIT_BREAKER_THRESHOLD:
+                    logger.error(
+                        f"[{self.name}] Circuit breaker tripped after {self._consecutive_errors} "
+                        f"consecutive failures. Pausing indexer for user {self.user_id}."
+                    )
+                    self.is_running = False
+                    return
+                
+                await asyncio.sleep(backoff)
+                
+    async def _process_single_item(self, item: Any) -> Tuple[List[ParsedNode], Optional[str]]:
         """
-        Execute one full sync cycle: fetch -> transform -> index
-        Returns number of items indexed.
+        Process a single item: transform -> dedup check -> index -> enrich.
+        Returns (indexed_nodes, error_message_or_None).
         """
         try:
+            # Transform to standardized node(s)
+            result = await self.transform_item(item)
+            if not result:
+                return [], None
+                
+            nodes = result if isinstance(result, list) else [result]
+            if not nodes:
+                return [], None
+            
+            # Content hash dedup: skip duplicate content from different sources
+            if self.graph_manager:
+                import hashlib
+                deduped_nodes = []
+                for node in nodes:
+                    if node.searchable_text and len(node.searchable_text) > 50:
+                        content_hash = hashlib.sha256(
+                            node.searchable_text[:500].encode()
+                        ).hexdigest()[:16]
+                        
+                        # Store hash in node properties for future lookups
+                        node.properties['_content_hash'] = content_hash
+                        
+                        # Quick check: does a node with this hash already exist?
+                        try:
+                            existing = await self.graph_manager.execute_query(
+                                """
+                                FOR n IN @@collection
+                                    FILTER n._content_hash == @hash
+                                    FILTER n.user_id == @user_id
+                                    LIMIT 1
+                                    RETURN n._id
+                                """,
+                                {
+                                    '@collection': node.node_type if isinstance(node.node_type, str) else node.node_type.value,
+                                    'hash': content_hash,
+                                    'user_id': self.user_id,
+                                }
+                            )
+                            if existing:
+                                logger.debug(
+                                    f"[{self.name}] Skipping duplicate content (hash={content_hash[:8]})"
+                                )
+                                continue
+                        except Exception:
+                            pass  # On query error, proceed with indexing
+                    
+                    deduped_nodes.append(node)
+                
+                nodes = deduped_nodes
+                if not nodes:
+                    return [], None
+                
+            # Index into Graph + Vector
+            if self.hybrid_index:
+                success, _ = await self.hybrid_index.index_batch(nodes)
+                if not success:
+                    return [], f"hybrid_index.index_batch failed"
+                    
+                # Run shared enrichment pipeline
+                await self._enrichment.enrich_nodes(nodes)
+                
+                return nodes, None
+                
+            elif self.rag_engine:
+                for node in nodes:
+                    await self._index_vector_only(node)
+                return nodes, None
+            else:
+                return [], "No index target (hybrid_index or rag_engine)"
+                
+        except Exception as e:
+            item_id = item.get('id', 'unknown') if isinstance(item, dict) else 'unknown'
+            return [], f"Item {item_id}: {e}"
+
+    async def run_sync_cycle(self) -> IndexingResult:
+        """
+        Execute one full sync cycle: fetch -> transform -> index.
+        
+        Items are processed in concurrent batches for throughput.
+        Returns IndexingResult with stats and error details.
+        """
+        stats = IndexingStats()
+        
+        try:
+            # 0. Load persisted sync state if not yet loaded
+            if not self._state_loaded:
+                await self.load_crawler_state()
+            
             # 1. Fetch new data
             items = await self.fetch_delta()
             if not items:
-                return 0
-                
-            indexed_count = 0
+                return IndexingResult(success=True, stats=stats)
             
-            # 2. Process each item
-            for item in items:
-                try:
-                    # Transform to standardized node(s)
-                    result = await self.transform_item(item)
-                    if not result:
+            all_indexed_nodes: List[ParsedNode] = []
+            
+            # 2. Process items in concurrent batches
+            for batch_start in range(0, len(items), PROCESSING_BATCH_SIZE):
+                batch = items[batch_start:batch_start + PROCESSING_BATCH_SIZE]
+                
+                results = await asyncio.gather(
+                    *[self._process_single_item(item) for item in batch],
+                    return_exceptions=True
+                )
+                
+                for i, result in enumerate(results):
+                    if isinstance(result, Exception):
+                        stats.errors += 1
+                        error_msg = f"Batch exception: {result}"
+                        stats.failed_items.append({"batch_index": batch_start + i, "error": error_msg})
+                        logger.warning(f"[{self.name}] {error_msg}")
                         continue
-                        
-                    # Handle both single node and list of nodes
-                    if isinstance(result, list):
-                        nodes = result
-                    else:
-                        nodes = [result]
-                        
-                    if not nodes:
-                        continue
-                        
-                    # Index into Graph + Vector
-                    if self.hybrid_index:
-                        # Graph Mode
-                        success, _ = await self.hybrid_index.index_batch(nodes)
-                        if success:
-                            indexed_count += len(nodes)
-                            # Extract topics from indexed content
-                            await self._extract_topics_for_nodes(nodes)
-                            # Link to TimeBlocks for temporal queries
-                            await self._link_temporal_for_nodes(nodes)
-                            # Reinforce relationship strengths
-                            await self._reinforce_relationships_for_nodes(nodes)
-                            # Cross-app correlation (find related content across apps)
-                            await self._correlate_across_apps(nodes)
-                            # Create pending relationships (OWNER_OF, STORED_IN, etc.)
-                            await self._create_pending_relationships_for_nodes(nodes)
-                            
-                            # Event-Driven Intelligence (P1)
-                            for node in nodes:
-                                # 1. Resolve immediately (link Persons instantly)
-                                if self.entity_resolver:
-                                    await self.entity_resolver.resolve_immediately(node)
-                                    
-                                # 2. Generate immediate insights (conflicts, urgent items)
-                                if self.observer_service:
-                                    await self.observer_service.generate_immediate_insight(node)
-                    elif self.rag_engine:
-                        # Vector Only Fallback
-                        for node in nodes:
-                            await self._index_vector_only(node)
-                            indexed_count += 1
-                        
-                except Exception as e:
-                    logger.warning(f"[{self.name}] Failed to process item: {e}")
-                    continue
                     
-            return indexed_count
+                    nodes, error = result
+                    if error:
+                        stats.errors += 1
+                        stats.failed_items.append({"batch_index": batch_start + i, "error": error})
+                        logger.warning(f"[{self.name}] Failed to process item: {error}")
+                    elif nodes:
+                        stats.created += len(nodes)
+                        all_indexed_nodes.extend(nodes)
+                    else:
+                        stats.skipped += 1
+            
+            # 3. Batch event-driven intelligence across ALL indexed nodes
+            if all_indexed_nodes:
+                await self._batch_event_driven_intelligence(all_indexed_nodes)
+            
+            # 4. Log high failure rates as errors
+            if items and stats.errors > len(items) * 0.3:
+                logger.error(
+                    f"[{self.name}] HIGH FAILURE RATE: {stats.errors}/{len(items)} items failed. "
+                    f"First errors: {stats.failed_items[:3]}"
+                )
+            
+            # 5. Persist sync state after successful processing
+            if stats.created > 0:
+                await self.save_crawler_state(items_processed=stats.created)
+            
+            return IndexingResult(
+                success=stats.errors == 0,
+                stats=stats,
+                errors=[fi['error'] for fi in stats.failed_items] if stats.failed_items else None
+            )
             
         except Exception as e:
             logger.error(f"[{self.name}] Sync cycle failed: {e}")
-            return 0
+            stats.errors += 1
+            return IndexingResult(success=False, stats=stats, errors=[str(e)])
+
+    async def _batch_event_driven_intelligence(self, nodes: List[ParsedNode]):
+        """
+        Run entity resolution and observer insights in parallel batches
+        instead of per-node sequential calls.
+        """
+        tasks = []
+        for node in nodes:
+            if self.entity_resolver:
+                tasks.append(self.entity_resolver.resolve_immediately(node))
+            if self.observer_service:
+                tasks.append(self.observer_service.generate_immediate_insight(node))
+        
+        if tasks:
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            errors = [r for r in results if isinstance(r, Exception)]
+            if errors:
+                logger.debug(
+                    f"[{self.name}] {len(errors)}/{len(tasks)} event-driven intelligence tasks failed"
+                )
             
     async def _index_vector_only(self, node: ParsedNode):
         """Fallback for when graph is not enabled"""
@@ -239,8 +474,12 @@ class BaseIndexer(ABC):
         metadata = node.properties.copy()
         metadata['node_id'] = node.node_id
         metadata['node_type'] = node.node_type
-        # Add graph bridge ID
+        # Add graph bridge ID (H1: ensures bridge works in fallback path)
         metadata['graph_node_id'] = node.node_id 
+        # Add doc_type and source for metadata filtering (V2 compatibility)
+        metadata['doc_type'] = metadata.get('doc_type', node.node_type.lower() if isinstance(node.node_type, str) else node.node_type)
+        metadata['source'] = metadata.get('source', self.name)
+        metadata['user_id'] = metadata.get('user_id', self.user_id)
         
         await asyncio.to_thread(
             self.rag_engine.index_document,
@@ -248,221 +487,6 @@ class BaseIndexer(ABC):
             node.searchable_text,
             metadata
         )
-
-    async def _extract_topics_for_nodes(self, nodes: List[ParsedNode]):
-        """
-        Extract topics from indexed nodes using TopicExtractor.
-        
-        Only processes content-bearing nodes (Email, Message, Document, CalendarEvent, ActionItem).
-        Topic extraction is non-blocking - failures don't affect indexing.
-        """
-        if not self.topic_extractor:
-            return
-            
-        # Node types that contain meaningful content for topic extraction
-        # Must match NodeType enum values in schema.py
-        content_types = {
-            'Email', 
-            'Message', 
-            'Document', 
-            'CalendarEvent',
-            'ActionItem',
-            'Project', 
-            'Conversation',
-            'BlogPost'
-        }
-        
-        for node in nodes:
-            try:
-                # Skip non-content nodes (Contacts, Actions, etc.)
-                if node.node_type not in content_types:
-                    continue
-                    
-                # Need searchable text for topic extraction
-                if not node.searchable_text or len(node.searchable_text) < 50:
-                    continue
-                    
-                # Extract topics (non-blocking)
-                await self.topic_extractor.extract_topics(
-                    content=node.searchable_text,
-                    source=self.name,
-                    source_node_id=node.node_id,
-                    user_id=self.user_id
-                )
-            except Exception as e:
-                # Topic extraction failure should not block indexing
-                logger.debug(f"[{self.name}] Topic extraction failed for {node.node_id}: {e}")
-
-    async def _link_temporal_for_nodes(self, nodes: List[ParsedNode]):
-        """
-        Link nodes to TimeBlock nodes for temporal queries.
-        
-        Enables queries like "What happened last week?" by creating
-        OCCURRED_DURING relationships between content nodes and TimeBlocks.
-        """
-        if not self.temporal_indexer:
-            return
-            
-        for node in nodes:
-            try:
-                # Get timestamp from node properties
-                timestamp_str = node.properties.get('timestamp') or node.properties.get('created_at') or node.properties.get('date')
-                if not timestamp_str:
-                    continue
-                
-                # Parse timestamp
-                if isinstance(timestamp_str, str):
-                    from datetime import datetime
-                    try:
-                        # Try ISO format first
-                        timestamp = datetime.fromisoformat(timestamp_str.replace('Z', '+00:00'))
-                    except ValueError:
-                        # Try other common formats
-                        try:
-                            timestamp = datetime.strptime(timestamp_str, "%Y-%m-%d %H:%M:%S")
-                        except ValueError:
-                            continue
-                else:
-                    timestamp = timestamp_str
-                
-                # Link to Day granularity TimeBlock
-                await self.temporal_indexer.link_event_to_timeblock(
-                    event_id=node.node_id,
-                    timestamp=timestamp,
-                    granularity="day",
-                    user_id=self.user_id
-                )
-                
-            except Exception as e:
-                # Temporal linking failure should not block indexing
-                logger.debug(f"[{self.name}] Temporal linking failed for {node.node_id}: {e}")
-
-    async def _reinforce_relationships_for_nodes(self, nodes: List[ParsedNode]):
-        """
-        Reinforce relationship strengths for nodes with relationships.
-        
-        This enables intelligent ranking of search results by connection strength.
-        Strong relationships (frequent interactions) are prioritized in queries.
-        """
-        if not self.relationship_manager:
-            return
-            
-        for node in nodes:
-            try:
-                # Get relationships from the node
-                relationships = getattr(node, 'relationships', [])
-                if not relationships:
-                    continue
-                    
-                for rel in relationships:
-                    # Reinforce each relationship
-                    await self.relationship_manager.reinforce_relationship(
-                        from_id=rel.from_node,
-                        to_id=rel.to_node,
-                        rel_type=rel.rel_type,
-                        interaction_weight=1.0  # Default weight, can be customized
-                    )
-                    
-            except Exception as e:
-                # Relationship reinforcement failure should not block indexing
-                logger.debug(f"[{self.name}] Relationship reinforcement failed for {node.node_id}: {e}")
-
-    async def _correlate_across_apps(self, nodes: List[ParsedNode]):
-        """
-        Find and create cross-app correlations for indexed nodes.
-        
-        Uses semantic similarity to discover related content from other apps
-        and creates RELATED_TO relationships in the graph.
-        
-        This enables "Show me everything about X" queries to aggregate
-        related content from email, Slack, Notion, calendar, etc.
-        """
-        if not self.cross_app_correlator:
-            return
-            
-        for node in nodes:
-            try:
-                # Find and create correlations (non-blocking)
-                await self.cross_app_correlator.correlate_on_index(node)
-            except Exception as e:
-                # Correlation failure should not block indexing
-                logger.debug(f"[{self.name}] Cross-app correlation failed for {node.node_id}: {e}")
-
-    async def _create_pending_relationships_for_nodes(self, nodes: List[ParsedNode]):
-        """
-        Create pending relationships that were scheduled during transform.
-        
-        This handles:
-        - Person -[OWNER_OF]-> Document (creates Person node if needed)
-        - Document -[STORED_IN]-> Folder
-        - Folder -[STORED_IN]-> Folder (nested folders)
-        
-        Relationships are stored in node._pending_relationships by the crawler.
-        """
-        if not self.graph_manager:
-            return
-            
-        from src.services.indexing.graph.schema import NodeType, RelationType
-        
-        for node in nodes:
-            try:
-                # Get pending relationships from the node (set by transform_item)
-                pending_rels = getattr(node, '_pending_relationships', [])
-                if not pending_rels:
-                    continue
-                    
-                for rel_data in pending_rels:
-                    try:
-                        from_id = rel_data.get('from_id')
-                        to_id = rel_data.get('to_id')
-                        rel_type = rel_data.get('rel_type')
-                        properties = rel_data.get('properties', {})
-                        
-                        # Check if we need to create the "from" node first (e.g., Person)
-                        create_from = rel_data.get('_create_from_node')
-                        if create_from:
-                            # Check if Person node exists; create if not
-                            existing = await self.graph_manager.get_node(create_from['node_id'])
-                            if not existing:
-                                await self.graph_manager.add_node(
-                                    node_id=create_from['node_id'],
-                                    node_type=create_from['node_type'],
-                                    properties=create_from['properties']
-                                )
-                                logger.debug(f"[{self.name}] Created {create_from['node_type']} node: {create_from['node_id']}")
-
-                        
-                        # Check if target node exists (for STORED_IN relationships)
-                        # Folder nodes might not exist yet if processed in wrong order
-                        if rel_type == RelationType.STORED_IN:
-                            target_exists = await self.graph_manager.get_node(to_id)
-
-                            if not target_exists:
-                                # Create a placeholder Folder node
-                                # Real folder data will update it when folder is processed
-                                folder_id = to_id.replace('folder_', '')
-                                await self.graph_manager.add_node(
-                                    node_id=to_id,
-                                    node_type=NodeType.FOLDER,
-                                    properties={"name": "Unknown Folder", "folder_id": folder_id}
-                                )
-                                logger.debug(f"[{self.name}] Created placeholder Folder: {to_id}")
-                        
-                        # Create the relationship
-                        await self.graph_manager.add_relationship(
-                            from_node=from_id,
-                            to_node=to_id,
-                            rel_type=rel_type,
-                            properties=properties
-                        )
-                        logger.debug(f"[{self.name}] Created {rel_type} relationship: {from_id} -> {to_id}")
-                        
-                    except Exception as rel_error:
-                        logger.debug(f"[{self.name}] Failed to create relationship: {rel_error}")
-                        
-            except Exception as e:
-                # Relationship creation failure should not block indexing
-                logger.debug(f"[{self.name}] Pending relationship creation failed for {node.node_id}: {e}")
 
     @abstractmethod
     async def fetch_delta(self) -> List[Any]:

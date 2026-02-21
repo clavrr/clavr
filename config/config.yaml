@@ -130,6 +130,7 @@ filters:
 # Speech-to-Text and Text-to-Speech settings for voice interactions
 voice:
   enabled: true  # Enable/disable voice features
+  model: "${VOICE_AI_MODEL:-gemini-2.5-flash-native-audio-preview-12-2025}"  # Google AI Live native audio model
   
   # Speech-to-Text (STT) Configuration
   stt:

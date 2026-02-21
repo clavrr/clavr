@@ -80,6 +80,17 @@ class GraphSearchService:
         
         logger.info(f"GraphSearchService initialized (default_user={user_id})")
     
+    # Graph-first patterns: queries better answered by graph traversal than vector similarity (G4)
+    GRAPH_FIRST_PATTERNS = [
+        r'who\s+did\s+I\s+(meet|talk|email|chat|message)',      # Relationship queries
+        r'(emails?|messages?)\s+(from|to|with|by)\s+',           # Entity-scoped
+        r'(contacts?|people)\s+(at|from|in|who)\s+',             # Company/org queries
+        r'(tasks?|issues?)\s+(assigned\s+to|created\s+by)\s+',   # Assignment queries
+        r'(meetings?|events?)\s+(with|about|for)\s+',            # Calendar queries
+        r'what\s+do\s+I\s+know\s+about\s+',                      # Entity lookup
+        r'(show|list|find)\s+(all\s+)?(my\s+)?(contacts?|people|meetings?)',  # Enumeration
+    ]
+
     async def search(
         self,
         query: str,
@@ -89,7 +100,10 @@ class GraphSearchService:
         max_results: int = 10
     ) -> Dict[str, Any]:
         """
-        Intelligent search combining graph and vector
+        Intelligent search combining graph and vector.
+        
+        G4 improvement: Detects entity/relationship queries and routes them
+        directly to graph traversal instead of vector search first.
         
         Args:
             query: Natural language query
@@ -101,6 +115,8 @@ class GraphSearchService:
         Returns:
             Combined search results with sources
         """
+        import re
+        
         # Resolve user_id: Method arg > Instance attr
         effective_user_id = user_id if user_id is not None else self.user_id
         if effective_user_id is None:
@@ -112,12 +128,21 @@ class GraphSearchService:
             # Add user filter
             filters = {'user_id': str(effective_user_id)}
             
+            # G4: Graph-first routing for entity/relationship queries
+            is_graph_first = use_graph and any(
+                re.search(p, query, re.IGNORECASE)
+                for p in self.GRAPH_FIRST_PATTERNS
+            )
+            
+            if is_graph_first:
+                logger.info(f"Graph-first routing for query: '{query}'")
+            
             # Execute hybrid query
             results = await self.hybrid.query(
                 text_query=query,
                 use_graph=use_graph,
                 use_vector=use_vector,
-                graph_depth=2,
+                graph_depth=3 if is_graph_first else 2,  # Deeper traversal for graph-first
                 vector_limit=max_results,
                 filters=filters
             )
@@ -127,9 +152,12 @@ class GraphSearchService:
                 analysis = await self._run_graphrag_analysis(query, results)
                 results['graphrag_analysis'] = analysis
             
+            results['graph_first'] = is_graph_first
+            
             logger.info(
                 f"Found {len(results.get('vector_results', []))} vector results, "
                 f"{len(results.get('graph_results', []))} graph results"
+                f"{' (graph-first)' if is_graph_first else ''}"
             )
             
             return results

@@ -63,72 +63,202 @@ class CalendarTool(WorkflowEventMixin, BaseTool):
         self._service = None
         self._date_parser = FlexibleDateParser(config)
         
-    def _resolve_attendees_sync(self, attendees: List[str]) -> List[str]:
-        """Resolve attendee names to emails using Graph (Sync wrapper)"""
+    def _resolve_attendees_sync(self, attendees: List[str]) -> tuple:
+        """Resolve attendee names to emails using People API + Gmail fallback.
+        
+        Resolution chain (per attendee):
+        1. Already an email → validate against blocklist
+        2. Google People API searchContacts → uses self.credentials
+        3. Gmail header search → searches From/To/Cc headers
+        
+        Returns:
+            Tuple of (resolved_emails: List[str], unresolved_names: List[str])
+        """
         if not attendees:
-            return []
-            
-        try:
-            from ...services.indexing.graph.manager import KnowledgeGraphManager
-            
-            async def _resolve_async():
-                graph = KnowledgeGraphManager()
-                resolved_list = []
+            return ([], [])
+        
+        resolved_list = []
+        unresolved_list = []
+        
+        for att in attendees:
+            if not att or not isinstance(att, str):
+                continue
                 
-                for att in attendees:
-                    # 1. Check if valid email / Blocklist
-                    if "@" in att:
-                        # Block list
-                        email_lower = att.lower()
-                        if any(b in email_lower for b in ['noreply', 'no-reply', 'notifications', 'alert', 'bounce', 'support']):
-                            logger.warning(f"[CalendarTool] Dropping system email: {att}")
-                            continue
-                        resolved_list.append(att)
-                        continue
+            att = att.strip()
+            
+            # 1. Already an email address
+            if "@" in att:
+                email_lower = att.lower()
+                if any(b in email_lower for b in ['noreply', 'no-reply', 'notifications', 'alert', 'bounce', 'support']):
+                    logger.warning(f"[CalendarTool] Dropping system email: {att}")
+                    continue
+                resolved_list.append(att)
+                continue
+            
+            # 2. People API (uses self.credentials directly)
+            resolved_email = self._resolve_name_via_people_api(att)
+            if resolved_email:
+                resolved_list.append(resolved_email)
+                continue
+            
+            # 3. Gmail header search
+            resolved_email = self._resolve_name_via_gmail(att)
+            if resolved_email:
+                resolved_list.append(resolved_email)
+                continue
+            
+            logger.warning(f"[CalendarTool] Could not resolve attendee '{att}' to email. Tracking as unresolved.")
+            unresolved_list.append(att)
+        
+        return (resolved_list, unresolved_list)
+    
+    def _resolve_name_via_people_api(self, name: str) -> Optional[str]:
+        """Resolve a name to email using Google People API.
+        
+        This mirrors Google Calendar's own autocomplete behavior.
+        Searches both 'My Contacts' and 'Other Contacts'.
+        """
+        if not self.credentials:
+            logger.warning(f"[CalendarTool] No credentials for People API resolution of '{name}'")
+            return None
+        
+        try:
+            from googleapiclient.discovery import build
+            
+            people_service = build('people', 'v1', credentials=self.credentials, cache_discovery=False)
+            
+            # Strategy A: searchContacts (My Contacts) — requires contacts.readonly
+            try:
+                result = people_service.people().searchContacts(
+                    query=name,
+                    readMask='emailAddresses,names',
+                    pageSize=5
+                ).execute()
+                
+                for contact in result.get('results', []):
+                    person = contact.get('person', {})
+                    emails = person.get('emailAddresses', [])
+                    if emails:
+                        email = emails[0].get('value')
+                        if email and '@' in email:
+                            logger.info(f"[CalendarTool] People API (My Contacts) resolved '{name}' → '{email}'")
+                            return email
+            except Exception as e:
+                logger.info(f"[CalendarTool] searchContacts failed for '{name}': {e}")
+            
+            # Strategy B: otherContacts.search (Other Contacts) — requires contacts.other.readonly
+            try:
+                result = people_service.otherContacts().search(
+                    query=name,
+                    readMask='emailAddresses,names',
+                    pageSize=5
+                ).execute()
+                
+                for contact in result.get('results', []):
+                    person = contact.get('person', {})
+                    emails = person.get('emailAddresses', [])
+                    if emails:
+                        email = emails[0].get('value')
+                        if email and '@' in email:
+                            logger.info(f"[CalendarTool] People API (Other Contacts) resolved '{name}' → '{email}'")
+                            return email
+            except Exception as e:
+                logger.info(f"[CalendarTool] otherContacts.search failed for '{name}': {e}")
+            
+            # Strategy C: List all connections and filter (slower fallback)
+            try:
+                result = people_service.people().connections().list(
+                    resourceName='people/me',
+                    pageSize=100,
+                    personFields='names,emailAddresses'
+                ).execute()
+                
+                name_lower = name.lower()
+                for connection in result.get('connections', []):
+                    names = connection.get('names', [])
+                    for n in names:
+                        display = n.get('displayName', '').lower()
+                        given = n.get('givenName', '').lower()
+                        family = n.get('familyName', '').lower()
                         
-                    # 2. Graph Search
-                    try:
-                        name_lower = att.lower().strip()
-                        aql = """
-                            LET contacts = (
-                                FOR c IN Contact
-                                    LET name_lower = LOWER(c.name)
-                                    LET email_lower = LOWER(c.email)
-                                    FILTER CONTAINS(name_lower, @name) OR CONTAINS(email_lower, @name)
-                                    RETURN {name: c.name, email: c.email}
-                            )
-                            LET people = (
-                                FOR p IN Person
-                                    LET name_lower = LOWER(p.name)
-                                    LET email_lower = LOWER(p.email)
-                                    FILTER (CONTAINS(name_lower, @name) OR CONTAINS(email_lower, @name)) AND p.email != null AND p.email != ""
-                                    RETURN {name: p.name, email: p.email}
-                            )
-                            FOR r IN UNION(contacts, people)
-                                FILTER r.email != null
-                                FILTER NOT CONTAINS(LOWER(r.email), 'noreply')
-                                FILTER NOT CONTAINS(LOWER(r.email), 'no-reply')
-                                FILTER NOT CONTAINS(LOWER(r.email), 'notifications')
-                                SORT r.name ASC 
-                                LIMIT 1 
-                                RETURN DISTINCT r.email
-                        """
-                        results = await graph.execute_query(aql, {'name': name_lower})
-                        if results:
-                            logger.info(f"[CalendarTool] Resolved '{att}' -> '{results[0]}'")
-                            resolved_list.append(results[0])
-                        else:
-                            logger.warning(f"[CalendarTool] Could not resolve attendee: {att}")
-                    except Exception as e:
-                        logger.warning(f"[CalendarTool] Resolution error for {att}: {e}")
-                        
-                return resolved_list
-
-            return asyncio.run(_resolve_async())
+                        if name_lower in display or name_lower == given or name_lower == family:
+                            emails = connection.get('emailAddresses', [])
+                            if emails:
+                                email = emails[0].get('value')
+                                if email and '@' in email:
+                                    logger.info(f"[CalendarTool] People API (connections list) resolved '{name}' → '{email}'")
+                                    return email
+            except Exception as e:
+                logger.info(f"[CalendarTool] connections.list failed for '{name}': {e}")
+            
+            logger.info(f"[CalendarTool] People API found no match for '{name}'")
+            return None
+            
+        except ImportError:
+            logger.warning("[CalendarTool] googleapiclient not available for People API")
+            return None
+        except Exception as e:
+            logger.warning(f"[CalendarTool] People API resolution error for '{name}': {e}")
+            return None
+    
+    def _resolve_name_via_gmail(self, name: str) -> Optional[str]:
+        """Resolve a name to email by searching Gmail message headers."""
+        if not self.credentials:
+            return None
+        
+        try:
+            from googleapiclient.discovery import build
+            import re as _re
+            
+            gmail_service = build('gmail', 'v1', credentials=self.credentials, cache_discovery=False)
+            
+            search_query = f"from:{name} OR to:{name}"
+            result = gmail_service.users().messages().list(
+                userId='me',
+                q=search_query,
+                maxResults=5
+            ).execute()
+            
+            messages = result.get('messages', [])
+            if not messages:
+                logger.info(f"[CalendarTool] Gmail search found no messages for '{name}'")
+                return None
+            
+            # Get headers from the first message
+            msg = gmail_service.users().messages().get(
+                userId='me',
+                id=messages[0]['id'],
+                format='metadata',
+                metadataHeaders=['From', 'To', 'Cc']
+            ).execute()
+            
+            headers = msg.get('payload', {}).get('headers', [])
+            name_lower = name.lower()
+            
+            for header in headers:
+                header_value = header.get('value', '')
+                if name_lower in header_value.lower():
+                    # Extract email from "Name <email@domain.com>" format
+                    email_match = _re.search(r'<([^>]+@[^>]+)>', header_value)
+                    if email_match:
+                        email = email_match.group(1)
+                        if not any(b in email.lower() for b in ['noreply', 'no-reply', 'notifications']):
+                            logger.info(f"[CalendarTool] Gmail resolved '{name}' → '{email}'")
+                            return email
+                    
+                    # Plain email format
+                    email_match = _re.search(r'[\w.+-]+@[\w.-]+\.\w{2,}', header_value)
+                    if email_match:
+                        email = email_match.group(0)
+                        if not any(b in email.lower() for b in ['noreply', 'no-reply', 'notifications']):
+                            logger.info(f"[CalendarTool] Gmail resolved '{name}' → '{email}'")
+                            return email
+            
+            return None
             
         except Exception as e:
-            logger.error(f"[CalendarTool] Sync resolution failed: {e}")
-            return attendees # Fallback to original
+            logger.info(f"[CalendarTool] Gmail resolution failed for '{name}': {e}")
+            return None
 
     
     def _initialize_service(self):
@@ -409,6 +539,7 @@ class CalendarTool(WorkflowEventMixin, BaseTool):
                             kwargs['attendees'].extend(extracted_names)
 
                 try:
+                    resolved_emails, tool_unresolved = self._resolve_attendees_sync(kwargs.get('attendees'))
                     result = self._service.create_event(
                         title=title,
                         start_time=start_time,
@@ -416,14 +547,18 @@ class CalendarTool(WorkflowEventMixin, BaseTool):
                         duration_minutes=duration_minutes or kwargs.get('duration_minutes'),
                         description=kwargs.get('description'),
                         location=kwargs.get('location'),
-                        attendees=self._resolve_attendees_sync(kwargs.get('attendees')),
+                        attendees=resolved_emails,
                         recurrence=kwargs.get('recurrence'),
                         check_conflicts=kwargs.get('check_conflicts', True)  # Default to True for conflict detection
                     )
                     
                     if result:
                         summary = result.get('summary', title)
-                        return f"You're all set! I've scheduled '{summary}' for {start_time}. See you there!"
+                        msg = f"You're all set! I've scheduled '{summary}' for {start_time}. See you there!"
+                        if tool_unresolved:
+                            names = ', '.join(tool_unresolved)
+                            msg += f" (Note: couldn't resolve {names} to email — they weren't added as attendees.)"
+                        return msg
                 except Exception as e:
                     error_msg = str(e)
                     # Check for "phantom" conflicts (identical event already exists)
@@ -697,8 +832,8 @@ class CalendarTool(WorkflowEventMixin, BaseTool):
                 free_slots = self._service.find_free_time(
                     duration_minutes=duration,
                     max_suggestions=5,
-                    start_datetime=start_search if isinstance(start_search, datetime) else None,
-                    end_datetime=end_search if isinstance(end_search, datetime) else None,
+                    start_date=start_search,
+                    end_date=end_search,
                     working_hours_only=kwargs.get('working_hours_only', True)
                 )
                 
@@ -723,74 +858,95 @@ class CalendarTool(WorkflowEventMixin, BaseTool):
         except Exception as e:
             # Handle specific conflict exception cleanly without scary traceback
             if SchedulingConflictException and isinstance(e, SchedulingConflictException):
-                logger.warning(f"Calendar scheduling conflict: {e}")
+                logger.info(f"[CalendarTool] Conflict detected, attempting auto-reschedule: {e}")
                 if workflow_emitter:
-                     # For conflicts, we treat it as an error state for the workflow but with a clean message
-                     self.emit_action_event(workflow_emitter, 'error', str(e), action=action, error=str(e))
+                     self.emit_action_event(workflow_emitter, 'info', 'Conflict detected, finding alternative time...', action=action)
                 
-                # Extract conflict details to be specific
+                # Extract conflict details
                 details = getattr(e, 'details', {})
                 conflicts = details.get('conflicting_events', [])
                 suggestions = details.get('suggestions', [])
                 conflict_titles = [c.get('summary', 'Busy') for c in conflicts]
-                conflict_str = ", ".join(conflict_titles)
+                conflict_str = ", ".join(conflict_titles) if conflict_titles else "an existing event"
+
+                # If no suggestions from the exception, find them ourselves
+                if not suggestions and self._service:
+                    try:
+                        duration = kwargs.get('duration_minutes', 60)
+                        suggestions = self._service.find_free_time(
+                            duration_minutes=duration,
+                            max_suggestions=3,
+                            start_date=kwargs.get('start_time'),
+                            working_hours_only=True
+                        ) or []
+                    except Exception as find_err:
+                        logger.debug(f"[CalendarTool] Could not find alternative times: {find_err}")
                 
-                # Format suggestions nicely for the user
-                suggestion_str = ""
+                # AUTO-RESCHEDULE: Proactively schedule at the first available slot
                 if suggestions:
+                    first_slot = suggestions[0]
+                    alt_start = first_slot.get('start', '')
+                    alt_end = first_slot.get('end', '')
+                    
+                    if alt_start:
+                        try:
+                            logger.info(f"[CalendarTool] Auto-rescheduling to {alt_start}")
+                            # Get the original event parameters
+                            alt_title = kwargs.get('title', kwargs.get('summary', 'Meeting'))
+                            alt_attendees, _ = self._resolve_attendees_sync(kwargs.get('attendees'))
+                            
+                            result = self._service.create_event(
+                                title=alt_title,
+                                start_time=alt_start,
+                                end_time=alt_end or None,
+                                duration_minutes=kwargs.get('duration_minutes'),
+                                description=kwargs.get('description'),
+                                location=kwargs.get('location'),
+                                attendees=alt_attendees,
+                                recurrence=kwargs.get('recurrence'),
+                                check_conflicts=False  # Don't re-check — we know this slot is free
+                            )
+                            
+                            if result:
+                                # Format the alternative time nicely
+                                try:
+                                    alt_dt = datetime.fromisoformat(alt_start.replace('Z', '+00:00'))
+                                    alt_time_str = alt_dt.strftime('%I:%M %p').lstrip('0')
+                                    alt_date_str = alt_dt.strftime('%A, %B %d')
+                                except Exception:
+                                    alt_time_str = alt_start
+                                    alt_date_str = ""
+                                
+                                summary = result.get('summary', alt_title)
+                                date_part = f" on {alt_date_str}" if alt_date_str else ""
+                                return (
+                                    f"Conflict with '{conflict_str}' at the original time, "
+                                    f"so I've scheduled '{summary}' for {alt_time_str}{date_part} instead."
+                                )
+                        except Exception as reschedule_err:
+                            logger.warning(f"[CalendarTool] Auto-reschedule failed: {reschedule_err}")
+                            # Fall through to manual suggestion below
+                    
+                    # Fallback: if auto-scheduling failed, list the alternatives
                     formatted_times = []
-                    for s in suggestions[:3]:  # Limit to 3 suggestions
+                    for s in suggestions[:3]:
                         try:
                             start_raw = s.get('start', '')
                             if start_raw:
                                 start_dt = datetime.fromisoformat(start_raw.replace('Z', '+00:00'))
-                                # Format nicely: "10:00 AM", "2:30 PM"
                                 formatted_times.append(start_dt.strftime('%I:%M %p').lstrip('0'))
                         except Exception:
                             formatted_times.append(start_raw[:10] if start_raw else 'Unknown')
                     
                     if formatted_times:
-                        suggestion_str = f"\n\nHere are some available times today: **{', '.join(formatted_times)}**. Would you like me to schedule it for one of these times instead?"
+                        return (
+                            f"Conflict with '{conflict_str}' at that time. "
+                            f"Available alternatives: **{', '.join(formatted_times)}**. "
+                            f"Which one works?"
+                        )
                 
-                # Build the response message
-                if conflict_titles:
-                    response = f"There's a conflict with '{conflict_str}' at that time."
-                else:
-                    response = f"That time slot is already busy."
-                
-                # Append suggestions if available
-                if suggestion_str:
-                    response += suggestion_str
-                else:
-                    # If no suggestions from service, try to find them ourselves
-                    if self._service:
-                        try:
-                            # Get duration from kwargs or default to 60 min
-                            duration = kwargs.get('duration_minutes', 60)
-                            free_slots = self._service.find_free_time(
-                                duration_minutes=duration,
-                                max_suggestions=3,
-                                working_hours_only=True
-                            )
-                            if free_slots:
-                                formatted_times = []
-                                for slot in free_slots[:3]:
-                                    try:
-                                        start_raw = slot.get('start', '')
-                                        if start_raw:
-                                            start_dt = datetime.fromisoformat(start_raw.replace('Z', '+00:00'))
-                                            formatted_times.append(start_dt.strftime('%I:%M %p').lstrip('0'))
-                                    except Exception:
-                                        pass
-                                if formatted_times:
-                                    response += f"\n\nHere are some available times: **{', '.join(formatted_times)}**. Would you like me to schedule it for one of these times instead?"
-                        except Exception as find_err:
-                            logger.debug(f"Could not find alternative times: {find_err}")
-                            response += "\n\nWould you like me to help you find another spot?"
-                    else:
-                        response += "\n\nWould you like me to help you find another spot?"
-                
-                return response
+                # No suggestions at all — ask user
+                return f"There's a conflict with '{conflict_str}' at that time. Want me to try a different day?"
             
             logger.error(f"CalendarTool error: {e}", exc_info=True)
             if workflow_emitter:

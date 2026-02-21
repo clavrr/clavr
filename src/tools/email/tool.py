@@ -332,14 +332,21 @@ class EmailTool(WorkflowEventMixin, BaseTool):
                     pass
                 elif query and ("new" in query.lower() or "unread" in query.lower()):
                     is_unread = True
-                    clean_q = query.lower().replace("emails", "").replace("email", "").replace("new", "").replace("unread", "").strip()
+                    # Comprehensive cleanup: strip ALL conversational wrapper words
+                    # Old regex only stripped 4 words, leaving "do have" in queries like
+                    # "What new emails do I have?" → Gmail searched "is:unread do have"
+                    import re as _re
+                    noise_words = r'\b(what|whats|do|does|did|i|my|me|have|has|any|are|is|there|check|list|show|get|give|tell|the|all|for|new|unread|latest|recent|emails|email|inbox|messages|please|can|you|could|would)\b'
+                    clean_q = _re.sub(noise_words, '', query.lower(), flags=_re.IGNORECASE).strip()
+                    clean_q = _re.sub(r'[?.,!]', '', clean_q).strip()
+                    clean_q = _re.sub(r'\s+', ' ', clean_q).strip()  # collapse whitespace
                     if not clean_q:
                         query = "" # Clear query so we just list unread
 
                 # VOICE OPTIMIZATION: If just checking unread/new, limit to 3 items for speed
                 limit = kwargs.get('limit', 5)
                 if is_unread and not query:
-                    limit = 3  # Reduce from 5 to 3 to save time on fetch & format
+                    limit = 5  # Show all recent unread
                 
                 # Extract specific filters from kwargs if the Agent provided them
                 from_email = kwargs.get('from') or kwargs.get('sender')
@@ -393,36 +400,45 @@ class EmailTool(WorkflowEventMixin, BaseTool):
                 # Format results conversationally
                 lines = []
                 if len(results) == 1:
-                    lines.append("I found one email:\n")
-                else:
-                    lines.append(f"I found {len(results)} emails:\n")
-
-                for i, email in enumerate(results, 1):
+                    # Single result — show FULL email content (user likely wants to read it)
+                    email = results[0]
                     sender = email.get('sender', 'Unknown')
                     if '<' in sender:
                         sender = sender.split('<')[0].strip().strip('"')
-                        
                     subj = email.get('subject', '(No Subject)')
-                    date = email.get('date', '')
-                    # Truncate snippet further for speed/TTS brevity
-                    snippet = email.get('snippet', '').strip()[:75] 
+                    body = email.get('body', '') or email.get('snippet', '')
                     
-                    lines.append(f"**{i}. {subj}**")
-                    
-                    # Simplify date logic for speed
-                    date_str = date
-                    try:
-                        from datetime import datetime
-                        if date and 'T' in date:
-                             dt = datetime.fromisoformat(date.replace('Z', '+00:00'))
-                             date_str = dt.strftime('%I:%M %p') # Just time for today hopefully
-                    except Exception as e:
-                        logger.debug(f"[EmailTool] Date parse failed for '{date}': {e}")
+                    lines.append(f"I've pulled up the email from {sender}. Here is the text:\n")
+                    lines.append(f"**{subj}**\n")
+                    lines.append(body.strip() if body.strip() else "(No content available)")
+                else:
+                    lines.append(f"I found {len(results)} emails:\n")
+
+                    for i, email in enumerate(results, 1):
+                        sender = email.get('sender', 'Unknown')
+                        if '<' in sender:
+                            sender = sender.split('<')[0].strip().strip('"')
+                            
+                        subj = email.get('subject', '(No Subject)')
+                        date = email.get('date', '')
+                        snippet = email.get('snippet', '').strip()[:150] 
                         
-                    lines.append(f"   from _{sender}_")
-                    if snippet:
-                        lines.append(f"   \"{snippet}...\"")
-                    lines.append("") # Spacer
+                        lines.append(f"**{i}. {subj}**")
+                        
+                        # Simplify date logic for speed
+                        date_str = date
+                        try:
+                            from datetime import datetime
+                            if date and 'T' in date:
+                                 dt = datetime.fromisoformat(date.replace('Z', '+00:00'))
+                                 date_str = dt.strftime('%I:%M %p') # Just time for today hopefully
+                        except Exception as e:
+                            logger.debug(f"[EmailTool] Date parse failed for '{date}': {e}")
+                            
+                        lines.append(f"   from _{sender}_")
+                        if snippet:
+                            lines.append(f"   \"{snippet}...\"")
+                        lines.append("") # Spacer
                 
                 return "\n".join(lines)
             

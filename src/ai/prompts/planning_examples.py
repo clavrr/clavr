@@ -112,20 +112,78 @@ PLANNING_EXAMPLES: List[PlanningExample] = [
             {"step": 3, "domain": "general", "query": "Book a table (Simulated)"} 
         ],
         "reasoning": "Maps -> Calendar -> Action. Booking might be general/unsupported but correctly planned."
+    },
+    # --- FOLLOW-UP REFERENCE RESOLUTION EXAMPLES ---
+    # These teach the planner to resolve pronouns/references from conversation history
+    {
+        "user_query": "What does the email talk about",
+        "_conversation_history": "USER: What new emails do I have? ASSISTANT: You have one new email: Google Developer forums Summary: A brief update on forum activity since January 23, 2026.",
+        "plan": [
+            {"step": 1, "domain": "email", "query": "Show full content of the email with subject 'Google Developer forums Summary'"}
+        ],
+        "reasoning": "Follow-up: 'the email' resolved to 'Google Developer forums Summary' from conversation history."
+    },
+    {
+        "user_query": "Who's attending that meeting?",
+        "_conversation_history": "USER: What's on my calendar today? ASSISTANT: You have 2 events: 1) Team Standup at 9:00 AM, 2) Product Review at 2:00 PM.",
+        "plan": [
+            {"step": 1, "domain": "calendar", "query": "Get attendee details for the 'Team Standup' meeting today"}
+        ],
+        "reasoning": "Follow-up: 'that meeting' resolved to the most recent/first meeting mentioned ('Team Standup'). If ambiguous, pick the most recently discussed one."
+    },
+    {
+        "user_query": "Reply to it saying I'll be there",
+        "_conversation_history": "USER: Show me emails from Sarah. ASSISTANT: Found 2 emails from Sarah: 1) 'Dinner plans Friday?' (today), 2) 'Q4 Report review' (yesterday).",
+        "plan": [
+            {"step": 1, "domain": "email", "query": "Reply to the email from Sarah with subject 'Dinner plans Friday?' saying 'I'll be there'"}
+        ],
+        "reasoning": "Follow-up: 'it' resolved to the most recent email from Sarah ('Dinner plans Friday?'). Reply intent detected."
+    },
+    # --- SCHEDULING WITH ATTENDEES ---
+    # CRITICAL: Scheduling with a person's name is ALWAYS a single calendar step.
+    # The calendar agent handles name-to-email resolution internally.
+    {
+        "user_query": "Schedule a meeting with Emmanuel tomorrow at 11am",
+        "plan": [
+            {"step": 1, "domain": "calendar", "query": "Schedule a meeting with Emmanuel tomorrow at 11am"}
+        ],
+        "reasoning": "SINGLE STEP. The calendar agent handles attendee name-to-email resolution internally. Do NOT decompose into email search + calendar."
+    },
+    {
+        "user_query": "Set up a 1:1 with Sarah Chen next Tuesday at 3pm",
+        "plan": [
+            {"step": 1, "domain": "calendar", "query": "Schedule a 1:1 meeting with Sarah Chen next Tuesday at 3pm"}
+        ],
+        "reasoning": "Scheduling with a person's name is always a SINGLE calendar step. The calendar agent resolves the name to an email address internally."
     }
 ]
 
 def get_planning_examples_str(count: int = 3) -> str:
     """
     Get a formatted string of random planning examples.
+    Always includes at least one follow-up reference resolution example.
     """
-    # Shuffle to provide variety
-    selected = random.sample(PLANNING_EXAMPLES, min(count, len(PLANNING_EXAMPLES)))
+    # Separate follow-up examples from standalone examples
+    followup_examples = [ex for ex in PLANNING_EXAMPLES if "_conversation_history" in ex]
+    standalone_examples = [ex for ex in PLANNING_EXAMPLES if "_conversation_history" not in ex]
+    
+    # Always include 1 follow-up example, fill rest with standalone
+    selected_followup = random.sample(followup_examples, min(1, len(followup_examples)))
+    remaining = max(0, count - len(selected_followup))
+    selected_standalone = random.sample(standalone_examples, min(remaining, len(standalone_examples)))
+    
+    selected = selected_standalone + selected_followup
+    random.shuffle(selected)
     
     output = []
     output.append("FEW-SHOT EXAMPLES:")
     for i, ex in enumerate(selected):
         output.append(f"Example {i+1}:")
+        
+        # Include conversation history for follow-up examples
+        if "_conversation_history" in ex:
+            output.append(f"(Conversation history: {ex['_conversation_history']})")
+        
         output.append(f'User: "{ex["user_query"]}"')
         
         # Aligned with SUPERVISOR_PLANNING_SYSTEM_PROMPT format

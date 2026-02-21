@@ -45,7 +45,7 @@ from api.routers import (
     notifications, blog, dashboard,
     analytics, proactive, health,
     admin, ghost, ai_features, data_export, profile, conversations,
-    slack_events
+    slack_events, team_pulse, crm
 )
 from api.routers.gmail_push import router as gmail_push_router
 # from api.auth_routes import router as google_auth_router  # DEPRECATED
@@ -211,6 +211,8 @@ app.include_router(gmail_push_router, prefix="/api")
 app.include_router(slack_events.router, prefix="/api")
 app.include_router(chat.router, prefix="/api")
 app.include_router(chat.query_router, prefix="/api")  # Legacy /api/query/*
+app.include_router(team_pulse.router, prefix="/api")
+app.include_router(crm.router, prefix="/api")
 
 # Base Routes (Without prefix)
 app.include_router(auth.router)

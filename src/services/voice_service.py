@@ -354,6 +354,14 @@ class VoiceService:
             client.tools = tools_res
             client.tool_map = {t.name: t for t in client.tools}
             
+            # Validate critical tools are present
+            tool_names = set(t.name for t in client.tools)
+            critical_tools = {"email", "calendar", "tasks", "reminders"}
+            missing = critical_tools - tool_names
+            if missing:
+                logger.warning(f"[VoiceService] Missing critical tools: {missing}. Voice may hallucinate for these domains.")
+            logger.info(f"[VoiceService] Tools loaded: {sorted(tool_names)}")
+            
             init_duration = (time.time() - start_time) * 1000
             logger.info(f"[VoiceService] Session ready in {init_duration:.0f}ms. Starting stream...")
             
@@ -436,10 +444,21 @@ class VoiceService:
                     # Generator finished normally
                     return
             except Exception as e:
-                logger.error(f"[VoiceService] Unhandled error with {provider_name}: {e}")
+                import traceback
+                error_detail = f"[VoiceService] Unhandled error with {provider_name}: {e}\n{traceback.format_exc()}"
+                logger.error(error_detail)
+                # Also write to a file so it's not lost when terminal scrolls
+                try:
+                    with open("logs/voice_error.log", "a") as f:
+                        from datetime import datetime
+                        f.write(f"\n{'='*60}\n{datetime.now().isoformat()} - Provider: {provider_name}\n{error_detail}\n")
+                except Exception:
+                    pass
                 if provider_name == providers_to_try[-1]:
-                    await websocket.send_json({"type": "error", "message": "Voice service encountered an error."})
+                    await websocket.send_json({"type": "error", "message": f"Voice service error: {str(e)[:200]}"})
                     return
+                else:
+                    logger.warning(f"[VoiceService] Falling back from {provider_name} to next provider...")
                 # Continue loop
 
     async def _save_to_memory(self, user_id: int, session_id: str, content: str, role: str = 'assistant'):

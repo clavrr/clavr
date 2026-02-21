@@ -32,9 +32,7 @@ class WebhookService:
     def __init__(self, db_session: Optional[Session] = None):
         self.db = db_session
 
-    # ------------------------------------------------------------------
     # Subscription CRUD
-    # ------------------------------------------------------------------
 
     def create_subscription(
         self,
@@ -111,9 +109,7 @@ class WebhookService:
         self.db.commit()
         return True
 
-    # ------------------------------------------------------------------
     # Event triggering
-    # ------------------------------------------------------------------
 
     def get_active_subscriptions_for_event(
         self,
@@ -169,9 +165,7 @@ class WebhookService:
 
         return deliveries
 
-    # ------------------------------------------------------------------
     # HTTP delivery
-    # ------------------------------------------------------------------
 
     async def _deliver_webhook(self, delivery: WebhookDelivery) -> bool:
         """
@@ -258,9 +252,7 @@ class WebhookService:
         self.db.commit()
         return False
 
-    # ------------------------------------------------------------------
     # Retry logic
-    # ------------------------------------------------------------------
 
     async def retry_pending_webhooks(self) -> int:
         """Retry all deliveries that are due for retry."""
@@ -284,9 +276,7 @@ class WebhookService:
         """Exponential backoff: 2^attempt seconds, capped at MAX_RETRY_DELAY."""
         return min(2 ** attempt, MAX_RETRY_DELAY)
 
-    # ------------------------------------------------------------------
     # Signature helpers
-    # ------------------------------------------------------------------
 
     @staticmethod
     def _generate_signature(payload: str, secret: str) -> str:
@@ -312,9 +302,7 @@ class WebhookService:
 
         return hmac.compare_digest(expected, signature)
 
-    # ------------------------------------------------------------------
     # History & cleanup
-    # ------------------------------------------------------------------
 
     def get_delivery_history(
         self,

@@ -149,3 +149,4 @@ After setting up credentials:
 2. Test voice transcription in the frontend
 3. Monitor usage in Google Cloud Console > Billing
 
+

@@ -178,12 +178,10 @@ class EmailSearchService:
         """Synchronous wrapper for _resolve_name_to_emails."""
         if not name: return []
         try:
-            loop = asyncio.get_event_loop()
-            if loop.is_running():
-                import concurrent.futures
-                with concurrent.futures.ThreadPoolExecutor() as executor:
-                    return executor.submit(lambda: asyncio.run(self._resolve_name_to_emails(name))).result(timeout=3.0)
-            return loop.run_until_complete(self._resolve_name_to_emails(name))
+            # Always use asyncio.run() in a fresh thread to avoid event loop issues
+            import concurrent.futures
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+                return executor.submit(lambda: asyncio.run(self._resolve_name_to_emails(name))).result(timeout=3.0)
         except Exception as e:
             logger.warning(f"[EMAIL_SEARCH] Sync name resolution failed: {e}")
             return []
@@ -212,6 +210,9 @@ class EmailSearchService:
         if from_email:
              sender_logic_run = True
              if '@' not in from_email:
+                # ALWAYS save original sender name for RAG result validation later
+                self._original_sender_name = from_email
+                
                 # 1. Add to query keywords if not present
                 if not query or from_email.lower() not in query.lower():
                     # If query is about charging/subscription/receipt, ensure those keywords are preserved
@@ -221,8 +222,6 @@ class EmailSearchService:
                 financial_keywords = ['charge', 'charged', 'subscription', 'receipt', 'invoice', 'payment', 'billing', 'price', 'cost']
                 if query and any(kw in query.lower() for kw in financial_keywords):
                     if not any(kw in query.lower() for kw in ['receipt', 'invoice', 'bill', 'billing']):
-                        # Use OR for broader matching in both RAG and Gmail
-                        # Added 'stripe' as many receipts come from stripe emails
                         query = f"{query} (receipt OR invoice OR bill OR billing OR stripe)".strip()
                 
                 logger.info(f"[EMAIL_SEARCH] Including entity '{from_email}' in keywords")
@@ -231,7 +230,6 @@ class EmailSearchService:
                 try:
                     resolved = self._resolve_name_to_emails_sync(from_email)
                     if resolved:
-                        self._original_sender_name = from_email
                         from_email = resolved[0]
                     else:
                         # 3. If no resolution, CLEAR from_email to avoid strict 'from:' filter
@@ -410,7 +408,37 @@ class EmailSearchService:
                 logger.warning(f"[EMAIL_SEARCH] Hybrid/RAG search failed: {e}")
 
         if emails_from_index and not is_freshness_query and len(emails_from_index) >= limit:
-            return emails_from_index[:limit]
+            # When specific filters were requested (sender/subject), verify RAG results
+            # actually match before returning them. RAG returns semantically similar but
+            # often irrelevant results that prevent Gmail API from being reached.
+            has_specific_criteria = bool(subject or self._original_sender_name)
+            
+            if has_specific_criteria:
+                matched = emails_from_index  # Start with all
+                
+                # Filter by subject if specified
+                if subject:
+                    subject_lower = subject.lower()
+                    matched = [e for e in matched if subject_lower in (e.get('subject', '') or '').lower()]
+                
+                # Filter by sender name if specified
+                if self._original_sender_name:
+                    sender_lower = self._original_sender_name.lower()
+                    # Check both 'sender' and 'from' fields
+                    matched = [e for e in matched 
+                               if sender_lower in (e.get('sender', '') or '').lower() 
+                               or sender_lower in (e.get('from', '') or '').lower()]
+                
+                if matched:
+                    return matched[:limit]
+                else:
+                    criteria = []
+                    if subject: criteria.append(f"subject='{subject}'")
+                    if self._original_sender_name: criteria.append(f"sender='{self._original_sender_name}'")
+                    logger.info(f"[EMAIL_SEARCH] RAG returned {len(emails_from_index)} results but none match {', '.join(criteria)}, falling through to Gmail API")
+                    emails_from_index = []  # Clear so Gmail API runs
+            else:
+                return emails_from_index[:limit]
 
         # Gmail API Fallback
         self._ensure_available()
@@ -441,6 +469,10 @@ class EmailSearchService:
                     search_parts.append(f"({' OR '.join(from_parts)})")
                 else:
                     search_parts.append(from_parts[0])
+            elif self._original_sender_name:
+                # Name resolution failed but we still have the original sender name
+                # Gmail can match sender display names with from:(name)
+                search_parts.append(f'from:({self._original_sender_name})')
             
             if newer_than_value: 
                 search_parts.append(f"newer_than:{newer_than_value}")
@@ -457,24 +489,34 @@ class EmailSearchService:
                 search_parts.append("is:unread" if is_unread else "is:read")
             
             if query:
-                # Better cleaning: Remove common "conversational wrapper" words to get to the core keywords
-                # Expanded with "how much was i" for financial queries
-                junk_words = r'\b(find|search|show|emails|email|about|what|whats|what\'s|the|from|all|my|in|for|me|how|much|was|i|is|a|of|can|you|please)\b'
-                clean_q = re.sub(junk_words, '', query, flags=re.IGNORECASE).strip()
+                # When structured filters (from:/subject:) are present, the conversational
+                # query text MUST be skipped entirely. Gmail requires ALL keywords to match,
+                # so "from:(Sagar Agrawal) regarding scaling Clavr beta success" returns 0
+                # results because Gmail looks for the literal words "regarding", "scaling" etc.
+                # The from:/subject: filter alone is always sufficient.
+                has_structured_filter = bool(subject or from_email or self._original_sender_name)
                 
-                # Cleanup common punctuation that might mess up Gmail's tokenization
-                clean_q = re.sub(r'[?.,!]', ' ', clean_q).strip()
-                
-                # If we have core keywords left, use them.
-                # CRITICAL Fix: Do NOT quote unconditionally. Gmail treats "foo bar" as "foo" AND "bar" (set intersection)
-                # whereas "foo bar" (quoted) is strict phrase match. We WANT intersection for robustness.
-                if clean_q: 
-                    # Only quote if it's a very short specific phrase or looks like an ID, 
-                    # otherwise loose search is safer for "Eleven Labs" (could be "Eleven" ... "Labs")
-                    search_parts.append(clean_q)
+                if not has_structured_filter:
+                    # No structured filters — clean up conversational words and use as keywords
+                    junk_words = r'\b(find|search|show|emails|email|about|what|whats|what\'s|the|from|all|my|in|for|me|how|much|was|i|is|a|of|can|you|please|full|content|tell|give|get|more|details|regarding|read|note|message)\b'
+                    clean_q = re.sub(junk_words, '', query, flags=re.IGNORECASE).strip()
+                    clean_q = re.sub(r'[?.,!]', ' ', clean_q).strip()
+                    clean_q = re.sub(r'\s+', ' ', clean_q).strip()
+                    
+                    if clean_q: 
+                        search_parts.append(clean_q)
             
             gmail_query = " ".join(search_parts)
+            logger.info(f"[EMAIL_SEARCH] Gmail API query: '{gmail_query}' (folder={folder}, limit={limit})")
             results = self.gmail_client.search_emails(query=gmail_query, folder=folder, limit=limit)
+            
+            # If from: filter returned 0, retry with sender name as keyword instead
+            if not results and self._original_sender_name and not from_email:
+                keyword_query = self._original_sender_name
+                if folder and folder.lower() not in ['all', 'any']:
+                    keyword_query = f"in:{folder} {keyword_query}"
+                logger.info(f"[EMAIL_SEARCH] Retrying Gmail with keyword fallback: '{keyword_query}'")
+                results = self.gmail_client.search_emails(query=keyword_query, folder='all', limit=limit)
             
             if emails_from_index:
                 seen = {e['id'] for e in emails_from_index}
@@ -509,6 +551,26 @@ class EmailSearchService:
                     
                     if rag_results:
                         logger.info(f"[EMAIL_SEARCH] RAG semantic search found {len(rag_results)} results")
+                        
+                        # Validate against sender/subject criteria (same as initial RAG check)
+                        if self._original_sender_name or subject:
+                            validated = rag_results
+                            if subject:
+                                subject_lower = subject.lower()
+                                validated = [e for e in validated if subject_lower in (e.get('subject', '') or '').lower()]
+                            if self._original_sender_name:
+                                sender_lower = self._original_sender_name.lower()
+                                validated = [e for e in validated
+                                             if sender_lower in (e.get('sender', '') or '').lower()
+                                             or sender_lower in (e.get('from', '') or '').lower()]
+                            if validated:
+                                for r in validated:
+                                    r['_source'] = 'rag_semantic'
+                                return validated[:limit]
+                            else:
+                                logger.info(f"[EMAIL_SEARCH] RAG semantic fallback: {len(rag_results)} results but none match sender/subject criteria")
+                                return []
+                        
                         for r in rag_results:
                             r['_source'] = 'rag_semantic'
                         return rag_results[:limit]

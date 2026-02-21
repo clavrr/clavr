@@ -2,18 +2,26 @@
 API Dependencies
 Provides shared dependencies for FastAPI routers using proper dependency injection
 """
-from typing import Optional, Generator, Any
+from __future__ import annotations
+
+from typing import Optional, Generator, Any, TYPE_CHECKING
 from sqlalchemy.ext.asyncio import AsyncSession
 from fastapi import Depends, Request, HTTPException, status
 
 from src.utils.config import load_config, Config
-# Defer imports to avoid circular dependencies
-# from src.ai.rag import RAGEngine
-# from src.ai.llm_factory import LLMFactory
 from src.database import get_db, get_async_db, User
 from src.utils.logger import setup_logger
+
+if TYPE_CHECKING:
+    from src.ai.rag import RAGEngine
+    from src.ai.llm_factory import LLMFactory
+    from api.websocket_manager import ConnectionManager
 from src.tools import EmailTool, CalendarTool, TaskTool, SummarizeTool, NotionTool, KeepTool, FinanceTool
 from src.tools.weather.tool import WeatherTool
+from src.services.indexing.event_stream import EventStreamHandler
+from src.services.indexing.topic_extractor import TopicExtractor
+from src.services.indexing.temporal_indexer import TemporalIndexer
+from src.services.indexing.relationship_strength import RelationshipStrengthManager
 
 logger = setup_logger(__name__)
 
@@ -25,7 +33,7 @@ logger = setup_logger(__name__)
 class AppState:
     """Application state holder for singleton instances"""
     _config: Optional[Config] = None
-    _rag_engine: Optional['RAGEngine'] = None
+    _rag_engine: Optional[RAGEngine] = None
     _email_tool: Optional[EmailTool] = None
     _calendar_tool: Optional[CalendarTool] = None
     _task_tool: Optional[TaskTool] = None
@@ -35,7 +43,16 @@ class AppState:
     _weather_tool: Optional[WeatherTool] = None
     _finance_tool: Optional[FinanceTool] = None
     _orchestrator: Optional[Any] = None
-    _connection_manager: Optional['ConnectionManager'] = None
+    _connection_manager: Optional[ConnectionManager] = None
+    _topic_extractor: Optional[TopicExtractor] = None
+    _temporal_indexer: Optional[TemporalIndexer] = None
+    _relationship_manager: Optional[RelationshipStrengthManager] = None
+    _event_handler: Optional[EventStreamHandler] = None
+    _revenue_classifier: Optional[Any] = None
+    _follow_up_tracker: Optional[Any] = None
+    _customer_health: Optional[Any] = None
+    _pipeline_service: Optional[Any] = None
+    _meeting_roi: Optional[Any] = None
     
     @classmethod
     def get_config(cls) -> Config:
@@ -106,7 +123,7 @@ class AppState:
         return cls._graph_manager
     
     @classmethod
-    def get_connection_manager(cls) -> Optional['ConnectionManager']:
+    def get_connection_manager(cls) -> Optional[ConnectionManager]:
         """Get or create ConnectionManager singleton for WebSocket notifications."""
         if cls._connection_manager is None:
             try:
@@ -119,7 +136,7 @@ class AppState:
         return cls._connection_manager
     
     @classmethod
-    def get_rag_engine(cls) -> 'RAGEngine':
+    def get_rag_engine(cls) -> RAGEngine:
         """Get or create RAG engine singleton"""
         if cls._rag_engine is None:
             from src.ai.rag import RAGEngine
@@ -129,7 +146,7 @@ class AppState:
         return cls._rag_engine
     
     @classmethod
-    def get_conversation_rag_engine(cls) -> 'RAGEngine':
+    def get_conversation_rag_engine(cls) -> RAGEngine:
         """Get RAG engine for conversation messages (separate from email-knowledge).
         
         This prevents conversation_messages from polluting the email search index.
@@ -176,7 +193,7 @@ class AppState:
         return cls._hybrid_coordinator
     
     @classmethod
-    def get_rag_tool(cls) -> 'RAGEngine':
+    def get_rag_tool(cls) -> RAGEngine:
         """Get or create RAG tool singleton (deprecated - use get_rag_engine instead)"""
         logger.warning("get_rag_tool is deprecated. Use get_rag_engine instead.")
         return cls.get_rag_engine()
@@ -377,6 +394,60 @@ class AppState:
             brief_generator=brief_gen
         )
     
+    # ============================================
+    # REVENUE SERVICE FACTORIES
+    # ============================================
+    
+    @classmethod
+    def get_revenue_classifier(cls) -> Any:
+        """Get or create RevenueSignalClassifier singleton."""
+        if cls._revenue_classifier is None:
+            from src.services.revenue_signals import RevenueSignalClassifier
+            config = cls.get_config()
+            cls._revenue_classifier = RevenueSignalClassifier(config=config)
+            logger.info("[OK] RevenueSignalClassifier initialized")
+        return cls._revenue_classifier
+
+    @classmethod
+    def get_follow_up_tracker(cls) -> Any:
+        """Get or create FollowUpTracker singleton."""
+        if cls._follow_up_tracker is None:
+            from src.services.follow_up_tracker import FollowUpTracker
+            config = cls.get_config()
+            cls._follow_up_tracker = FollowUpTracker(config=config)
+            logger.info("[OK] FollowUpTracker initialized")
+        return cls._follow_up_tracker
+
+    @classmethod
+    def get_customer_health_service(cls, db_session: Optional[Any] = None) -> Any:
+        """Get or create CustomerHealthService singleton."""
+        if cls._customer_health is None:
+            from src.services.customer_health import CustomerHealthService
+            config = cls.get_config()
+            cls._customer_health = CustomerHealthService(config=config, db_session=db_session)
+            logger.info("[OK] CustomerHealthService initialized")
+        return cls._customer_health
+
+    @classmethod
+    def get_pipeline_service(cls, db_session: Optional[Any] = None) -> Any:
+        """Get or create PipelineService singleton."""
+        if cls._pipeline_service is None:
+            from src.services.pipeline_service import PipelineService
+            config = cls.get_config()
+            cls._pipeline_service = PipelineService(config=config, db_session=db_session)
+            logger.info("[OK] PipelineService initialized")
+        return cls._pipeline_service
+
+    @classmethod
+    def get_meeting_roi_service(cls, db_session: Optional[Any] = None) -> Any:
+        """Get or create MeetingROIService singleton."""
+        if cls._meeting_roi is None:
+            from src.services.meeting_roi import MeetingROIService
+            config = cls.get_config()
+            cls._meeting_roi = MeetingROIService(config=config, db_session=db_session)
+            logger.info("[OK] MeetingROIService initialized")
+        return cls._meeting_roi
+
     @classmethod
     def get_orchestrator(cls, db: Optional[Any] = None, user_id: Optional[int] = None, request: Optional[Any] = None) -> Any:
         """
@@ -500,6 +571,26 @@ class AppState:
             return None
 
     @classmethod
+    def get_autonomous_bridge(cls, user_id: int) -> Optional[Any]:
+        """Get AutonomousBridgeService for a user."""
+        try:
+            from src.services.autonomous_bridge import AutonomousBridgeService, _get_notion_service, _get_slack_client
+            config = cls.get_config()
+            linear_service = cls.get_linear_service(user_id)
+            notion_service = _get_notion_service(config)
+            slack_client = _get_slack_client(config, user_id)
+            return AutonomousBridgeService(
+                config=config,
+                linear_service=linear_service,
+                notion_service=notion_service,
+                slack_client=slack_client,
+                user_id=user_id,
+            )
+        except Exception as e:
+            logger.warning(f"Failed to initialize AutonomousBridgeService: {e}")
+            return None
+
+    @classmethod
     def get_ghost_tool(cls, user_id: int) -> Any:
         """Get or create GhostTool for a user"""
         from src.tools.ghost.tool import GhostTool
@@ -555,6 +646,72 @@ class AppState:
         return ChatService(db=db, config=config)
 
     @classmethod
+    def get_topic_extractor(cls) -> Optional[TopicExtractor]:
+        """Get or create TopicExtractor singleton"""
+        if cls._topic_extractor is None:
+            config = cls.get_config()
+            graph_manager = cls.get_knowledge_graph_manager()
+            if graph_manager:
+                cls._topic_extractor = TopicExtractor(config, graph_manager)
+            else:
+                logger.warning("TopicExtractor skipped: missing graph_manager")
+        return cls._topic_extractor
+
+    @classmethod
+    def get_temporal_indexer(cls) -> Optional[TemporalIndexer]:
+        """Get or create TemporalIndexer singleton"""
+        if cls._temporal_indexer is None:
+            config = cls.get_config()
+            graph_manager = cls.get_knowledge_graph_manager()
+            rag_engine = cls.get_rag_engine()
+            if graph_manager:
+                cls._temporal_indexer = TemporalIndexer(config, graph_manager, rag_engine)
+            else:
+                logger.warning("TemporalIndexer skipped: missing graph_manager")
+        return cls._temporal_indexer
+
+    @classmethod
+    def get_relationship_strength_manager(cls) -> Optional[RelationshipStrengthManager]:
+        """Get or create RelationshipStrengthManager singleton"""
+        if cls._relationship_manager is None:
+            config = cls.get_config()
+            graph_manager = cls.get_knowledge_graph_manager()
+            if graph_manager:
+                cls._relationship_manager = RelationshipStrengthManager(config, graph_manager)
+            else:
+                logger.warning("RelationshipStrengthManager skipped: missing graph_manager")
+        return cls._relationship_manager
+
+    @classmethod
+    def get_event_stream_handler(cls) -> Optional[EventStreamHandler]:
+        """Get or create EventStreamHandler singleton"""
+        if cls._event_handler is None:
+            config = cls.get_config()
+            graph_manager = cls.get_knowledge_graph_manager()
+            rag_engine = cls.get_rag_engine()
+            hybrid_coordinator = cls.get_hybrid_coordinator()
+            topic_extractor = cls.get_topic_extractor()
+            temporal_indexer = cls.get_temporal_indexer()
+            relationship_manager = cls.get_relationship_strength_manager()
+            insight_service = cls.get_insight_service()
+            
+            if all([graph_manager, rag_engine, hybrid_coordinator]):
+                cls._event_handler = EventStreamHandler(
+                    config=config,
+                    graph_manager=graph_manager,
+                    rag_engine=rag_engine,
+                    hybrid_coordinator=hybrid_coordinator,
+                    topic_extractor=topic_extractor,
+                    temporal_indexer=temporal_indexer,
+                    relationship_manager=relationship_manager,
+                    insight_service=insight_service
+                )
+                logger.info("[OK] EventStreamHandler initialized")
+            else:
+                logger.warning("EventStreamHandler skipped: missing core dependencies")
+        return cls._event_handler
+
+    @classmethod
     def reset(cls):
         """Reset all singletons (useful for testing)"""
         cls._config = None
@@ -564,6 +721,10 @@ class AppState:
         cls._task_tool = None
         cls._summarize_tool = None
         cls._orchestrator = None
+        cls._event_handler = None
+        cls._topic_extractor = None
+        cls._temporal_indexer = None
+        cls._relationship_manager = None
         if hasattr(cls, '_email_tool_cache'):
             cls._email_tool_cache = {}
         if hasattr(cls, '_task_tool_cache'):
@@ -590,13 +751,13 @@ def get_config() -> Config:
     return AppState.get_config()
 
 
-def get_rag_engine() -> 'RAGEngine':
+def get_rag_engine() -> RAGEngine:
     """
     FastAPI dependency for RAG engine
     
     Usage:
         @app.get("/search")
-        def search(rag: 'RAGEngine' = Depends(get_rag_engine)):
+        def search(rag: RAGEngine = Depends(get_rag_engine)):
             ...
     
     Returns:
@@ -604,13 +765,13 @@ def get_rag_engine() -> 'RAGEngine':
     """
     return AppState.get_rag_engine()
 
-def get_rag_tool() -> 'RAGEngine':
+def get_rag_tool() -> RAGEngine:
     """
     FastAPI dependency for RAG tool (deprecated - use get_rag_engine instead)
     
     Usage:
         @app.get("/search")
-        def search(rag: 'RAGEngine' = Depends(get_rag_tool)):
+        def search(rag: RAGEngine = Depends(get_rag_tool)):
             ...
     
     Returns:
@@ -742,6 +903,11 @@ def get_integration_service(db: AsyncSession = Depends(get_async_db)) -> Any:
 def get_chat_service(db: AsyncSession = Depends(get_async_db)) -> Any:
     """FastAPI dependency for ChatService."""
     return AppState.get_chat_service(db=db)
+
+
+def get_event_stream_handler() -> Optional[EventStreamHandler]:
+    """FastAPI dependency for EventStreamHandler"""
+    return AppState.get_event_stream_handler()
 
 
 def get_current_user(request: Request) -> User:

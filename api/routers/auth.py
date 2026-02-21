@@ -28,10 +28,22 @@ async def login_google(
     session = getattr(request.state, 'session', None)
     
     if user and session:
-        # Already logged in - redirect to dashboard
+        # Already logged in - redirect through /auth/callback so frontend can
+        # store the session token in localStorage (required for API auth).
+        # Previously this redirected directly to /dashboard, but the frontend
+        # needs the token in localStorage and only /auth/callback stores it.
+        import urllib.parse
         frontend_url = get_frontend_url(config)
-        logger.info(f"User {user.id} already authenticated, redirecting to dashboard")
-        return RedirectResponse(url=f"{frontend_url}/dashboard")
+        target_url = f"{frontend_url}/dashboard"
+        raw_token = getattr(request.state, 'session_id', None)  # raw token from middleware
+        if raw_token:
+            redirect_url = f"{frontend_url}/auth/callback?token={raw_token}&target={urllib.parse.quote(target_url)}"
+            logger.info(f"User {user.id} already authenticated, redirecting through /auth/callback")
+            return RedirectResponse(url=redirect_url)
+        else:
+            # Fallback: no raw token available, redirect to dashboard directly
+            logger.warning(f"User {user.id} authenticated but no raw token available, redirecting to dashboard")
+            return RedirectResponse(url=f"{frontend_url}/dashboard")
     
     # Not authenticated - start OAuth flow
     authorization_url, state = await auth_service.get_google_auth_url()

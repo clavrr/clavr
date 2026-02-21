@@ -220,6 +220,41 @@ celery_app.conf.update(
             'schedule': crontab(hour=10, minute=0, day_of_week=5),  # Friday 10 AM UTC
             'options': {'queue': 'default'}
         },
+
+        # Follow-Up Sweeps — advance overdue follow-ups every 15 minutes
+        'follow-up-sweep-every-15-minutes': {
+            'task': 'src.workers.tasks.ghost_tasks.sweep_follow_ups',
+            'schedule': 900.0,  # 15 minutes
+            'options': {'queue': 'default'}
+        },
+
+        # Meeting Closer — process recently-ended meetings every 30 minutes
+        'meeting-closer-every-30-minutes': {
+            'task': 'src.workers.tasks.ghost_tasks.run_meeting_closer',
+            'schedule': 1800.0,  # 30 minutes
+            'options': {'queue': 'default'}
+        },
+
+        # PR Bottleneck Detector — scan for stale/blocked PRs every 2 hours
+        'pr-bottleneck-check-every-2-hours': {
+            'task': 'src.workers.tasks.ghost_tasks.check_pr_bottlenecks',
+            'schedule': 7200.0,  # 2 hours
+            'options': {'queue': 'default'}
+        },
+
+        # Sprint Retro Summarizer — generate retro at cycle close
+        'sprint-retro-weekly': {
+            'task': 'src.workers.tasks.ghost_tasks.run_sprint_retro',
+            'schedule': crontab(hour=16, minute=0, day_of_week=5),  # Friday 4 PM UTC
+            'options': {'queue': 'default'}
+        },
+
+        # Proactive Morning Digest — comprehensive daily briefing
+        'morning-digest-daily': {
+            'task': 'src.workers.tasks.ghost_tasks.send_morning_digest',
+            'schedule': crontab(hour=6, minute=30),  # 6:30 AM UTC daily
+            'options': {'queue': 'default'}
+        },
     },
     
     # Beat scheduler configuration

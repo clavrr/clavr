@@ -203,7 +203,8 @@ class GeminiEmbeddingProvider(EmbeddingProvider):
                 result = embed_func(
                     model=self.model_name,
                     content=text,
-                    task_type=task_type
+                    task_type=task_type,
+                    output_dimensionality=self._dimension
                 )
                 embedding = result['embedding']
                 

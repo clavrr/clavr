@@ -64,30 +64,26 @@ class BriefService:
         tasks = [
             self._get_emails(user_id, fast_mode=fast_mode),
             self._get_todos(user_id, fast_mode=fast_mode),
-            self._get_meetings(user_id)
+            self._get_meetings(user_id),
         ]
         if not fast_mode:
             tasks.append(self._get_documents(user_id))
             
-        # Parallel fetch for high-impact reminders (read or unread)
-        tasks.append(self._get_recent_important_emails(user_id))
-        
         # Always fetch Ghost drafts (internal and fast)
         tasks.append(self._get_ghost_drafts(user_id))
+        
+        # People CRM data (fast — graph queries only)
+        tasks.append(self._get_people(user_id))
             
         results = await asyncio.gather(*tasks, return_exceptions=True)
         
-        # Unpack results handling errors
-        # Expected order: 
-        # 0: emails (unread)
-        # 1: todos
-        # 2: meetings
-        # 3: documents (if not fast)
-        # 4: high-impact (if not fast, idx shifts) -- WAIT, I added it AFTER documents
-        # 5: ghost drafts
-        
-        # Let's be safer with unpacking by checking lengths
-        # But simpler: map results to vars based on known order
+        # We must fetch recent important emails SEQUENTIALLY after _get_emails 
+        # because google-api-python-client's httplib2 is NOT thread-safe for parallel calls on the same client.
+        urgent_read_emails = []
+        try:
+            urgent_read_emails = await self._get_recent_important_emails(user_id)
+        except Exception as e:
+            logger.error(f"[BriefService] Sequential fetch of urgent emails failed: {e}")
         
         emails = results[0] if isinstance(results[0], list) else []
         todos = results[1] if isinstance(results[1], list) else []
@@ -99,10 +95,10 @@ class BriefService:
             documents = results[idx] if isinstance(results[idx], list) else []
             idx += 1
             
-        urgent_read_emails = results[idx] if isinstance(results[idx], list) else []
+        ghost_drafts = results[idx] if isinstance(results[idx], list) else []
         idx += 1
         
-        ghost_drafts = results[idx] if isinstance(results[idx], list) else []
+        people = results[idx] if isinstance(results[idx], dict) else {}
 
         # 2. Skip slow LLM-based summarization in fast_mode (voice optimization)
         # _generate_smart_reminders takes ~6-8s, which is too slow for voice (~1s limit)
@@ -146,6 +142,7 @@ class BriefService:
             "meetings": meetings,
             "documents": documents,
             "ghost_drafts": ghost_drafts,
+            "people": people,
             "reminders": reminders
         }
 
@@ -156,19 +153,23 @@ class BriefService:
             return []
             
         try:
-            # Use label:UNREAD to get ALL unread emails (widest net), then filter internally
-            # 'is:unread in:inbox' failed in testing (returned 0), 'label:UNREAD' found the most
-            query = "label:UNREAD"
+            # Use structured parameters — search_emails builds its own Gmail query internally.
+            # Do NOT pass raw Gmail syntax (e.g. "in:inbox newer_than:2d") as the query arg
+            # because the search service strips/mangles it via junk-word removal.
+            recent_cutoff = (datetime.now() - timedelta(days=7)).strftime("%Y/%m/%d")
             
-            logger.info(f"[BriefService] Searching emails with query: {query}")
+            logger.info(f"[BriefService] Searching recent inbox emails since {recent_cutoff}")
             
             # Explicitly disable RAG in fast_mode to avoid hitting timeouts (>1s)
             allow_rag = not fast_mode
             
             messages = await asyncio.to_thread(
-                self.email_service.search_emails, 
-                query=query, 
-                limit=15,  # Fetch slightly fewer for speed
+                self.email_service.search_emails,
+                query=None,           # No free-text query — just structural filters
+                folder="inbox",       # Inbox only
+                after_date=recent_cutoff,  # Last 7 days
+                is_unread=None,       # Both read AND unread
+                limit=25,             # Fetch more to survive promotional filtering
                 allow_rag=allow_rag
             ) 
             
@@ -519,6 +520,46 @@ class BriefService:
         except Exception as e:
             logger.error(f"[BriefService] Drive documents error: {e}")
             return []
+    
+    async def _get_people(self, user_id: int) -> Dict[str, Any]:
+        """Get People CRM data: inner circle + fading contacts."""
+        try:
+            from src.services.crm.personal_crm import get_personal_crm
+            crm = get_personal_crm()
+            if not crm:
+                return {}
+            
+            from dataclasses import asdict
+            
+            # Fetch inner circle (top 5) and fading contacts (up to 3) in parallel
+            inner_circle_task = crm.get_inner_circle(user_id=user_id, limit=5)
+            fading_task = crm.get_fading_contacts(user_id=user_id, limit=3)
+            
+            inner_circle, fading = await asyncio.gather(
+                inner_circle_task, fading_task,
+                return_exceptions=True
+            )
+            
+            inner = [asdict(c) for c in inner_circle] if isinstance(inner_circle, list) else []
+            fade = [asdict(c) for c in fading] if isinstance(fading, list) else []
+            
+            # Build nudge messages for fading contacts
+            nudges = []
+            for contact in fade:
+                name = contact.get('name', 'Someone')
+                last = contact.get('last_interaction', '')
+                nudges.append(f"You haven't connected with {name} recently")
+            
+            return {
+                "inner_circle": inner,
+                "fading_contacts": fade,
+                "nudges": nudges,
+                "total_inner_circle": len(inner),
+                "total_fading": len(fade)
+            }
+        except Exception as e:
+            logger.debug(f"[BriefService] People CRM fetch error: {e}")
+            return {}
 
     async def _get_reminders(self, user_id: int) -> List[Dict]:
         """

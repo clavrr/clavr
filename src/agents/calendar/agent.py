@@ -23,7 +23,8 @@ from .schemas import (
 )
 from .constants import (
     SYSTEM_EMAIL_BLOCKLIST, TITLE_FALLBACK_PATTERNS, 
-    EMAIL_PATTERN, DURATION_IN_ENDTIME_PATTERN, AQL_RESOLVE_PERSON
+    EMAIL_PATTERN, DURATION_IN_ENDTIME_PATTERN,
+    AQL_RESOLVE_PERSON, AQL_RESOLVE_CONTACT, AQL_RESOLVE_KNOWS
 )
 
 logger = setup_logger(__name__)
@@ -35,9 +36,27 @@ class CalendarAgent(BaseAgent):
     
     # Inherits __init__ from BaseAgent
         
+    @staticmethod
+    def _matches_intent(query_lower: str, keywords: list) -> bool:
+        """Check if query matches any keyword using word-boundary matching.
+        
+        Uses regex \\b word boundaries to prevent 'event' from matching 'events',
+        'meeting' from matching 'meetings', etc. Multi-word keywords are matched
+        as exact phrases.
+        """
+        for kw in keywords:
+            # Use word boundary regex for exact word/phrase matching
+            pattern = r'\b' + re.escape(kw) + r'\b'
+            if re.search(pattern, query_lower):
+                return True
+        return False
+
     async def run(self, query: str, context: Optional[Dict[str, Any]] = None) -> str:
         """
         Execute calendar-related queries with memory awareness.
+        
+        Routing priority: LIST (read) > UPDATE > SCHEDULE (write) > AVAILABILITY > default LIST.
+        This prevents read-intent queries from being accidentally routed to schedule/create.
         """
         logger.info(f"[{self.name}] Processing query: {query}")
         
@@ -47,99 +66,327 @@ class CalendarAgent(BaseAgent):
              # Optimization: We rely on _extract_params to retrieve memory context (via task_type='planning')
              # to avoid duplicating context in the query string and bloating the prompt.
 
-
         query_lower = query.lower()
         
-        # Routing logic - prioritize schedule and update over list
-        if any(w in query_lower for w in INTENT_KEYWORDS['calendar']['schedule']):
-            # Special check: if it contains "list" or "show", it might still be a list request
-            # e.g., "show my schedule" vs "schedule a meeting"
-            if "schedule" in query_lower and any(w in query_lower for w in ["show", "list", "my"]):
-                return await self._handle_list(query, context)
-            return await self._handle_schedule(query, context)
-            
-        elif any(w in query_lower for w in INTENT_KEYWORDS['calendar']['update']):
+        list_kws = INTENT_KEYWORDS['calendar']['list']
+        schedule_kws = INTENT_KEYWORDS['calendar']['schedule']
+        update_kws = INTENT_KEYWORDS['calendar']['update']
+        
+        has_list = self._matches_intent(query_lower, list_kws)
+        has_schedule = self._matches_intent(query_lower, schedule_kws)
+        has_update = self._matches_intent(query_lower, update_kws)
+        has_availability = self._matches_intent(query_lower, [
+            "free", "busy", "available", "gap", "open",
+            "different time", "another time", "other time", "find time",
+            "alternative", "when can", "find a slot", "find slot",
+        ])
+        
+        logger.info(f"[{self.name}] Intent detection: list={has_list}, schedule={has_schedule}, update={has_update}, availability={has_availability}")
+        
+        # --- Priority Routing ---
+        
+        # 1. UPDATE intent has highest priority (reschedule, move, cancel are very specific verbs)
+        #    Must be checked before LIST because "reschedule my meeting" contains list keyword "meeting"
+        if has_update:
             return await self._handle_update(query, context)
-            
-        elif any(w in query_lower for w in INTENT_KEYWORDS['calendar']['list']):
-            return await self._handle_list(query, context)
-            
-        elif any(w in query_lower for w in ["free", "busy", "available", "gap", "open"]):
+        
+        # 2. AVAILABILITY intent beats LIST — "find available time for meeting" is NOT a list request
+        #    Must be checked before LIST because queries often contain list keywords like "meeting"
+        if has_availability:
             return await self._handle_availability(query, context)
-        else:
-            # Default to agenda/list
+        
+        # 3. LIST intent takes priority over schedule when both match
+        #    e.g., "show my events" has list("show","event") but should NOT schedule
+        if has_list and not has_schedule:
             return await self._handle_list(query, context)
+        
+        if has_list and has_schedule:
+            # Both matched — disambiguate based on action-oriented words
+            # "schedule" as a VERB (action) vs "my schedule" (noun/read)
+            # "create a meeting" (action) vs "show my meetings" (read)
+            action_verbs = ['book', 'set up', 'create', 'schedule', 'add', 'new', 'please schedule']
+            has_action_verb = self._matches_intent(query_lower, action_verbs)
+            
+            if has_action_verb:
+                # Check if 'schedule' is used as a NOUN (reading intent) vs VERB (creating intent)
+                # "show my schedule" / "what's on my schedule" / "my schedule for today" → list
+                # "schedule a meeting" / "schedule that" / "please schedule" → schedule
+                schedule_as_noun = any(p in query_lower for p in ['my schedule', 'the schedule', "what's on"])
+                
+                if schedule_as_noun:
+                    return await self._handle_list(query, context)
+                
+                return await self._handle_schedule(query, context)
+            else:
+                # No action verbs, default to list (safer — read not write)
+                return await self._handle_list(query, context)
+        
+        # 4. SCHEDULE intent (only if no list match)
+        if has_schedule:
+            return await self._handle_schedule(query, context)
+        
+        # 5. Default to list (safest — reading is non-destructive)
+        return await self._handle_list(query, context)
 
 
+
+    def _get_google_credentials(self):
+        """Extract Google OAuth credentials from available tools."""
+        # Check email tool first (most likely to have Gmail/People API scopes)
+        for tool_name in ['email', 'calendar', 'tasks', 'drive']:
+            tool = self.tools.get(tool_name)
+            if tool and hasattr(tool, 'credentials') and tool.credentials:
+                logger.info(f"[{self.name}] Got Google credentials from '{tool_name}' tool (valid={getattr(tool.credentials, 'valid', '?')})")
+                return tool.credentials
+        logger.warning(f"[{self.name}] No Google credentials found in any tool. Available tools: {list(self.tools.keys())}")
+        return None
+
+    async def _resolve_via_people_api(self, name: str) -> Optional[str]:
+        """Resolve a name to email using Google People API (searchContacts).
+        
+        This mirrors Gmail's autocomplete behavior — it searches the user's
+        Google Contacts and 'Other Contacts' (people they've emailed).
+        """
+        credentials = self._get_google_credentials()
+        if not credentials:
+            return None
+        
+        try:
+            from googleapiclient.discovery import build
+            import asyncio
+            
+            def _search_contacts():
+                people_service = build('people', 'v1', credentials=credentials, cache_discovery=False)
+                
+                # Strategy A: Search "Other Contacts" (people the user has emailed)
+                # This is the closest to Gmail's autocomplete behavior
+                try:
+                    result = people_service.otherContacts().search(
+                        query=name,
+                        readMask='emailAddresses,names',
+                        pageSize=5
+                    ).execute()
+                    
+                    for contact in result.get('results', []):
+                        person = contact.get('person', {})
+                        emails = person.get('emailAddresses', [])
+                        if emails:
+                            email = emails[0].get('value')
+                            if email and not any(b in email.lower() for b in SYSTEM_EMAIL_BLOCKLIST):
+                                return email
+                except Exception as e:
+                    logger.debug(f"[{self.name}] otherContacts.search failed: {e}")
+                
+                # Strategy B: Search saved contacts
+                try:
+                    result = people_service.people().searchContacts(
+                        query=name,
+                        readMask='emailAddresses,names',
+                        pageSize=5
+                    ).execute()
+                    
+                    for contact in result.get('results', []):
+                        person = contact.get('person', {})
+                        emails = person.get('emailAddresses', [])
+                        if emails:
+                            email = emails[0].get('value')
+                            if email and not any(b in email.lower() for b in SYSTEM_EMAIL_BLOCKLIST):
+                                return email
+                except Exception as e:
+                    logger.debug(f"[{self.name}] people.searchContacts failed: {e}")
+                
+                return None
+            
+            with LatencyMonitor(f"[{self.name}] People API Resolution ({name})"):
+                result = await asyncio.to_thread(_search_contacts)
+            
+            if result:
+                logger.info(f"[{self.name}] People API resolved '{name}' to '{result}'")
+            return result
+                
+        except ImportError:
+            logger.debug(f"[{self.name}] googleapiclient not available for People API")
+            return None
+        except Exception as e:
+            logger.warning(f"[{self.name}] People API resolution failed for {name}: {e}")
+            return None
+
+    async def _resolve_via_gmail_search(self, name: str) -> Optional[str]:
+        """Resolve a name to email by searching Gmail message headers.
+        
+        Searches for emails sent to/from the person and extracts their
+        email address from the message headers. This works even without
+        Google Contacts API scope.
+        """
+        credentials = self._get_google_credentials()
+        if not credentials:
+            return None
+        
+        try:
+            from googleapiclient.discovery import build
+            import asyncio
+            
+            def _search_gmail_headers():
+                gmail_service = build('gmail', 'v1', credentials=credentials, cache_discovery=False)
+                
+                # Search for messages from or to this person
+                search_query = f"from:{name} OR to:{name}"
+                
+                try:
+                    result = gmail_service.users().messages().list(
+                        userId='me',
+                        q=search_query,
+                        maxResults=5
+                    ).execute()
+                    
+                    messages = result.get('messages', [])
+                    if not messages:
+                        return None
+                    
+                    # Get headers from the first message
+                    msg = gmail_service.users().messages().get(
+                        userId='me',
+                        id=messages[0]['id'],
+                        format='metadata',
+                        metadataHeaders=['From', 'To', 'Cc']
+                    ).execute()
+                    
+                    headers = msg.get('payload', {}).get('headers', [])
+                    name_lower = name.lower()
+                    
+                    # Extract email from From/To/Cc headers that match the name
+                    for header in headers:
+                        header_value = header.get('value', '')
+                        header_lower = header_value.lower()
+                        
+                        if name_lower in header_lower:
+                            # Extract email from formats like "Emmanuel Haankwenda <emmanuel@clavr.me>"
+                            email_match = re.search(r'<([^>]+@[^>]+)>', header_value)
+                            if email_match:
+                                email = email_match.group(1)
+                                if not any(b in email.lower() for b in SYSTEM_EMAIL_BLOCKLIST):
+                                    return email
+                            
+                            # Or plain email format
+                            email_match = re.search(EMAIL_PATTERN, header_value)
+                            if email_match:
+                                email = email_match.group(0)
+                                if not any(b in email.lower() for b in SYSTEM_EMAIL_BLOCKLIST):
+                                    return email
+                    
+                    return None
+                    
+                except Exception as e:
+                    logger.debug(f"[{self.name}] Gmail header search failed: {e}")
+                    return None
+            
+            with LatencyMonitor(f"[{self.name}] Gmail Resolution ({name})"):
+                result = await asyncio.to_thread(_search_gmail_headers)
+            
+            if result:
+                logger.info(f"[{self.name}] Gmail search resolved '{name}' to '{result}'")
+            return result
+                
+        except ImportError:
+            logger.debug(f"[{self.name}] googleapiclient not available for Gmail search")
+            return None
+        except Exception as e:
+            logger.warning(f"[{self.name}] Gmail search resolution failed for {name}: {e}")
+            return None
 
     async def _resolve_attendee_email(self, name: str, user_id: int) -> Optional[str]:
-        """Resolve a name to an email address using domain context."""
+        """Resolve a name to an email address.
+        
+        Resolution chain:
+        1. ContactResolver with disambiguation (returns all candidates)
+        2. If single match → use it
+        3. If multiple matches with clear winner → use best one
+        4. If ambiguous → return best guess but log alternatives
+        5. Returns None → CalendarTool will try People API + Gmail as fallback
+        """
+        logger.info(f"[{self.name}] 🔍 Resolving attendee: '{name}' (user_id={user_id})")
+        
         if "@" in name:
-            # Block list for system emails
-            block_list = SYSTEM_EMAIL_BLOCKLIST
+            # Already an email — validate against blocklist
             name_lower = name.lower()
-            if any(block in name_lower for block in block_list):
+            if any(block in name_lower for block in SYSTEM_EMAIL_BLOCKLIST):
                 logger.warning(f"[{self.name}] Rejecting system email: {name}")
                 return None
             return name
-            
-        if not self.domain_context:
-            logger.warning(f"[{self.name}] No domain context for email resolution")
-            return None
 
-        # 1. Try Graph Search (Primary) - Look for Person node
-        if self.domain_context.graph_manager:
-            try:
-                # Search for Person with matching name (case-insensitive fuzzy match)
-                with LatencyMonitor(f"[{self.name}] Graph Resolution ({name})"):
-                    # execute_query returns List[Dict]
-                    results = await self.domain_context.graph_manager.execute_query(
-                        query=AQL_RESOLVE_PERSON, 
-                        params={"name": name}
-                    )
-                
-                if results and len(results) > 0:
-                    person = results[0]
-                    # Check for email property
-                    email = person.get('email')
-                    if email:
-                        # Double check if the resolved email is a system email
-                        if any(block in email.lower() for block in SYSTEM_EMAIL_BLOCKLIST):
-                             logger.warning(f"[{self.name}] Graph resolved to system email, rejecting: {email}")
-                             return None
-                             
-                        logger.info(f"[{self.name}] Graph resolved '{name}' to '{email}' (Person.email)")
-                        return email
-                        
-            except Exception as e:
-                logger.warning(f"[{self.name}] Graph resolution failed for {name}: {e}")
-
-        # 2. Fallback to Vector Search
-        if not self.domain_context.vector_store:
-             return None
-
+        # 1. ContactResolver with disambiguation
         try:
-            query = f"email address for {name}"
-            with LatencyMonitor(f"[{self.name}] Email Resolution ({name})"):
-                results = await self.domain_context.vector_store.asearch(
-                    query=query,
-                    filters={"user_id": user_id},
-                    k=3,
-                    min_confidence=0.75
-                )
-            
-            for res in results:
-                content = res.get('content', '')
-                matches = re.findall(EMAIL_PATTERN, content)
-                if matches:
-                    logger.info(f"[{self.name}] Resolved '{name}' to '{matches[0]}'")
-                    return matches[0]
+            from src.services.contact_resolver import get_contact_resolver
+            resolver = get_contact_resolver()
+            if resolver:
+                candidates = await resolver.resolve_with_disambiguation(name, user_id, identity_type="email")
+                
+                if len(candidates) == 1:
+                    # Unambiguous — single match
+                    c = candidates[0]
+                    logger.info(f"[{self.name}] ✅ Resolved '{name}' → '{c.email}' (via {c.source}, confidence={c.confidence})")
+                    return c.email
+                
+                elif len(candidates) > 1:
+                    best = candidates[0]
+                    runner_up = candidates[1]
                     
-            return None
-            
+                    # If best match is clearly stronger (confidence gap > 0.2), use it
+                    if best.confidence - runner_up.confidence > 0.2:
+                        logger.info(
+                            f"[{self.name}] ✅ Best match for '{name}' → '{best.email}' "
+                            f"(confidence={best.confidence}, runner-up={runner_up.person_name}={runner_up.confidence})"
+                        )
+                        return best.email
+                    
+                    # Ambiguous — use best match but log the alternatives
+                    alternatives = ", ".join(f"{c.person_name} ({c.email})" for c in candidates[1:])
+                    logger.info(
+                        f"[{self.name}] ⚠️ Ambiguous match for '{name}': "
+                        f"using '{best.email}' (confidence={best.confidence}). "
+                        f"Alternatives: {alternatives}"
+                    )
+                    # Store disambiguation info for the agent to surface to user
+                    if not hasattr(self, '_disambiguation_warnings'):
+                        self._disambiguation_warnings = []
+                    self._disambiguation_warnings.append({
+                        'name': name,
+                        'chosen': best.person_name,
+                        'chosen_email': best.email,
+                        'alternatives': [
+                            {'name': c.person_name, 'email': c.email, 'confidence': c.confidence}
+                            for c in candidates[1:]
+                        ]
+                    })
+                    return best.email
+                
+                logger.info(f"[{self.name}] ContactResolver found no match for '{name}'")
+            else:
+                logger.info(f"[{self.name}] ContactResolver not initialized, skipping graph resolution")
         except Exception as e:
-            logger.error(f"[{self.name}] Failed to resolve email for {name}: {e}")
-            return None
+            logger.warning(f"[{self.name}] ContactResolver failed for '{name}': {e}")
+
+        # 2. People API fallback (searches Google Contacts + Other Contacts)
+        try:
+            people_result = await self._resolve_via_people_api(name)
+            if people_result:
+                logger.info(f"[{self.name}] ✅ People API resolved '{name}' → '{people_result}'")
+                return people_result
+        except Exception as e:
+            logger.debug(f"[{self.name}] People API fallback failed for '{name}': {e}")
+
+        # 3. Gmail header search fallback (searches From/To/Cc headers)
+        try:
+            gmail_result = await self._resolve_via_gmail_search(name)
+            if gmail_result:
+                logger.info(f"[{self.name}] ✅ Gmail search resolved '{name}' → '{gmail_result}'")
+                return gmail_result
+        except Exception as e:
+            logger.debug(f"[{self.name}] Gmail search fallback failed for '{name}': {e}")
+
+        # All resolution strategies exhausted
+        logger.info(f"[{self.name}] ❌ All resolution strategies failed for '{name}'")
+        return None
 
     async def _handle_schedule(self, query: str, context: Optional[Dict[str, Any]] = None) -> str:
         """Handle event scheduling with LLM extraction"""
@@ -159,45 +406,43 @@ class CalendarAgent(BaseAgent):
 
         # Resolve attendees
         attendees = params.get("attendees")
-        unresolved_names = []
+        unresolved_attendees = []  # Track names we couldn't resolve to emails
+        
+        # Use pre-resolved entities from supervisor context (EntityExtractor)
+        pre_resolved_contacts = {}
+        if context:
+            pre_resolved_contacts = context.get('resolved_contacts', {}) or {}
+            if pre_resolved_contacts:
+                logger.info(f"[{self.name}] Found pre-resolved contacts from supervisor: {pre_resolved_contacts}")
         
         if attendees and isinstance(attendees, list) and user_id:
             resolved_attendees = []
             for attendee in attendees:
                 if isinstance(attendee, str):
-                    # Always try to resolve/validate, even if it looks like an email.
-                    # This ensures system emails (notifications@, noreply@) are filtered out via blocklist.
+                    # First, check if supervisor already resolved this name
+                    pre_resolved_email = pre_resolved_contacts.get(attendee)
+                    if pre_resolved_email:
+                        logger.info(f"[{self.name}] ✅ Using pre-resolved email for '{attendee}' → '{pre_resolved_email}'")
+                        resolved_attendees.append(pre_resolved_email)
+                        continue
+                    
+                    # Try CalendarAgent-level resolution (graph → People API → Gmail)
                     resolved = await self._resolve_attendee_email(attendee, user_id)
                     if resolved:
                         resolved_attendees.append(resolved)
                     else:
-                        logger.warning(f"[{self.name}] Could not resolve email for: {attendee}")
-                        # Keep track of unresolved names to add to description
-                        if "@" not in attendee:  # Only adding names, not broken emails
-                            unresolved_names.append(attendee)
+                        logger.warning(f"[{self.name}] Could not resolve attendee '{attendee}' to email")
+                        unresolved_attendees.append(attendee)
             
-            # Update params with valid emails
-            if resolved_attendees != attendees:
-                 logger.info(f"[{self.name}] Resolved attendees: {resolved_attendees}")
-                 params["attendees"] = resolved_attendees
-
-        # Append unresolved guests to description so they aren't lost
-        if unresolved_names:
-            desc = params.get("description") or ""
-            guests_str = ", ".join(unresolved_names)
-            # Add to description gracefully
-            if desc:
-                params["description"] = f"{desc}\n\nGuests (no email found): {guests_str}"
-            else:
-                params["description"] = f"Guests: {guests_str}"
-            logger.info(f"[{self.name}] Added unresolved guests to description: {guests_str}")
+            params["attendees"] = resolved_attendees
+            logger.info(f"[{self.name}] Final attendees list for tool: {resolved_attendees} (unresolved: {unresolved_attendees})")
         # FIX: The LLM often puts duration (e.g., "1 hour") into end_time because of the schema description.
         # We must detect this and move it to duration_minutes, otherwise service layer fails with date parsing error.
         raw_end = params.get("end_time")
         if raw_end and isinstance(raw_end, str):
             # Check if it looks like a duration ("1 hour", "30 mins") rather than a time ("13:00")
             # Simple heuristic: presence of duration words and absence of colon (unless it's like 1:30h)
-            import re
+            # re is imported at file level
             duration_match = re.search(DURATION_IN_ENDTIME_PATTERN, raw_end, re.IGNORECASE)
             is_iso = 'T' in raw_end or ':' in raw_end
             
@@ -219,9 +464,7 @@ class CalendarAgent(BaseAgent):
                 
                 if minutes > 0:
                     params['duration_minutes'] = minutes
-                if minutes > 0:
-                    params['duration_minutes'] = minutes
-                    params['end_time'] = None # Clear invalid end_time
+                    params['end_time'] = None  # Clear invalid end_time
         
         # SMART SCHEDULING: "Plan a run between meetings"
         # If no start time is provided, but user asks for "between", "gap", "free", try to find a slot.
@@ -242,18 +485,46 @@ class CalendarAgent(BaseAgent):
              availability_resp = await self._safe_tool_execute(TOOL_ALIASES_CALENDAR, free_input, "checking availability")
              
              # Extract first slot from text
-             import re
-             # Match "- Day, HH:MM PM" or similar
-             slot_match = re.search(r'-\s+(?:[A-Za-z]+,\s+)?(\d{1,2}:\d{2}\s*[AaPp][Mm])', availability_resp)
+             # Tool output format: "Found available slots...\n- Monday, 02:00 PM"
+             # Regex captures optional day-of-week and the time
+             slot_match = re.search(
+                 r'-\s+(?:([A-Za-z]+),\s+)?(\d{1,2}:\d{2}\s*[AaPp][Mm])',
+                 availability_resp
+             )
              if slot_match:
-                 found_time_str = slot_match.group(1)
-                 # Parse time relative to today
-                 # Assuming FlexibleDateParser inside Tool handled the date, but here we just get time string.
-                 # We need a proper datetime.
-                 # Optimization: For now, let's just pass this string to start_time and hope Tool parses it.
-                 # "02:00 PM" works for tool input if date is implied (today).
-                 params["start_time"] = found_time_str
-                 logger.info(f"[{self.name}] Smart Scheduling: Found gap at {found_time_str}")
+                 day_name = slot_match.group(1)  # e.g. "Monday" or None
+                 time_str = slot_match.group(2)  # e.g. "02:00 PM"
+                 
+                 # Build a proper ISO datetime from day-of-week + time
+                 from datetime import datetime as _dt, timedelta as _td
+                 try:
+                     time_part = _dt.strptime(time_str.strip(), "%I:%M %p")
+                     target_date = _dt.now().date()
+                     
+                     if day_name:
+                         # Resolve day-of-week to next occurrence
+                         day_map = {
+                             'monday': 0, 'tuesday': 1, 'wednesday': 2,
+                             'thursday': 3, 'friday': 4, 'saturday': 5, 'sunday': 6
+                         }
+                         target_dow = day_map.get(day_name.lower())
+                         if target_dow is not None:
+                             current_dow = target_date.weekday()
+                             days_ahead = (target_dow - current_dow) % 7
+                             if days_ahead == 0:
+                                 # Same day — only use it if the time is in the future
+                                 candidate = _dt.combine(target_date, time_part.time())
+                                 if candidate <= _dt.now():
+                                     days_ahead = 7  # Next week
+                             target_date = target_date + _td(days=days_ahead)
+                     
+                     full_dt = _dt.combine(target_date, time_part.time())
+                     params["start_time"] = full_dt.isoformat()
+                     logger.info(f"[{self.name}] Smart Scheduling: Found gap at {full_dt.isoformat()}")
+                 except (ValueError, KeyError) as e:
+                     # Fallback: pass the raw time string and let the tool parse it
+                     logger.warning(f"[{self.name}] Smart Scheduling: datetime construction failed ({e}), using raw time: {time_str}")
+                     params["start_time"] = time_str
                  
                  # Append context to description
                  params["description"] = (params.get("description") or "") + "\n(Scheduled in found gap)"
@@ -268,7 +539,6 @@ class CalendarAgent(BaseAgent):
         # Check for None, empty string, or whitespace-only
         if not summary_value or (isinstance(summary_value, str) and not summary_value.strip()):
             logger.warning(f"[{self.name}] LLM did not extract title (got: {repr(summary_value)}), attempting fallback extraction from query: {query}")
-            import re
             # Try to extract title from common patterns like "schedule X meeting", "book a X session"
             for pattern in TITLE_FALLBACK_PATTERNS:
                 match = re.search(pattern, query, re.IGNORECASE)
@@ -307,26 +577,43 @@ class CalendarAgent(BaseAgent):
             "check_conflicts": params.get("check_conflicts") if params.get("check_conflicts") is not None else True  # Hard default
         }
         
-        return await self._safe_tool_execute(
+        result = await self._safe_tool_execute(
             TOOL_ALIASES_CALENDAR, tool_input, "scheduling event"
         )
+        
+        # Surface unresolved attendees to the user — don't silently drop them
+        if unresolved_attendees:
+            names_str = ", ".join(unresolved_attendees)
+            result += (
+                f"\n\n⚠️ **Heads up:** I couldn't find an email address for **{names_str}**. "
+                f"You'll need to add them manually in Google Calendar, or tell me their email "
+                f"(e.g., \"Emmanuel's email is emmanuel@example.com\") so I can remember it for next time."
+            )
+        
+        return result
 
     async def _handle_list(self, query: str, context: Optional[Dict[str, Any]] = None) -> str:
-        """Handle event listing with robust fallback for param extraction failures."""
+        """Handle event listing with fast path for common date queries."""
         user_id = context.get('user_id') if context else None
         
-        try:
-            params = await self._extract_params(
-                query, 
-                LIST_SCHEMA, 
-                user_id=user_id,
-                task_type="planning"
-            )
-            logger.info(f"[{self.name}] Extracted params for list: {params}")
-        except Exception as e:
-            # Fallback: default to today's events if param extraction fails
-            logger.warning(f"[{self.name}] Param extraction failed ({e}), using defaults for 'today'")
-            params = {"days_ahead": 1}  # Default: show today's events
+        # FAST PATH: Extract dates directly for common patterns (skip LLM entirely)
+        params = self._fast_extract_list_params(query)
+        
+        if params is None:
+            # Complex query — use LLM but skip memory/RAG (simple_extraction)
+            try:
+                params = await self._extract_params(
+                    query, 
+                    LIST_SCHEMA, 
+                    user_id=user_id,
+                    task_type="simple_extraction"
+                )
+                logger.info(f"[{self.name}] Extracted params for list (LLM): {params}")
+            except Exception as e:
+                logger.warning(f"[{self.name}] Param extraction failed ({e}), using defaults for 'today'")
+                params = {"days_ahead": 1}
+        else:
+            logger.info(f"[{self.name}] Extracted params for list (fast path): {params}")
         
         # Handle past date queries
         if params.get("looking_at_past"):
@@ -335,13 +622,13 @@ class CalendarAgent(BaseAgent):
                 "query": query,
                 "start_date": params.get("start_time"),
                 "end_date": params.get("end_time"),
-                "days_ahead": 1  # When we have explicit dates, set days_ahead to 1
+                "days_ahead": 1
             }
         else:
             tool_input = {
                 "action": "list", 
                 "query": query,
-                "days_ahead": params.get("days_ahead") or 1,  # Default to 1 day
+                "days_ahead": params.get("days_ahead") or 1,
                 "start_date": params.get("start_time"),
                 "end_date": params.get("end_time")
             }
@@ -351,6 +638,71 @@ class CalendarAgent(BaseAgent):
         return await self._safe_tool_execute(
             TOOL_ALIASES_CALENDAR, tool_input, "listing calendar events"
         )
+    
+    @staticmethod
+    def _fast_extract_list_params(query: str) -> Optional[Dict[str, Any]]:
+        """
+        Fast regex-based date extraction for common calendar list queries.
+        Returns None if the query is too complex for regex (falls back to LLM).
+        """
+        from datetime import datetime, timedelta
+        
+        q = query.lower().strip()
+        now = datetime.now()
+        
+        # "today" or generic calendar queries
+        today_patterns = ['today', 'what is on my calendar', "what's on my calendar",
+                          'my calendar', 'my events', 'my schedule', 'my agenda']
+        if any(p in q for p in today_patterns) and 'tomorrow' not in q and 'week' not in q:
+            return {
+                "start_time": now.strftime("%Y-%m-%dT00:00:00"),
+                "end_time": now.strftime("%Y-%m-%dT23:59:59"),
+                "days_ahead": 1
+            }
+        
+        # "tomorrow"
+        if 'tomorrow' in q:
+            tmrw = now + timedelta(days=1)
+            return {
+                "start_time": tmrw.strftime("%Y-%m-%dT00:00:00"),
+                "end_time": tmrw.strftime("%Y-%m-%dT23:59:59"),
+                "days_ahead": 1
+            }
+        
+        # "this week"
+        if 'this week' in q:
+            end = now + timedelta(days=(6 - now.weekday()))
+            return {
+                "start_time": now.strftime("%Y-%m-%dT00:00:00"),
+                "end_time": end.strftime("%Y-%m-%dT23:59:59"),
+                "days_ahead": (end - now).days + 1
+            }
+        
+        # "next week"
+        if 'next week' in q:
+            days_until_monday = 7 - now.weekday()
+            start = now + timedelta(days=days_until_monday)
+            end = start + timedelta(days=6)
+            return {
+                "start_time": start.strftime("%Y-%m-%dT00:00:00"),
+                "end_time": end.strftime("%Y-%m-%dT23:59:59"),
+                "days_ahead": 7
+            }
+        
+        # "next N days"
+        import re as _re
+        m = _re.search(r'next\s+(\d+)\s+days?', q)
+        if m:
+            n = int(m.group(1))
+            end = now + timedelta(days=n)
+            return {
+                "start_time": now.strftime("%Y-%m-%dT00:00:00"),
+                "end_time": end.strftime("%Y-%m-%dT23:59:59"),
+                "days_ahead": n
+            }
+        
+        # Not a simple pattern — fall back to LLM
+        return None
 
     async def _handle_update(self, query: str, context: Optional[Dict[str, Any]] = None) -> str:
         """
@@ -419,7 +771,6 @@ class CalendarAgent(BaseAgent):
              availability_resp = await self._safe_tool_execute(TOOL_ALIASES_CALENDAR, free_input, "finding new slot")
              
              # Extract slot
-             import re
              slot_match = re.search(r'-\s+(?:[A-Za-z]+,\s+)?(\d{1,2}:\d{2}\s*[AaPp][Mm])', availability_resp)
              if slot_match:
                  new_start = slot_match.group(1)
@@ -443,26 +794,153 @@ class CalendarAgent(BaseAgent):
         )
 
     async def _handle_availability(self, query: str, context: Optional[Dict[str, Any]] = None) -> str:
-        """Handle availability queries (Am I free?)"""
+        """
+        Handle availability queries.
+        
+        Two modes based on LLM-extracted 'action':
+          - check_specific: "Am I free at 3pm?" → list events at that time, report free/busy
+          - find_gap: "When am I free?" → call find_free_time to locate open slots
+        """
         user_id = context.get('user_id') if context else None
         
-        params = await self._extract_params(
-            query, 
-            AVAILABILITY_SCHEMA, 
-            user_id=user_id,
-            task_type="planning"
-        )
-        # We rely on list logic for now as specialized tool actions 'find_free' are internal to service
-        # but not fully exposed in 'list/search' actions of the tool.
-        # Mapping to list allows LLM to see the gap.
+        try:
+            params = await self._extract_params(
+                query, 
+                AVAILABILITY_SCHEMA, 
+                user_id=user_id,
+                task_type="planning"
+            )
+            logger.info(f"[{self.name}] Availability params: {params}")
+        except Exception as e:
+            logger.warning(f"[{self.name}] Availability param extraction failed ({e}), defaulting to find_gap")
+            params = {"action": "find_gap", "duration_minutes": 30}
+        
+        availability_action = (params.get("action") or "find_gap").lower().strip()
+        duration = params.get("duration_minutes") or 30
+        start_time = params.get("start_time")
+        
+        # ------------------------------------------------------------------
+        # MODE 1: Check a specific time — "Am I free at 3pm?"
+        # ------------------------------------------------------------------
+        if availability_action == "check_specific" and start_time:
+            logger.info(f"[{self.name}] Checking specific availability at {start_time}")
+            
+            # List events around the requested time window
+            tool_input = {
+                "action": "list",
+                "query": query,
+                "start_date": start_time,
+                "days_ahead": 1
+            }
+            
+            events_resp = await self._safe_tool_execute(
+                TOOL_ALIASES_CALENDAR, tool_input, "checking calendar"
+            )
+            
+            # Analyze the response to determine free/busy
+            # Tool returns strings like "No events found" or lists event details
+            no_events_indicators = ["no events", "no upcoming", "nothing scheduled", "calendar is clear"]
+            is_free = any(indicator in events_resp.lower() for indicator in no_events_indicators)
+            
+            if is_free:
+                return f"✅ You're free at that time! No conflicts found.\n\n{events_resp}"
+            else:
+                # There are events — check if find_free_time can suggest alternatives
+                alt_input = {
+                    "action": "find_free_time",
+                    "duration_minutes": duration,
+                    "start_time": start_time,
+                    "working_hours_only": True
+                }
+                
+                alt_resp = await self._safe_tool_execute(
+                    TOOL_ALIASES_CALENDAR, alt_input, "finding alternatives"
+                )
+                
+                return (
+                    f"⚠️ You have events at that time:\n\n{events_resp}\n\n"
+                    f"Here are some available alternatives:\n{alt_resp}"
+                )
+        
+        # ------------------------------------------------------------------
+        # MODE 2: Find gaps — "When am I free?" / "Find me a 1-hour slot"
+        # ------------------------------------------------------------------
+        logger.info(f"[{self.name}] Finding free gaps (duration={duration}min)")
         
         tool_input = {
-            "action": "list", 
+            "action": "find_free_time",
+            "duration_minutes": duration,
             "query": query,
-            "days_ahead": 1,
-            "start_date": params.get("start_time")
+            "working_hours_only": True
         }
         
-        return await self._safe_tool_execute(
-            TOOL_ALIASES_CALENDAR, tool_input, "checking availability"
+        # Add time bounds if the user specified them
+        if start_time:
+            tool_input["start_time"] = start_time
+        
+        result = await self._safe_tool_execute(
+            TOOL_ALIASES_CALENDAR, tool_input, "finding available time"
         )
+        
+        # ------------------------------------------------------------------
+        # AUTO-SCHEDULE: If query has scheduling context (from HITL rewrite),
+        # extract the first available slot and schedule the event there.
+        # ------------------------------------------------------------------
+        scheduling_signals = ['schedule', 'book', 'set up', 'create', 'meeting with', 'clavr meeting']
+        query_lower = query.lower()
+        is_scheduling_followup = any(sig in query_lower for sig in scheduling_signals)
+        
+        if is_scheduling_followup and "available" in result.lower():
+            logger.info(f"[{self.name}] Scheduling follow-up detected — auto-scheduling at first free slot")
+            
+            # Parse the first available time from the find_free_time output
+            # Format is: "Found available slots...\n- Friday, 10:00 AM\n- Friday, 12:00 PM"
+            import re as _re
+            slot_match = _re.search(
+                r'-\s+(?:([A-Za-z]+),\s+)?(\d{1,2}:\d{2}\s*[AaPp][Mm])',
+                result
+            )
+            
+            if slot_match:
+                from datetime import datetime as _dt, timedelta as _td
+                
+                day_name = slot_match.group(1)  # e.g., "Friday"
+                time_str = slot_match.group(2)  # e.g., "10:00 AM"
+                
+                try:
+                    time_part = _dt.strptime(time_str.strip(), "%I:%M %p")
+                    target_date = _dt.now().date()
+                    
+                    if day_name:
+                        day_map = {
+                            'monday': 0, 'tuesday': 1, 'wednesday': 2,
+                            'thursday': 3, 'friday': 4, 'saturday': 5, 'sunday': 6
+                        }
+                        target_dow = day_map.get(day_name.lower())
+                        if target_dow is not None:
+                            current_dow = target_date.weekday()
+                            days_ahead = (target_dow - current_dow) % 7
+                            if days_ahead == 0:
+                                candidate = _dt.combine(target_date, time_part.time())
+                                if candidate <= _dt.now():
+                                    days_ahead = 7
+                            target_date = target_date + _td(days=days_ahead)
+                    
+                    full_dt = _dt.combine(target_date, time_part.time())
+                    new_start = full_dt.isoformat()
+                    
+                    # Build a scheduling query with the new time
+                    schedule_query = f"schedule {query} at {time_str}"
+                    if day_name:
+                        schedule_query = f"schedule {query} on {day_name} at {time_str}"
+                    
+                    logger.info(f"[{self.name}] Auto-scheduling at {new_start}: {schedule_query}")
+                    
+                    # Route to the schedule handler with the resolved time
+                    schedule_result = await self._handle_schedule(schedule_query, context)
+                    return schedule_result
+                    
+                except Exception as auto_err:
+                    logger.warning(f"[{self.name}] Auto-schedule failed: {auto_err}, falling back to listing slots")
+        
+        return result

@@ -427,18 +427,66 @@ class GraphRAGIntegrationService:
                     # Fallback: batch query without type filter
                     nodes_map = await self.graph.get_nodes_batch(node_ids)
                 
-                # Batch get neighbors (Priority 1 & 3 improvement)
-                # Get common relationship types for context enrichment
+                # Batch get neighbors (G2 improvement: node-type-aware traversal)
+                # Use relationship types relevant to each node type for richer context
                 from .graph.schema import RelationType, NodeType
-                rel_types = [
-                    RelationType.CONTAINS,  # For ActionItems
-                    RelationType.FROM,      # For Contacts
-                    RelationType.HAS_ATTACHMENT,  # For Documents
-                ]
+                
+                # Build comprehensive rel_types based on which node types we have
+                NODE_TYPE_REL_MAP = {
+                    NodeType.EMAIL: [
+                        RelationType.FROM, RelationType.TO, RelationType.CC,
+                        RelationType.HAS_ATTACHMENT, RelationType.ABOUT,
+                    ],
+                    NodeType.PERSON: [
+                        RelationType.COMMUNICATES_WITH, RelationType.KNOWS,
+                        RelationType.FROM, RelationType.TO,
+                    ],
+                    NodeType.CONTACT: [
+                        RelationType.COMMUNICATES_WITH, RelationType.KNOWS,
+                        RelationType.FROM, RelationType.TO,
+                    ],
+                    NodeType.CALENDAR_EVENT: [
+                        RelationType.ABOUT,
+                    ],
+                    NodeType.ASANA_TASK: [
+                        RelationType.ASSIGNED_TO, RelationType.ABOUT,
+                        RelationType.CONTAINS,
+                    ],
+                    NodeType.LINEAR_ISSUE: [
+                        RelationType.ASSIGNED_TO, RelationType.ABOUT,
+                    ],
+                    NodeType.ACTION_ITEM: [
+                        RelationType.CONTAINS, RelationType.ASSIGNED_TO,
+                    ],
+                    NodeType.DOCUMENT: [
+                        RelationType.HAS_ATTACHMENT, RelationType.ABOUT,
+                    ],
+                }
+                
+                # Collect all relevant relationship types based on node types present
+                all_rel_types = set()
+                for nid in node_ids:
+                    nt = node_types_map.get(nid)
+                    if nt and nt in NODE_TYPE_REL_MAP:
+                        all_rel_types.update(NODE_TYPE_REL_MAP[nt])
+                
+                # Fallback: if no node types matched, use broad defaults
+                if not all_rel_types:
+                    all_rel_types = {
+                        RelationType.CONTAINS,
+                        RelationType.FROM,
+                        RelationType.HAS_ATTACHMENT,
+                        RelationType.ABOUT,
+                        RelationType.COMMUNICATES_WITH,
+                    }
+                
+                rel_types = list(all_rel_types)
                 target_node_types = [
                     NodeType.ACTION_ITEM,
                     NodeType.CONTACT,
+                    NodeType.PERSON,
                     NodeType.DOCUMENT,
+                    NodeType.TOPIC,
                 ]
                 
                 neighbors_map = await self.graph.get_neighbors_batch(
@@ -482,6 +530,52 @@ class GraphRAGIntegrationService:
                         'node_type': node.get('node_type') or node.get('type'),
                         'properties': node
                     }
+                    
+                    # Multi-signal relationship-weighted score boosting
+                    # Considers edge type, strength, and safe fallbacks
+                    EDGE_TYPE_WEIGHTS = {
+                        'COMMUNICATES_WITH': 1.0,
+                        'ATTENDED_BY': 0.8,
+                        'ORGANIZED_BY': 0.8,
+                        'FROM': 0.7,
+                        'TO': 0.7,
+                        'CC': 0.5,
+                        'DISCUSSES': 0.5,
+                        'KNOWS': 0.6,
+                        'HAS_IDENTITY': 0.0,
+                        'SAME_AS': 0.0,
+                        'RELATED_TO': 0.3,
+                        'BELONGS_TO': 0.1,
+                    }
+                    
+                    best_signal = 0.0
+                    for neighbor_data in neighbors:
+                        # neighbors may be (id, rel_dict) tuples or dicts
+                        rel_data = None
+                        if isinstance(neighbor_data, (list, tuple)) and len(neighbor_data) >= 2:
+                            _, rel_data = neighbor_data[0], neighbor_data[1]
+                        elif isinstance(neighbor_data, dict):
+                            rel_data = neighbor_data
+                        
+                        if not isinstance(rel_data, dict):
+                            continue
+                        
+                        # Edge type weight
+                        rel_type = rel_data.get('rel_type', rel_data.get('type', ''))
+                        type_weight = EDGE_TYPE_WEIGHTS.get(str(rel_type), 0.3)
+                        
+                        # Relationship strength (may not exist on all edges)
+                        strength = float(rel_data.get('strength', 0.5) or 0.5)
+                        
+                        signal = strength * type_weight
+                        if signal > best_signal:
+                            best_signal = signal
+                    
+                    if best_signal > 0:
+                        # Boost confidence by up to 0.15
+                        strength_boost = min(best_signal * 0.15, 0.15)
+                        enriched['confidence'] = min(1.0, enriched['confidence'] + strength_boost)
+                        enriched['relationship_strength'] = best_signal
             
             enriched_results.append(enriched)
         
@@ -939,6 +1033,20 @@ class GraphRAGIntegrationService:
             'indexed_at': node.properties.get('indexed_at', ''),
             **self._extract_searchable_metadata(node)
         }
+        
+        # G5: Compute numeric _timestamp for efficient temporal range queries
+        # Replaces slow string-based date comparison in both Qdrant and ArangoDB
+        timestamp_candidates = ['date', 'timestamp', 'start_time', 'created_at', 'due', 'receipt_date']
+        for field in timestamp_candidates:
+            raw_ts = node.properties.get(field)
+            if raw_ts:
+                try:
+                    from dateutil.parser import parse as dateparse
+                    dt = dateparse(str(raw_ts))
+                    metadata['_timestamp'] = int(dt.timestamp())
+                    break
+                except (ValueError, TypeError):
+                    continue
         
         # Use chunked indexing 
         # Each chunk will have the graph_node_id for Graph traversal

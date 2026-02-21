@@ -62,6 +62,18 @@ class CalendarCrawler(BaseIndexer):
         self.sync_interval = ServiceConstants.CALENDAR_SYNC_INTERVAL
         self.days_back = ServiceConstants.CALENDAR_DAYS_BACK
         self.days_ahead = ServiceConstants.CALENDAR_DAYS_AHEAD
+        
+        # Fetch user's email for self-attendee detection
+        self.user_email = None
+        try:
+            from sqlalchemy import select
+            from src.database.models import User
+            with get_db_context() as db:
+                user = db.execute(select(User).where(User.id == user_id)).scalars().first()
+                if user:
+                    self.user_email = user.email
+        except Exception:
+            pass
     
     @property
     def name(self) -> str:
@@ -238,31 +250,61 @@ class CalendarCrawler(BaseIndexer):
             
             # Create Person nodes for organizer
             if organizer.get('email'):
-                organizer_node, organizer_rel = self._create_person_with_relationship(
+                org_nodes = self._create_person_with_relationship(
                     email=organizer.get('email'),
                     name=organizer.get('displayName'),
                     event_node_id=node_id,
-                    rel_type=RelationType.ORGANIZED_BY
+                    rel_type=RelationType.ORGANIZED_BY,
+                    response_status='accepted',
+                    attendee_role='organizer',
                 )
-                if organizer_node:
-                    nodes.append(organizer_node)
-                    event_node.relationships.append(organizer_rel)
+                if org_nodes:
+                    nodes.extend(org_nodes)
+                    # The relationship is already appended inside _create_person_with_relationship
+                    # via event_node_id, but we need to add it to event_node
+                    for n in org_nodes:
+                        if hasattr(n, 'relationships'):
+                            for rel in (n.relationships or []):
+                                if rel.get('from_node') == node_id or (hasattr(rel, 'from_node') and rel.from_node == node_id):
+                                    event_node.relationships.append(rel)
             
-            # Create Person nodes for attendees
+            # Create Person nodes for attendees with RSVP + role
             for attendee in attendees:
                 email = attendee.get('email')
                 if not email:
                     continue
                 
-                attendee_node, attendee_rel = self._create_person_with_relationship(
+                # Skip self (link directly via BELONGS_TO already)
+                if self.user_email and email.lower().strip() == self.user_email.lower():
+                    continue
+                
+                response_status = attendee.get('responseStatus', 'needsAction')
+                is_optional = attendee.get('optional', False)
+                attendee_role = 'optional' if is_optional else 'required'
+                
+                att_nodes = self._create_person_with_relationship(
                     email=email,
                     name=attendee.get('displayName'),
                     event_node_id=node_id,
-                    rel_type=RelationType.ATTENDED_BY
+                    rel_type=RelationType.ATTENDED_BY,
+                    response_status=response_status,
+                    attendee_role=attendee_role,
                 )
-                if attendee_node:
-                    nodes.append(attendee_node)
-                    event_node.relationships.append(attendee_rel)
+                if att_nodes:
+                    nodes.extend(att_nodes)
+            
+            # Auto-link event title to Topic nodes for cross-stack discovery
+            if self.topic_extractor and summary and len(summary) > 10:
+                try:
+                    await self.topic_extractor.get_or_create_topic(
+                        name=summary,
+                        source='google_calendar',
+                        source_node_id=node_id,
+                        user_id=self.user_id,
+                        confidence=0.8,
+                    )
+                except Exception as e:
+                    logger.debug(f"[CalendarCrawler] Auto-topic failed for '{summary[:30]}': {e}")
             
             return nodes
             
@@ -275,34 +317,117 @@ class CalendarCrawler(BaseIndexer):
         email: str,
         name: Optional[str],
         event_node_id: str,
-        rel_type: RelationType
-    ) -> tuple:
-        """Create a Person node and relationship to an event."""
+        rel_type: RelationType,
+        response_status: str = 'needsAction',
+        attendee_role: str = 'required',
+    ) -> Optional[List[ParsedNode]]:
+        """
+        Create Person + Identity nodes and relationships for a calendar attendee.
+        
+        Creates:
+        - Person node (with user_id for data isolation)
+        - Identity node (email) with HAS_IDENTITY edge
+        - User KNOWS Person edge with aliases
+        - CalendarEvent → Person edge with RSVP status and role
+        
+        Returns:
+            List of ParsedNodes (Person + Identity), or None
+        """
         # Normalize email
         email_lower = email.lower().strip()
         
         # Generate consistent person node ID using centralized utility
-        from src.services.indexing.node_id_utils import generate_person_id
+        from src.services.indexing.node_id_utils import generate_person_id, generate_identity_id
         person_node_id = generate_person_id(email=email_lower)
         
+        display_name = name or email_lower.split('@')[0]
+        
+        # --- Person node (enriched) ---
         person_node = ParsedNode(
             node_id=person_node_id,
             node_type=NodeType.PERSON,
             properties={
-                'name': name or email.split('@')[0],
+                'name': display_name,
                 'email': email_lower,
+                'user_id': self.user_id,
                 'source': 'google_calendar',
             },
-            searchable_text=f"{name or ''} {email_lower}"
+            searchable_text=f"{display_name} {email_lower}",
+            relationships=[]
         )
         
-        relationship = Relationship(
-            from_node=event_node_id,
-            to_node=person_node_id,
-            rel_type=rel_type
-        )
+        # --- CalendarEvent → Person relationship with RSVP + role ---
+        event_rel = {
+            'from_node': event_node_id,
+            'to_node': person_node_id,
+            'rel_type': rel_type.value if hasattr(rel_type, 'value') else str(rel_type),
+            'properties': {
+                'response_status': response_status,
+                'attendee_role': attendee_role,
+                'source': 'google_calendar',
+            }
+        }
+        person_node.relationships.append(event_rel)
         
-        return person_node, relationship
+        nodes = [person_node]
+        
+        # --- Identity node (email address) ---
+        identity_id = generate_identity_id('email', email_lower)
+        
+        identity_node = ParsedNode(
+            node_id=identity_id,
+            node_type=NodeType.IDENTITY,
+            properties={
+                'type': 'email',
+                'value': email_lower,
+                'primary': True,
+                'source': 'google_calendar',
+                'verified': True,  # Present in calendar invite = verified
+            },
+            relationships=[{
+                'from_node': person_node_id,
+                'to_node': identity_id,
+                'rel_type': RelationType.HAS_IDENTITY.value,
+                'properties': {'source': 'google_calendar'}
+            }]
+        )
+        nodes.append(identity_node)
+        
+        # --- User KNOWS Person edge (with aliases) ---
+        aliases = []
+        if display_name and display_name != email_lower.split('@')[0]:
+            aliases.append(display_name)
+            first_name = display_name.split()[0] if display_name.split() else None
+            if first_name and first_name != display_name:
+                aliases.append(first_name)
+        
+        if not hasattr(person_node, '_pending_relationships'):
+            person_node._pending_relationships = []
+        
+        person_node._pending_relationships.append({
+            'rel_type': RelationType.KNOWS.value,
+            'from_id': f"User/{self.user_id}",
+            'to_id': person_node_id,
+            'properties': {
+                'aliases': aliases,
+                'frequency': 1,
+                'source': 'google_calendar',
+            }
+        })
+        
+        # --- User COMMUNICATES_WITH Person (interaction signal for relationship strength) ---
+        person_node._pending_relationships.append({
+            'rel_type': RelationType.COMMUNICATES_WITH.value,
+            'from_id': f"User/{self.user_id}",
+            'to_id': person_node_id,
+            'properties': {
+                'source': 'google_calendar',
+                'last_interaction': datetime.utcnow().isoformat(),
+                'strength': 0.3,  # Meeting = moderate interaction signal
+            }
+        })
+        
+        return nodes
     
     async def detect_conflicts(self) -> List[Dict[str, Any]]:
         """

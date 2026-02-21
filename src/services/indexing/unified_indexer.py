@@ -76,52 +76,55 @@ class UnifiedIndexerService:
             except Exception as e:
                 logger.error(f"[UnifiedIndexer] Failed to start dynamic indexer {indexer.name}: {e}")
 
-    def set_resolution_service(self, service: EntityResolutionService):
-        """Register the entity resolution service"""
-        self.resolution_service = service
+    def register_component(self, name: str, instance) -> None:
+        """
+        Register a named component (replaces individual set_* methods).
+        
+        Valid names: resolution_service, observer_service, temporal_indexer,
+        insight_service, relationship_manager, topic_extractor,
+        behavior_learner, temporal_reasoner, health_monitor,
+        reasoning_service, reactive_service
+        """
+        valid_names = {
+            'resolution_service', 'observer_service', 'temporal_indexer',
+            'insight_service', 'relationship_manager', 'topic_extractor',
+            'behavior_learner', 'temporal_reasoner', 'health_monitor',
+            'reasoning_service', 'reactive_service',
+        }
+        if name not in valid_names:
+            logger.warning(f"[UnifiedIndexer] Unknown component name: {name}")
+            return
+        setattr(self, name, instance)
+        logger.info(f"[UnifiedIndexer] {name} registered")
 
-    def set_observer_service(self, service: GraphObserverService):
-        """Register the graph observer service"""
-        self.observer_service = service
-
-    def set_temporal_indexer(self, temporal_indexer):
-        """Register the temporal indexer"""
-        self.temporal_indexer = temporal_indexer
-        logger.info("[UnifiedIndexer] TemporalIndexer registered")
-
-    def set_insight_service(self, insight_service):
-        """Register the insight service"""
-        self.insight_service = insight_service
-        logger.info("[UnifiedIndexer] InsightService registered")
-
-    def set_relationship_manager(self, relationship_manager):
-        """Register the relationship strength manager"""
-        self.relationship_manager = relationship_manager
-        logger.info("[UnifiedIndexer] RelationshipStrengthManager registered")
-
-    def set_topic_extractor(self, topic_extractor):
-        """Register the topic extractor"""
-        self.topic_extractor = topic_extractor
-        logger.info("[UnifiedIndexer] TopicExtractor registered")
-
-    def set_behavior_learner(self, behavior_learner: BehaviorLearner):
-        """Register the behavior learner"""
-        self.behavior_learner = behavior_learner
-        logger.info("[UnifiedIndexer] BehaviorLearner registered")
-
-    def set_temporal_reasoner(self, temporal_reasoner: TemporalReasoner):
-        """Register the temporal reasoner"""
-        self.temporal_reasoner = temporal_reasoner
-        logger.info("[UnifiedIndexer] TemporalReasoner registered")
-
-    def set_health_monitor(self, health_monitor: GraphHealthMonitor):
-        """Register the graph health monitor"""
-        self.health_monitor = health_monitor
-        logger.info("[UnifiedIndexer] GraphHealthMonitor registered")
-    def set_reasoning_service(self, reasoning_service: GraphReasoningService):
-        """Register the reasoning service"""
-        self.reasoning_service = reasoning_service
-        logger.info("[UnifiedIndexer] GraphReasoningService registered")
+    def get_indexer_health(self) -> dict:
+        """
+        Return health status of all registered indexers.
+        
+        Useful for admin endpoints and monitoring.
+        """
+        health = {
+            "service_running": self.is_running,
+            "total_indexers": len(self.indexers),
+            "indexers": [],
+        }
+        for indexer in self.indexers:
+            status = {
+                "name": indexer.name,
+                "user_id": indexer.user_id,
+                "is_running": indexer.is_running,
+                "is_healthy": indexer.is_healthy(),
+                "consecutive_errors": indexer._consecutive_errors,
+                "sync_interval": indexer.sync_interval,
+            }
+            if indexer._last_stats:
+                status["last_stats"] = {
+                    "created": indexer._last_stats.created,
+                    "errors": indexer._last_stats.errors,
+                    "skipped": indexer._last_stats.skipped,
+                }
+            health["indexers"].append(status)
+        return health
 
     async def start_all(self):
         """Start all registered indexers and resolution service"""
@@ -425,246 +428,166 @@ def get_unified_indexer() -> UnifiedIndexerService:
         _unified_indexer = UnifiedIndexerService()
     return _unified_indexer
 
-async def start_unified_indexing(db_session, config, rag_engine, graph_manager, cross_stack_context=None):
-    """
-    Start the unified indexer and register all active integrations.
-    
-    Enhanced with TemporalIndexer and InsightService for Phase 1 improvements.
-    """
-    from src.database.models import UserIntegration
-    from src.services.indexing.factory import IndexerFactory
+# ---------------------------------------------------------------------------
+# Provider Registry — data-driven config instead of per-provider if/elif
+# ---------------------------------------------------------------------------
+# creds_source:
+#   "credential_provider" → uses CredentialProvider.get_integration_credentials (needs token_saver)
+#   "access_token"        → uses integration.access_token string
+#   "integration"         → passes the full UserIntegration object
+_PROVIDER_REGISTRY: dict = {}  # populated after constants are importable
+
+def _build_provider_registry():
+    """Build once to avoid circular imports at module level."""
     from src.services.indexing.indexing_constants import (
-        PROVIDER_SLACK, PROVIDER_NOTION, PROVIDER_ASANA, 
+        PROVIDER_SLACK, PROVIDER_NOTION, PROVIDER_ASANA,
         PROVIDER_GMAIL, PROVIDER_GOOGLE_DRIVE,
         PROVIDER_CALENDAR, PROVIDER_GOOGLE_TASKS, PROVIDER_GOOGLE_KEEP, PROVIDER_LINEAR,
         CRAWLER_EMAIL, CRAWLER_DRIVE, CRAWLER_SLACK, CRAWLER_NOTION, CRAWLER_ASANA,
-        CRAWLER_CALENDAR, CRAWLER_TASKS, CRAWLER_KEEP, CRAWLER_LINEAR
+        CRAWLER_CALENDAR, CRAWLER_TASKS, CRAWLER_KEEP, CRAWLER_LINEAR, CRAWLER_CONTACTS,
     )
-    
+    return {
+        PROVIDER_GMAIL:        {"crawler": CRAWLER_EMAIL,    "creds_source": "credential_provider", "secondary_crawlers": [CRAWLER_CONTACTS]},
+        PROVIDER_GOOGLE_DRIVE: {"crawler": CRAWLER_DRIVE,    "creds_source": "credential_provider"},
+        PROVIDER_CALENDAR:     {"crawler": CRAWLER_CALENDAR, "creds_source": "credential_provider"},
+        PROVIDER_GOOGLE_TASKS: {"crawler": CRAWLER_TASKS,    "creds_source": "credential_provider"},
+        PROVIDER_GOOGLE_KEEP:  {"crawler": CRAWLER_KEEP,     "creds_source": "credential_provider"},
+        PROVIDER_SLACK:        {"crawler": CRAWLER_SLACK,    "creds_source": "integration"},
+        PROVIDER_LINEAR:       {"crawler": CRAWLER_LINEAR,   "creds_source": "integration"},
+        PROVIDER_NOTION:       {"crawler": CRAWLER_NOTION,   "creds_source": "access_token"},
+        PROVIDER_ASANA:        {"crawler": CRAWLER_ASANA,    "creds_source": "access_token"},
+    }
+
+
+def _resolve_credentials(integration, provider_cfg):
+    """
+    Resolve credentials for an integration based on its provider config.
+    Returns (creds, token_saver) or (None, None) if credentials unavailable.
+    """
+    source = provider_cfg["creds_source"]
+
+    if source == "credential_provider":
+        from src.core.credential_provider import CredentialProvider
+        creds = CredentialProvider.get_integration_credentials(
+            user_id=integration.user_id,
+            provider=integration.provider,
+            auto_refresh=True,
+        )
+        if not creds:
+            return None, None
+        from src.auth.token_persistence import create_token_saver_callback
+        token_saver = create_token_saver_callback(integration.id, "integration")
+        return creds, token_saver
+
+    elif source == "access_token":
+        return integration.access_token, None
+
+    elif source == "integration":
+        return integration, None
+
+    return None, None
+
+
+def _create_crawler_for_integration(
+    integration, provider_cfg, *,
+    config, rag_engine, graph_manager,
+    topic_extractor, temporal_indexer, relationship_manager,
+    resolution_service, observer_service,
+):
+    """
+    Resolve credentials and create a crawler for a single integration.
+    Returns the crawler instance or None.
+    """
+    from src.services.indexing.factory import IndexerFactory
+
+    creds, token_saver = _resolve_credentials(integration, provider_cfg)
+    if creds is None:
+        return None
+
+    kwargs = dict(
+        crawler_type=provider_cfg["crawler"],
+        config=config,
+        creds=creds,
+        user_id=integration.user_id,
+        rag_engine=rag_engine,
+        graph_manager=graph_manager,
+        topic_extractor=topic_extractor,
+        temporal_indexer=temporal_indexer,
+        relationship_manager=relationship_manager,
+        entity_resolver=resolution_service,
+        observer_service=observer_service,
+    )
+    if token_saver:
+        kwargs["token_saver_callback"] = token_saver
+
+    return IndexerFactory.create_crawler(**kwargs)
+
+
+async def start_unified_indexing(db_session, config, rag_engine, graph_manager, cross_stack_context=None):
+    """
+    Start the unified indexer and register all active integrations.
+
+    Enhanced with TemporalIndexer and InsightService for Phase 1 improvements.
+    """
+    from src.database.models import UserIntegration
+    from sqlalchemy import select
+
+    global _PROVIDER_REGISTRY
+    if not _PROVIDER_REGISTRY:
+        _PROVIDER_REGISTRY = _build_provider_registry()
+
     indexer_service = get_unified_indexer()
-    
+
     # Initialize all sub-services and AI components
     await indexer_service.configure_components(config, rag_engine, graph_manager, cross_stack_context)
-    
-    # Extract common components for easier access in the loop
-    topic_extractor = indexer_service.topic_extractor
-    temporal_indexer = indexer_service.temporal_indexer
-    relationship_manager = indexer_service.relationship_manager
-    
-    
-    from sqlalchemy import select
-    
+
+    # Extract common components for easier access
+    common_kwargs = dict(
+        config=config,
+        rag_engine=rag_engine,
+        graph_manager=graph_manager,
+        topic_extractor=indexer_service.topic_extractor,
+        temporal_indexer=indexer_service.temporal_indexer,
+        relationship_manager=indexer_service.relationship_manager,
+        resolution_service=indexer_service.resolution_service,
+        observer_service=indexer_service.observer_service,
+    )
+
     # 1. Fetch all active integrations (Slack, Notion, Asana, etc.)
     result = await db_session.execute(select(UserIntegration))
     integrations = result.scalars().all()
-    
+
     count = 0
     for integration in integrations:
         try:
-            crawler = None
-            creds = None
-            crawler_type = None
+            provider_cfg = _PROVIDER_REGISTRY.get(integration.provider)
+            if not provider_cfg:
+                logger.debug(f"[UnifiedIndexer] No registry entry for provider {integration.provider}")
+                continue
 
-            if integration.provider == PROVIDER_SLACK:
-                crawler_type = CRAWLER_SLACK
-                # Pass object with access_token/refresh_token attributes or dict
-                creds = integration # UserIntegration object has access_token/refresh_token
-                
-            elif integration.provider == PROVIDER_NOTION:
-                crawler_type = CRAWLER_NOTION
-                creds = integration.access_token # Just the token string
-                
-            elif integration.provider == PROVIDER_ASANA:
-                crawler_type = CRAWLER_ASANA
-                creds = integration.access_token
-
-            elif integration.provider == PROVIDER_GMAIL:
-                # Handled via CredentialProvider which does refresh tokens etc.
-                from src.core.credential_provider import CredentialProvider
-                creds = CredentialProvider.get_integration_credentials(
-                    user_id=integration.user_id,
-                    provider=PROVIDER_GMAIL,
-                    auto_refresh=True
-                )
-                crawler_type = CRAWLER_EMAIL
-                if not creds:
-                    continue
-
-                # Token saver for gmail
-                from src.auth.token_persistence import create_token_saver_callback
-                token_saver = create_token_saver_callback(integration.id, "integration")
-                
-                crawler = IndexerFactory.create_crawler(
-                    crawler_type=crawler_type,
-                    config=config,
-                    creds=creds,
-                    user_id=integration.user_id,
-                    rag_engine=rag_engine,
-                    graph_manager=graph_manager,
-                    topic_extractor=topic_extractor,
-                    temporal_indexer=temporal_indexer,
-                    relationship_manager=relationship_manager,
-                    entity_resolver=indexer_service.resolution_service,
-                    observer_service=indexer_service.observer_service,
-                    token_saver_callback=token_saver
-                )
-                
-            elif integration.provider == PROVIDER_GOOGLE_DRIVE:
-                from src.core.credential_provider import CredentialProvider
-                creds = CredentialProvider.get_integration_credentials(
-                    user_id=integration.user_id,
-                    provider=PROVIDER_GOOGLE_DRIVE,
-                    auto_refresh=True
-                )
-                crawler_type = CRAWLER_DRIVE
-                if not creds:
-                    continue
-                    
-                # Token saver for drive
-                from src.auth.token_persistence import create_token_saver_callback
-                token_saver = create_token_saver_callback(integration.id, "integration")
-                
-                crawler = IndexerFactory.create_crawler(
-                    crawler_type=crawler_type,
-                    config=config,
-                    creds=creds,
-                    user_id=integration.user_id,
-                    rag_engine=rag_engine,
-                    graph_manager=graph_manager,
-                    topic_extractor=topic_extractor,
-                    temporal_indexer=temporal_indexer,
-                    relationship_manager=relationship_manager,
-                    entity_resolver=indexer_service.resolution_service,
-                    observer_service=indexer_service.observer_service,
-                    token_saver_callback=token_saver
-                )
-                
-            elif integration.provider == PROVIDER_CALENDAR:
-                from src.core.credential_provider import CredentialProvider
-                creds = CredentialProvider.get_integration_credentials(
-                    user_id=integration.user_id,
-                    provider=PROVIDER_CALENDAR,
-                    auto_refresh=True
-                )
-                crawler_type = CRAWLER_CALENDAR
-                if not creds:
-                    continue
-                    
-                from src.auth.token_persistence import create_token_saver_callback
-                token_saver = create_token_saver_callback(integration.id, "integration")
-                
-                crawler = IndexerFactory.create_crawler(
-                    crawler_type=crawler_type,
-                    config=config,
-                    creds=creds,
-                    user_id=integration.user_id,
-                    rag_engine=rag_engine,
-                    graph_manager=graph_manager,
-                    topic_extractor=topic_extractor,
-                    temporal_indexer=temporal_indexer,
-                    relationship_manager=relationship_manager,
-                    entity_resolver=indexer_service.resolution_service,
-                    observer_service=indexer_service.observer_service,
-                    token_saver_callback=token_saver
-                )
-                
-            elif integration.provider == PROVIDER_GOOGLE_TASKS:
-                from src.core.credential_provider import CredentialProvider
-                creds = CredentialProvider.get_integration_credentials(
-                    user_id=integration.user_id,
-                    provider=PROVIDER_GOOGLE_TASKS,
-                    auto_refresh=True
-                )
-                crawler_type = CRAWLER_TASKS
-                if not creds:
-                    continue
-                    
-                from src.auth.token_persistence import create_token_saver_callback
-                token_saver = create_token_saver_callback(integration.id, "integration")
-                
-                crawler = IndexerFactory.create_crawler(
-                    crawler_type=crawler_type,
-                    config=config,
-                    creds=creds,
-                    user_id=integration.user_id,
-                    rag_engine=rag_engine,
-                    graph_manager=graph_manager,
-                    topic_extractor=topic_extractor,
-                    temporal_indexer=temporal_indexer,
-                    relationship_manager=relationship_manager,
-                    entity_resolver=indexer_service.resolution_service,
-                    observer_service=indexer_service.observer_service,
-                    token_saver_callback=token_saver
-                )
-                
-            elif integration.provider == PROVIDER_GOOGLE_KEEP:
-                from src.core.credential_provider import CredentialProvider
-                creds = CredentialProvider.get_integration_credentials(
-                    user_id=integration.user_id,
-                    provider=PROVIDER_GOOGLE_KEEP,
-                    auto_refresh=True
-                )
-                crawler_type = CRAWLER_KEEP
-                if not creds:
-                    continue
-                    
-                from src.auth.token_persistence import create_token_saver_callback
-                token_saver = create_token_saver_callback(integration.id, "integration")
-                
-                crawler = IndexerFactory.create_crawler(
-                    crawler_type=crawler_type,
-                    config=config,
-                    creds=creds,
-                    user_id=integration.user_id,
-                    rag_engine=rag_engine,
-                    graph_manager=graph_manager,
-                    topic_extractor=topic_extractor,
-                    temporal_indexer=temporal_indexer,
-                    relationship_manager=relationship_manager,
-                    entity_resolver=indexer_service.resolution_service,
-                    observer_service=indexer_service.observer_service,
-                    token_saver_callback=token_saver
-                )
-                
-            elif integration.provider == PROVIDER_LINEAR:
-                crawler_type = CRAWLER_LINEAR
-                creds = integration
-                
-                crawler = IndexerFactory.create_crawler(
-                    crawler_type=crawler_type,
-                    config=config,
-                    creds=creds,
-                    user_id=integration.user_id,
-                    rag_engine=rag_engine,
-                    graph_manager=graph_manager,
-                    topic_extractor=topic_extractor,
-                    temporal_indexer=temporal_indexer,
-                    relationship_manager=relationship_manager,
-                    entity_resolver=indexer_service.resolution_service,
-                    observer_service=indexer_service.observer_service
-                )
-
-            # Create crawler for generic types (Slack, Notion, Asana) using Factory if not already created
-            if not crawler and crawler_type and creds:
-                 crawler = IndexerFactory.create_crawler(
-                    crawler_type=crawler_type,
-                    config=config,
-                    creds=creds,
-                    user_id=integration.user_id,
-                    rag_engine=rag_engine,
-                    graph_manager=graph_manager,
-                    topic_extractor=topic_extractor,
-                    temporal_indexer=temporal_indexer,
-                    relationship_manager=relationship_manager,
-                    entity_resolver=indexer_service.resolution_service,
-                    observer_service=indexer_service.observer_service
-                )
+            crawler = _create_crawler_for_integration(integration, provider_cfg, **common_kwargs)
 
             if crawler:
                 indexer_service.register_indexer(crawler)
                 count += 1
-                logger.info(f"[UnifiedIndexer] Registered {crawler_type} for user {integration.user_id}")
+                logger.info(
+                    f"[UnifiedIndexer] Registered {provider_cfg['crawler']} for user {integration.user_id}"
+                )
             
+            # Register secondary crawlers (e.g., contacts alongside Gmail)
+            for secondary_type in provider_cfg.get('secondary_crawlers', []):
+                try:
+                    secondary_cfg = {**provider_cfg, 'crawler': secondary_type}
+                    secondary = _create_crawler_for_integration(integration, secondary_cfg, **common_kwargs)
+                    if secondary:
+                        indexer_service.register_indexer(secondary)
+                        count += 1
+                        logger.info(
+                            f"[UnifiedIndexer] Registered secondary {secondary_type} for user {integration.user_id}"
+                        )
+                except Exception as sec_e:
+                    logger.warning(f"[UnifiedIndexer] Failed to create secondary crawler {secondary_type}: {sec_e}")
+
         except Exception as e:
             logger.error(f"[UnifiedIndexer] Failed to register integration {integration.id}: {e}")
 

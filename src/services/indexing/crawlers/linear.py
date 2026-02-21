@@ -152,6 +152,38 @@ class LinearIndexer(BaseIndexer):
                 rel_type="ASSIGNED_TO"
             ))
             
+            # COMMUNICATES_WITH — Linear issue assignment = work collaboration signal
+            relationships.append(Relationship(
+                from_node=f"User/{self.user_id}",
+                to_node=person_id,
+                rel_type="COMMUNICATES_WITH",
+                properties={
+                    'source': 'linear',
+                    'last_interaction': datetime.utcnow().isoformat(),
+                    'strength': 0.2,  # Issue assignment = moderate signal
+                }
+            ))
+            
+            # KNOWS — ensure User knows this Linear contact
+            assignee_name = assignee.get("name", "")
+            aliases = []
+            if assignee_name and assignee_name.strip():
+                aliases.append(assignee_name)
+                first_name = assignee_name.split()[0] if assignee_name.split() else None
+                if first_name and first_name != assignee_name:
+                    aliases.append(first_name)
+            
+            relationships.append(Relationship(
+                from_node=f"User/{self.user_id}",
+                to_node=person_id,
+                rel_type="KNOWS",
+                properties={
+                    'aliases': aliases,
+                    'frequency': 1,
+                    'source': 'linear',
+                }
+            ))
+            
         issue_node = ParsedNode(
             node_id=issue_id,
             node_type="LinearIssue",

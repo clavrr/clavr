@@ -359,6 +359,12 @@ class FactGraph:
         from .memory_utils import extract_entities
         return extract_entities(content)
     
+    def _index_keywords(self, fact_id: int, content: str):
+        """Index keywords from content for fast search."""
+        for word in content.lower().split():
+            if len(word) > 3:
+                self._keyword_index[word].add(fact_id)
+    
     def get_fact(self, fact_id: int) -> Optional[FactNode]:
         """Get a fact by ID."""
         fact = self._facts.get(fact_id)
@@ -720,12 +726,32 @@ class FactGraphManager:
     
     def __init__(self):
         self._graphs: Dict[int, FactGraph] = {}
+        self._db_loaded: Set[int] = set()
     
     def get_or_create(self, user_id: int) -> FactGraph:
         """Get or create a fact graph for a user."""
         if user_id not in self._graphs:
             self._graphs[user_id] = FactGraph(user_id)
         return self._graphs[user_id]
+    
+    async def get_or_create_with_db(self, user_id: int, db) -> FactGraph:
+        """
+        Get or create a fact graph, auto-loading from DB on first access.
+        Facts survive restarts because they're loaded from the database.
+        """
+        graph = self.get_or_create(user_id)
+        
+        # Auto-load from DB on first access
+        if user_id not in self._db_loaded and db:
+            try:
+                loaded = await graph.load_from_db(db)
+                self._db_loaded.add(user_id)
+                if loaded > 0:
+                    logger.info(f"[FactGraphManager] Auto-loaded {loaded} facts for user {user_id}")
+            except Exception as e:
+                logger.debug(f"[FactGraphManager] Auto-load failed for user {user_id}: {e}")
+        
+        return graph
     
     def get(self, user_id: int) -> Optional[FactGraph]:
         """Get fact graph if it exists."""

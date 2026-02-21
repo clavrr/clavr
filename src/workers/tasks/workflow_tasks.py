@@ -7,25 +7,28 @@ from ..celery_app import celery_app
 from ..base_task import IdempotentTask
 from src.utils.logger import setup_logger
 from src.utils.config import load_config
-from api.dependencies import AppState
 from src.workflows.base import WorkflowContext
-from src.workflows.definitions import (
-    MorningBriefingWorkflow,
-    EmailToActionWorkflow,
-    WeeklyPlanningWorkflow,
-    EndOfDayReviewWorkflow,
-    BatchEmailProcessorWorkflow
-)
 
 logger = setup_logger(__name__)
 
-WORKFLOW_MAP = {
-    "morning_briefing": MorningBriefingWorkflow,
-    "email_to_action": EmailToActionWorkflow,
-    "weekly_planning": WeeklyPlanningWorkflow,
-    "end_of_day_review": EndOfDayReviewWorkflow,
-    "batch_email_processor": BatchEmailProcessorWorkflow
-}
+
+def _get_workflow_map():
+    """Lazy import of workflow definitions to avoid circular imports."""
+    from api.dependencies import AppState  # noqa: deferred
+    from src.workflows.definitions import (
+        MorningBriefingWorkflow,
+        EmailToActionWorkflow,
+        WeeklyPlanningWorkflow,
+        EndOfDayReviewWorkflow,
+        BatchEmailProcessorWorkflow,
+    )
+    return {
+        "morning_briefing": MorningBriefingWorkflow,
+        "email_to_action": EmailToActionWorkflow,
+        "weekly_planning": WeeklyPlanningWorkflow,
+        "end_of_day_review": EndOfDayReviewWorkflow,
+        "batch_email_processor": BatchEmailProcessorWorkflow,
+    }, AppState
 
 @celery_app.task(base=IdempotentTask, bind=True, name='src.workers.tasks.workflow_tasks.run_workflow')
 def run_workflow(self, user_id: int, workflow_name: str, params: Dict[str, Any]) -> Dict[str, Any]:
@@ -35,6 +38,9 @@ def run_workflow(self, user_id: int, workflow_name: str, params: Dict[str, Any])
     logger.info(f"[WORKFLOW] Starting background workflow {workflow_name} for user {user_id}")
     
     async def _execute():
+        # Lazy import to avoid circular dependency
+        WORKFLOW_MAP, AppState = _get_workflow_map()
+
         # 1. Get workflow class
         workflow_cls = WORKFLOW_MAP.get(workflow_name)
         if not workflow_cls:

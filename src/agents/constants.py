@@ -44,12 +44,13 @@ INTENT_KEYWORDS = {
         'search': ['search', 'find', 'show', 'list', 'check', 'get', 'read', 'inbox']
     },
     'calendar': {
-        'schedule': ['book', 'set up', 'new meeting', 'new event', 'create event', 'schedule', 'create', 'meeting', 'event', 'add'],
+        'schedule': ['book', 'set up', 'new meeting', 'new event', 'create event', 'schedule', 'create', 'add'],
         'update': ['reschedule', 'move', 'change', 'update', 'cancel', 'edit'],
-        'list': ['agenda', 'calendar', 'show', 'list', 'what do i have', 'meetings', 'events', 'summarize', 'my schedule']
+        'list': ['agenda', 'calendar', 'show', 'list', 'what do i have', 'meetings', 'events', 'meeting', 'event', 'summarize', 'my schedule', 'upcoming', 'today', 'tomorrow', 'this week'],
+        'availability': ['free', 'busy', 'available', 'gap', 'open', 'different time', 'another time', 'find time', 'find a slot', 'when can']
     },
     'tasks': {
-        'create': ['add', 'remind me', 'new task', 'new todo', 'buy'],
+        'create': ['create', 'add', 'make', 'set', 'remind me', 'new task', 'new todo', 'buy'],
         'complete': ['complete', 'finish', 'check off', 'done', 'mark complete'],
         'list': ['list', 'show', 'tasks', 'todos', 'outstanding', 'pending', 'summarize', 'get', 'what are']
     },

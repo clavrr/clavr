@@ -28,6 +28,9 @@ from ..chunking import RecursiveTextChunker
 from ..query import QueryEnhancer, ResultReranker, HybridSearchEngine
 from ..query import apply_diversity, maximal_marginal_relevance
 from ..query import AdaptiveRerankingWeights, create_adaptive_reranker
+from ..query import CrossEncoderReranker
+from ..query import RelevanceGrader, RelevanceLevel
+from ..query import HyDEGenerator
 from ..chunking import EmailChunker
 from ..utils.utils import deduplicate_results, calculate_semantic_score
 from ..utils.performance import CircuitBreaker
@@ -147,6 +150,18 @@ class RAGEngine:
         # Document version tracking for smart cache invalidation
         self._document_version = 0  # Incremented on any document change
         self._last_cache_clear = datetime.utcnow()
+        
+        # Initialize cross-encoder reranker (V3: two-stage reranking)
+        # Stage 1: Fast adaptive reranking (keyword/metadata heuristics)
+        # Stage 2: CrossEncoder re-scoring top candidates (joint encoding)
+        self._cross_encoder = None
+        use_cross_encoder = getattr(rag_config, 'use_cross_encoder', True)
+        if use_cross_encoder:
+            try:
+                self._cross_encoder = CrossEncoderReranker()
+                logger.info("[OK] CrossEncoder reranker initialized for two-stage reranking")
+            except Exception as e:
+                logger.info(f"CrossEncoder unavailable (sentence-transformers not installed), skipping: {e}")
         
         # Initialize monitoring
         self.monitor = get_monitor()
@@ -601,6 +616,18 @@ class RAGEngine:
         """Internal search core logic."""
         primary_query = enhanced['expanded']
         
+        # Merge suggested metadata filters from QueryEnhancer (V2 improvement)
+        # Caller-provided filters take precedence over suggested ones
+        suggested = enhanced.get('suggested_filters', {})
+        if suggested:
+            if filters is None:
+                filters = {}
+            for key, value in suggested.items():
+                if key not in filters:  # Don't override explicit caller filters
+                    filters[key] = value
+            if filters:
+                logger.debug(f"Applied metadata filters: {filters}")
+        
         # Check if this is a "recent" query
         is_recent_query = enhanced['intent'] == 'recent' or any(
             term in query.lower() for term in ['recent', 'new', 'latest', 'today', 'yesterday']
@@ -650,6 +677,67 @@ class RAGEngine:
                 )
                 
                 logger.debug(f"Applied adaptive reranking with intent: {intent}")
+        
+        # CrossEncoder re-scoring for top candidates 
+        # Only when we have enough candidates to make it worthwhile
+        if rerank and self._cross_encoder and len(all_results) > k:
+            try:
+                all_results = self._cross_encoder.rerank(
+                    query=query,
+                    results=all_results,
+                    k=k * 2,  # Keep 2x for confidence filtering
+                    content_key='content',
+                    preserve_original_score=True
+                )
+                # Use cross_encoder_score as confidence if available
+                for result in all_results:
+                    if 'cross_encoder_score' in result:
+                        result['rerank_score'] = result['cross_encoder_score']
+                logger.debug(f"CrossEncoder refined {len(all_results)} results")
+            except Exception as e:
+                logger.debug(f"CrossEncoder reranking failed, using stage-1 results: {e}")
+        
+        # V5: Self-RAG relevance grading with automatic expansion
+        # If retrieved chunks are low-relevance, expand query and re-search
+        intent = enhanced.get('intent', 'search')
+        if rerank and len(all_results) > 0:
+            try:
+                grader = RelevanceGrader()
+                grade = grader.grade(query, all_results, query_intent=intent)
+                
+                if grade.should_expand_query and grade.level in (RelevanceLevel.LOW, RelevanceLevel.IRRELEVANT):
+                    logger.info(f"V5: Low relevance ({grade.score:.2f}), expanding query")
+                    # Try LLM expansion for better results
+                    if self.query_enhancer.use_llm_expansion:
+                        try:
+                            expanded_query = asyncio.get_event_loop().run_until_complete(
+                                self.query_enhancer._llm_expand_query(query, intent)
+                            )
+                            if expanded_query and expanded_query != query:
+                                expanded_results = self._search_parallel([expanded_query], fetch_k, filters)
+                                # Merge expanded results with original, deduplicate
+                                all_results = deduplicate_results(all_results + expanded_results)
+                                logger.info(f"V5: Expanded query yielded {len(expanded_results)} additional results")
+                        except Exception as e:
+                            logger.debug(f"V5: LLM expansion failed: {e}")
+            except Exception as e:
+                logger.debug(f"V5: Relevance grading failed: {e}")
+        
+        # V4: HyDE for conceptual/abstract queries with weak initial results
+        if len(all_results) < k and intent in ('topic', 'search'):
+            try:
+                hyde = HyDEGenerator()
+                if hyde.should_use_hyde(query):
+                    logger.info(f"V4: Activating HyDE for conceptual query")
+                    hypothetical = asyncio.get_event_loop().run_until_complete(
+                        hyde.generate_hypothetical(query)
+                    )
+                    if hypothetical:
+                        hyde_results = self.vector_store.search_by_text(hypothetical, k=k)
+                        all_results = deduplicate_results(all_results + hyde_results)
+                        logger.info(f"V4: HyDE yielded {len(hyde_results)} additional results")
+            except Exception as e:
+                logger.debug(f"V4: HyDE failed: {e}")
         
         # Filter by confidence threshold and calculate confidence scores
         filtered_results = []

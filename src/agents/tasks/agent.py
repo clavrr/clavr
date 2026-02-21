@@ -109,11 +109,13 @@ class TaskAgent(BaseAgent):
             for verb in ["create", "add", "make", "new task", "new todo", "remind me"]
         )
         
-        # Priority order: complete → explicit create → list
-        if any(w in query_lower for w in INTENT_KEYWORDS['tasks']['complete']):
-            return await self._handle_complete(query, context)
-        elif explicit_create_intent or any(w in query_lower for w in INTENT_KEYWORDS['tasks']['create']):
+        # Priority order: create → complete → list
+        # Create must be checked FIRST because queries like "add a task about X" 
+        # can also contain list keywords (e.g., "task"/"tasks"), causing misrouting.
+        if explicit_create_intent or any(w in query_lower for w in INTENT_KEYWORDS['tasks']['create']):
             return await self._handle_create(query, context)
+        elif any(w in query_lower for w in INTENT_KEYWORDS['tasks']['complete']):
+            return await self._handle_complete(query, context)
         elif any(w in query_lower for w in INTENT_KEYWORDS['tasks']['list']):
              return await self._handle_list(query, context)
         else:

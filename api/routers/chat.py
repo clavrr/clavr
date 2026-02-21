@@ -5,7 +5,7 @@ from fastapi import APIRouter, Depends, Request, HTTPException, Body
 from fastapi.responses import StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 from typing import Dict, Any, List, Optional
-from pydantic import BaseModel
+from pydantic import BaseModel, model_validator
 
 from api.dependencies import get_db, get_chat_service, get_config, get_current_user
 from src.database.models import User
@@ -23,11 +23,23 @@ SSE_HEADERS = {
 
 
 class QueryRequest(BaseModel):
-    query: str
+    query: Optional[str] = None
+    message: Optional[str] = None  # Frontend sends 'message' instead of 'query'
     max_results: Optional[int] = 5
+    conversationId: Optional[str] = None
+    userId: Optional[str] = None
+
+    @model_validator(mode="after")
+    def _resolve_query(self):
+        """Accept either 'query' or 'message' — normalize to query."""
+        if not self.query and self.message:
+            self.query = self.message
+        if not self.query:
+            raise ValueError("Either 'query' or 'message' must be provided")
+        return self
 
 
-def _create_streaming_response(user: User, query: str, request: Request, chat_service) -> StreamingResponse:
+def _create_streaming_response(user: User, query: str, request: Request, chat_service, conversation_id: str = None) -> StreamingResponse:
     """
     Create a streaming SSE response for chat queries.
     
@@ -37,7 +49,8 @@ def _create_streaming_response(user: User, query: str, request: Request, chat_se
         async for chunk in chat_service.execute_unified_query_stream(
             user=user,
             query_text=query,
-            request=request
+            request=request,
+            conversation_id=conversation_id
         ):
             yield f"data: {chunk}\n\n"
     
@@ -88,7 +101,7 @@ async def unified_query_stream(
     chat_service = Depends(get_chat_service)
 ):
     """Execute query using the multi-agent system with streaming output."""
-    return _create_streaming_response(user, body.query, request, chat_service)
+    return _create_streaming_response(user, body.query, request, chat_service, conversation_id=body.conversationId)
 
 
 @router.post("/stream")
@@ -99,7 +112,7 @@ async def chat_stream_alias(
     chat_service = Depends(get_chat_service)
 ):
     """Alias for /api/chat/unified/stream - Direct chat streaming endpoint."""
-    return _create_streaming_response(user, body.query, request, chat_service)
+    return _create_streaming_response(user, body.query, request, chat_service, conversation_id=body.conversationId)
 
 
 # Legacy /api/query router
@@ -114,4 +127,4 @@ async def query_stream_alias(
     chat_service = Depends(get_chat_service)
 ):
     """Alias for /api/chat/unified/stream - Legacy query streaming endpoint."""
-    return _create_streaming_response(user, body.query, request, chat_service)
+    return _create_streaming_response(user, body.query, request, chat_service, conversation_id=body.conversationId)

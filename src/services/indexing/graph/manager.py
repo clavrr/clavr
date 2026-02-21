@@ -464,7 +464,8 @@ class KnowledgeGraphManager:
     async def get_nodes_batch(
         self,
         node_ids: List[str],
-        node_type: Optional[NodeType] = None
+        node_type: Optional[NodeType] = None,
+        user_id: Optional[str] = None
     ) -> Dict[str, Dict[str, Any]]:
         """
         Get multiple nodes by IDs in a single batch query (IMPROVED: Priority 1)
@@ -475,6 +476,7 @@ class KnowledgeGraphManager:
         Args:
             node_ids: List of node identifiers
             node_type: Optional node type filter (uses explicit label for better performance)
+            user_id: Optional user_id for multi-tenant isolation (G1 improvement)
             
         Returns:
             Dictionary mapping node_id -> node properties
@@ -489,11 +491,14 @@ class KnowledgeGraphManager:
                     node_data = self._decrypt_graph_properties(dict(self.graph.nodes[node_id]))
                     # Filter by node_type if specified
                     if node_type is None or node_data.get('node_type') == node_type.value:
+                        # Filter by user_id if specified (G1)
+                        if user_id and str(node_data.get('user_id')) != str(user_id):
+                            continue
                         result[node_id] = node_data
             return result
         
         elif self.backend_type == GraphBackend.ARANGODB:
-            nodes = await self._get_nodes_batch_arangodb(node_ids, node_type)
+            nodes = await self._get_nodes_batch_arangodb(node_ids, node_type, user_id)
             return {nid: self._decrypt_graph_properties(data) for nid, data in nodes.items()}
 
     async def get_nodes_by_type(
@@ -548,7 +553,8 @@ class KnowledgeGraphManager:
         self,
         node_type: NodeType,
         property_name: str,
-        property_value: Any
+        property_value: Any,
+        user_id: Optional[str] = None
     ) -> Optional[Dict[str, Any]]:
         """
         Find a node by a specific property value within a node type collection.
@@ -557,6 +563,7 @@ class KnowledgeGraphManager:
             node_type: Type of node to search in
             property_name: Property name to match
             property_value: Property value to find
+            user_id: Optional user_id for multi-tenant isolation (G1 improvement)
             
         Returns:
             Node properties if found, None otherwise
@@ -565,18 +572,22 @@ class KnowledgeGraphManager:
             for node_id, data in self.graph.nodes(data=True):
                 if (data.get('node_type') == node_type.value and 
                     data.get(property_name) == property_value):
+                    # Filter by user_id if specified (G1)
+                    if user_id and str(data.get('user_id')) != str(user_id):
+                        continue
                     return self._decrypt_graph_properties({'id': node_id, **data})
             return None
         
         elif self.backend_type == GraphBackend.ARANGODB:
-            node = await self._find_node_by_property_arangodb(node_type, property_name, property_value)
+            node = await self._find_node_by_property_arangodb(node_type, property_name, property_value, user_id)
             return self._decrypt_graph_properties(node) if node else None
     
     async def _find_node_by_property_arangodb(
         self,
         node_type: NodeType,
         property_name: str,
-        property_value: Any
+        property_value: Any,
+        user_id: Optional[str] = None
     ) -> Optional[Dict[str, Any]]:
         """ArangoDB implementation of find_node_by_property."""
         def _execute():
@@ -584,17 +595,21 @@ class KnowledgeGraphManager:
             if not self.db.has_collection(collection_name):
                 return None
             
+            # Build query with optional user_id filter (G1 improvement)
+            user_filter = "FILTER doc.user_id == @user_id" if user_id else ""
             query = f"""
             FOR doc IN {collection_name}
                 FILTER doc.@prop_name == @prop_value
+                {user_filter}
                 LIMIT 1
                 RETURN doc
             """
+            bind_vars = {'prop_name': property_name, 'prop_value': property_value}
+            if user_id:
+                bind_vars['user_id'] = user_id
+            
             try:
-                cursor = self.db.aql.execute(
-                    query, 
-                    bind_vars={'prop_name': property_name, 'prop_value': property_value}
-                )
+                cursor = self.db.aql.execute(query, bind_vars=bind_vars)
                 results = [d for d in cursor]
                 return results[0] if results else None
             except Exception as e:

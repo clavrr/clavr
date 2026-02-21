@@ -319,6 +319,40 @@ class AsanaCrawler(BaseIndexer):
         else:
             person_node_id = generate_person_id(source='asana', source_id=user_id)
         
+        # Build COMMUNICATES_WITH + KNOWS relationships
+        extra_rels = []
+        
+        # COMMUNICATES_WITH — Asana task = work collaboration signal
+        extra_rels.append(Relationship(
+            from_node=f"User/{self.user_id}",
+            to_node=person_node_id,
+            rel_type=RelationType.COMMUNICATES_WITH,
+            properties={
+                'source': 'asana',
+                'last_interaction': datetime.utcnow().isoformat(),
+                'strength': 0.25,  # Task collaboration = moderate signal
+            }
+        ))
+        
+        # KNOWS — ensure User knows this Asana contact
+        aliases = []
+        if name and name.strip() and name != 'Unknown':
+            aliases.append(name)
+            first_name = name.split()[0] if name.split() else None
+            if first_name and first_name != name:
+                aliases.append(first_name)
+        
+        extra_rels.append(Relationship(
+            from_node=f"User/{self.user_id}",
+            to_node=person_node_id,
+            rel_type=RelationType.KNOWS,
+            properties={
+                'aliases': aliases,
+                'frequency': 1,
+                'source': 'asana',
+            }
+        ))
+        
         person_node = ParsedNode(
             node_id=person_node_id,
             node_type=NodeType.PERSON,
@@ -328,7 +362,8 @@ class AsanaCrawler(BaseIndexer):
                 'asana_user_id': user_id,
                 'source': 'asana',
             },
-            searchable_text=f"{name} {email or ''}"
+            searchable_text=f"{name} {email or ''}",
+            relationships=extra_rels,
         )
         
         relationship = Relationship(

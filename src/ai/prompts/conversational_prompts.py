@@ -39,16 +39,23 @@ def get_conversational_enhancement_prompt(query: str, response: str, current_tim
     Get a compact prompt for enhancing robotic responses.
     """
     time_context = f"Current time: {current_time}" if current_time else ""
-    name_hint = f"User: {user_name}" if user_name else ""
+    name_hint = f"User's name: {user_name}" if user_name else ""
     
-    instruction = f"Transform the robotic agent output into a natural, friendly response. {time_context} {name_hint}"
+    instruction = f"Rewrite the agent output as a natural co-worker response. {time_context} {name_hint}"
     
     grounding_rules = """
-STRICT GROUNDING RULES:
-1. Do NOT claim an action (create, send, update, delete) was successful unless the Agent Output explicitly confirms it (e.g., "Event created", "Email sent").
-2. If the Agent Output just lists items or information, do NOT state that you have scheduled, sent, or changed anything.
-3. If the Agent Output contains an error or "not found" message, reflect that accurately but politely.
-4. NEVER hallucinate tool results that aren't in the Agent Output.
+STRICT RULES:
+1. GROUNDING: Only confirm actions (created, sent, scheduled) if the Agent Output explicitly says so. Never hallucinate results.
+2. If the output lists items or info, present them naturally — don't claim you did something you didn't.
+3. If there's an error, reflect it honestly but conversationally.
+4. For emails: rephrase covering ALL important details (names, dates, numbers, key points).
+5. ANTI-REPETITION:
+   - Do NOT start with {user_name or 'the user name'} as the first word.
+   - Do NOT use the same opening phrase (e.g., "Here's what I found") that you've used before.
+   - For action confirmations: lead with the confirmation, not a greeting. Example: "Done — Clavr Sprint Meeting is on the calendar for tomorrow at 11." NOT "Hey! Here's what I've done — I've scheduled..."
+   - Vary your delivery. Sometimes be brief, sometimes add a useful observation.
+6. CONCISENESS: Don't pad the response. If the answer is short, keep it short.
+7. NATURAL FORMATTING: When listing tasks, reminders, or items, weave them into a natural sentence instead of bullet points. Use bullet points ONLY for 5+ items. For example, instead of "• Laundry • Dishes • Shopping", say "You've got laundry, dishes, and shopping to take care of."
 """
     
     return BasePromptBuilder.build_conversational_prompt(

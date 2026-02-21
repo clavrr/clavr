@@ -37,8 +37,13 @@ DRIVE_SCOPES = [
     'https://www.googleapis.com/auth/drive.readonly',
 ]
 
+CONTACTS_SCOPES = [
+    'https://www.googleapis.com/auth/contacts.readonly',
+    'https://www.googleapis.com/auth/contacts.other.readonly',
+]
+
 # Combined service scopes (for legacy use or "all-in-one" flows)
-SERVICE_SCOPES = GMAIL_SCOPES + CALENDAR_SCOPES + TASKS_SCOPES + DRIVE_SCOPES
+SERVICE_SCOPES = GMAIL_SCOPES + CALENDAR_SCOPES + TASKS_SCOPES + DRIVE_SCOPES + CONTACTS_SCOPES
 
 # Full scopes for authentication - includes all services
 # Note: Users must re-authenticate to get new scopes if they previously logged in with limited scopes
@@ -116,6 +121,8 @@ class GoogleOAuthHandler:
             scopes=use_scopes,
             redirect_uri=self.redirect_uri
         )
+        
+        logger.info(f"Using Google OAuth Redirect URI: {self.redirect_uri}")
         
         # Don't use include_granted_scopes for login - we only want the minimal scopes
         # Integration flows can pass it explicitly if they want to accumulate scopes

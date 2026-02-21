@@ -7,7 +7,7 @@ Provides overview statistics for:
 - Outstanding tasks count
 """
 from fastapi import APIRouter, Depends, HTTPException, status
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 from datetime import datetime
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import Session
@@ -110,7 +110,7 @@ async def get_dashboard_stats(
         # Get REAL unread emails count
         try:
             email_service = EmailService(config, credentials)
-            unread_emails = email_service.list_unread_emails(limit=100)
+            unread_emails = await asyncio.to_thread(email_service.list_unread_emails, limit=100)
             stats["unread_emails"] = len(unread_emails) if unread_emails else 0
             logger.info(f"[DASHBOARD] Real unread emails: {stats['unread_emails']}")
         except Exception as e:
@@ -129,7 +129,8 @@ async def get_dashboard_stats(
             
             logger.info(f"[DASHBOARD] Fetching events from {now_local.isoformat()} to {today_end_local.isoformat()}")
             
-            events = calendar_service.list_events(
+            events = await asyncio.to_thread(
+                calendar_service.list_events,
                 start_date=now_local.isoformat(),
                 end_date=today_end_local.isoformat(),
                 days_back=0,
@@ -146,7 +147,7 @@ async def get_dashboard_stats(
         # Get REAL outstanding tasks count
         try:
             task_service = TaskService(config, credentials)
-            tasks = task_service.list_tasks(status='pending', limit=100)
+            tasks = await asyncio.to_thread(task_service.list_tasks, status='pending', limit=100)
             stats["outstanding_tasks"] = len(tasks) if tasks else 0
             logger.info(f"[DASHBOARD] Real outstanding tasks: {stats['outstanding_tasks']}")
         except Exception as e:
@@ -488,3 +489,206 @@ Respond with valid JSON only:"""
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to analyze email: {str(e)}"
         )
+
+
+# ============================================
+# REVENUE DASHBOARD ROUTES
+# ============================================
+
+@router.get("/pipeline")
+async def get_pipeline(
+    current_user: User = Depends(get_current_user_required),
+    config = Depends(get_config),
+    db: Session = Depends(get_db)
+) -> Dict[str, Any]:
+    """Get active deal pipeline for the current user."""
+    from api.dependencies import AppState
+
+    try:
+        pipeline_svc = AppState.get_pipeline_service(db_session=db)
+        deals = await pipeline_svc.get_pipeline(current_user.id)
+        return {
+            "success": True,
+            "deals": [d.to_dict() for d in deals],
+            "total": len(deals),
+        }
+    except Exception as e:
+        logger.error(f"[PIPELINE] Error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/pipeline/stale")
+async def get_stale_deals(
+    current_user: User = Depends(get_current_user_required),
+    config = Depends(get_config),
+    db: Session = Depends(get_db),
+    days: int = 7
+) -> Dict[str, Any]:
+    """Get deals with no activity in the last N days."""
+    from api.dependencies import AppState
+
+    try:
+        pipeline_svc = AppState.get_pipeline_service(db_session=db)
+        stale = await pipeline_svc.get_stale_deals(current_user.id, stale_days=days)
+        return {
+            "success": True,
+            "stale_deals": [d.to_dict() for d in stale],
+            "total": len(stale),
+        }
+    except Exception as e:
+        logger.error(f"[PIPELINE] Stale deals error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/pipeline/{deal_name}")
+async def get_deal_detail(
+    deal_name: str,
+    current_user: User = Depends(get_current_user_required),
+    config = Depends(get_config),
+    db: Session = Depends(get_db)
+) -> Dict[str, Any]:
+    """Get deep detail for a specific deal with cross-stack context."""
+    from api.dependencies import AppState
+
+    try:
+        pipeline_svc = AppState.get_pipeline_service(db_session=db)
+        detail = await pipeline_svc.get_deal_detail(deal_name, current_user.id)
+        if not detail:
+            raise HTTPException(status_code=404, detail=f"Deal '{deal_name}' not found")
+        return {"success": True, **detail}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"[PIPELINE] Deal detail error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/health/accounts")
+async def get_customer_health(
+    current_user: User = Depends(get_current_user_required),
+    config = Depends(get_config),
+    db: Session = Depends(get_db),
+    threshold: float = 40.0
+) -> Dict[str, Any]:
+    """Get customer health scores, filtered to at-risk accounts."""
+    from api.dependencies import AppState
+
+    try:
+        health_svc = AppState.get_customer_health_service(db_session=db)
+        at_risk = await health_svc.get_at_risk_accounts(current_user.id, threshold=threshold)
+        return {
+            "success": True,
+            "at_risk_accounts": [h.to_dict() for h in at_risk],
+            "total_at_risk": len(at_risk),
+            "threshold": threshold,
+        }
+    except Exception as e:
+        logger.error(f"[HEALTH] Error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/meeting-roi")
+async def get_meeting_roi(
+    current_user: User = Depends(get_current_user_required),
+    config = Depends(get_config),
+    db: Session = Depends(get_db),
+    date: Optional[str] = None
+) -> Dict[str, Any]:
+    """Get meeting ROI scores for a given day."""
+    from api.dependencies import AppState
+
+    try:
+        roi_svc = AppState.get_meeting_roi_service(db_session=db)
+        summary = await roi_svc.score_day(current_user.id, date)
+        return {"success": True, **summary.to_dict()}
+    except Exception as e:
+        logger.error(f"[MEETING_ROI] Error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/meeting-roi/declines")
+async def get_decline_suggestions(
+    current_user: User = Depends(get_current_user_required),
+    config = Depends(get_config),
+    db: Session = Depends(get_db),
+    date: Optional[str] = None
+) -> Dict[str, Any]:
+    """Get low-ROI meetings that could be declined."""
+    from api.dependencies import AppState
+
+    try:
+        roi_svc = AppState.get_meeting_roi_service(db_session=db)
+        suggestions = await roi_svc.suggest_declines(current_user.id, date)
+        return {
+            "success": True,
+            "suggestions": [s.to_dict() for s in suggestions],
+            "total": len(suggestions),
+        }
+    except Exception as e:
+        logger.error(f"[MEETING_ROI] Decline suggestions error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/follow-ups")
+async def get_follow_ups(
+    current_user: User = Depends(get_current_user_required),
+    config = Depends(get_config),
+) -> Dict[str, Any]:
+    """Get active follow-up tracked threads and stats."""
+    from api.dependencies import AppState
+
+    try:
+        tracker = AppState.get_follow_up_tracker()
+        active = tracker.get_active(current_user.id)
+        stats = tracker.get_stats(current_user.id)
+        return {
+            "success": True,
+            "active_threads": [t.to_dict() for t in active],
+            "stats": stats,
+        }
+    except Exception as e:
+        logger.error(f"[FOLLOW_UP] Error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/time-allocation")
+async def get_time_allocation(
+    current_user: User = Depends(get_current_user_required),
+    config = Depends(get_config),
+    db: Session = Depends(get_db),
+    week_start: Optional[str] = None
+) -> Dict[str, Any]:
+    """Get time allocation report for a given week."""
+    from api.dependencies import AppState
+
+    try:
+        from src.services.time_allocation import TimeAllocationService
+        time_svc = TimeAllocationService(config=config, db_session=db)
+        report = await time_svc.analyze_week(current_user.id, week_start)
+        return {"success": True, **report.to_dict()}
+    except Exception as e:
+        logger.error(f"[TIME_ALLOC] Error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/velocity")
+async def get_sprint_velocity(
+    current_user: User = Depends(get_current_user_required),
+    config = Depends(get_config),
+) -> Dict[str, Any]:
+    """Get sprint velocity trend and recommendations."""
+    from src.services.sprint_velocity import SprintVelocityService
+
+    try:
+        velocity_svc = SprintVelocityService(config=config)
+        trend = velocity_svc.get_velocity_trend(current_user.id)
+        recs = velocity_svc.get_recommendations(current_user.id)
+        return {
+            "success": True,
+            "trend": trend.to_dict(),
+            "recommendations": recs,
+        }
+    except Exception as e:
+        logger.error(f"[VELOCITY] Error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
