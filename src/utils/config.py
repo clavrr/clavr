@@ -24,19 +24,25 @@ class ConfigDefaults:
     EMAIL_FOLDER_ARCHIVE = "Archive"
     EMAIL_FOLDER_PROCESSED = "Processed"
 
-    # Default promo patterns for email filtering
+    # Default promo patterns for email filtering — matches against sender address (lowercased)
+    # IMPORTANT: Keep these SPECIFIC. Avoid broad patterns like 'noreply@' or 'info@'
+    # which catch legitimate automated emails (e.g. Google Sheets share requests).
     EMAIL_PROMO_PATTERNS = [
-        # Newsletter platforms
-        '@substack.com', '@beehiiv.com',
-        '@convertkit.com', '@ghost.io',
-        '@interviewcake.com', 
-        # Social media
-        '@facebookmail.com', 
+        # Newsletter/marketing platforms
+        '@substack.com', '@beehiiv.com', '@convertkit.com', '@ghost.io',
+        '@interviewcake.com', '@mailchimp.com', '@sendinblue.com',
+        # Medium newsletters
+        '@medium.com',
+        # Google promotional (NOT share requests or workspace notifications)
+        'ads-noreply@google.com', 'google-ads-noreply',
+        # Social media notifications
+        '@facebookmail.com',
         # E-commerce / Streaming
         '@primevideo.com', '@email.amazon.com', '@netflix.com',
-        '@spotify.com', '@doordash.com', 
-        # Explicit marketing
-        'newsletter@', 'marketing@',
+        '@spotify.com', '@doordash.com', '@ubereats.com',
+        # Explicitly marketing senders
+        'newsletter@', 'marketing@', 'promo@', 'promotions@',
+        'digest@', 'mailer@',
     ]
     
     # Agent defaults
@@ -59,8 +65,8 @@ class ConfigDefaults:
     
     # RAG defaults
     RAG_EMBEDDING_PROVIDER_GEMINI = "gemini"
-    RAG_EMBEDDING_MODEL_DEFAULT = "models/text-embedding-004"
-    RAG_EMBEDDING_DIMENSION_DEFAULT = 768
+    RAG_EMBEDDING_MODEL_DEFAULT = "models/gemini-embedding-001"
+    RAG_EMBEDDING_DIMENSION_DEFAULT = 3072
     RAG_VECTOR_STORE_BACKEND_AUTO = "auto"
     RAG_COLLECTION_NAME_DEFAULT = "email-knowledge"
     RAG_CHUNK_SIZE_DEFAULT = 500
@@ -294,7 +300,7 @@ class RAGConfig(BaseModel):
     # Embedding configuration
     embedding_provider: str = ConfigDefaults.RAG_EMBEDDING_PROVIDER_GEMINI  # "gemini" or "sentence-transformers"
     embedding_model: str = ConfigDefaults.RAG_EMBEDDING_MODEL_DEFAULT  # Gemini model or sentence-transformer model name
-    embedding_dimension: int = ConfigDefaults.RAG_EMBEDDING_DIMENSION_DEFAULT  # 768 for Gemini/all-mpnet-base-v2, 384 for all-MiniLM-L6-v2
+    embedding_dimension: int = ConfigDefaults.RAG_EMBEDDING_DIMENSION_DEFAULT  # 3072 for gemini-embedding-001, 768 for text-embedding-005, 384 for all-MiniLM-L6-v2
     
     # Vector store configuration
     vector_store_backend: str = ConfigDefaults.RAG_VECTOR_STORE_BACKEND_AUTO  # "auto", "qdrant", or "postgres"

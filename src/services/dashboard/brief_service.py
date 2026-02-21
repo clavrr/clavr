@@ -137,6 +137,65 @@ class BriefService:
                 people=people
             )
 
+        # Enhance emails with conversational body-based summaries via LLM
+        # No per-email cache — the dashboard-level cache in dashboard.py handles caching
+        if not fast_mode and emails:
+            
+            def _clean_from(e):
+                """Strip <email@address> brackets from sender name."""
+                raw = str(e.get('from', ''))
+                m = re.search(r'^([^<]+)', raw)
+                if m:
+                    name = m.group(1).strip().replace('"', '')
+                    if name:
+                        e['from'] = name
+            
+            async def enhance_email(e):
+                _clean_from(e)
+                
+                # Try LLM summarization with one retry
+                for attempt in range(2):
+                    try:
+                        raw_summary = await self._extract_actionable_summary(e, user_name)
+                        if raw_summary and len(raw_summary) >= 30:
+                            e['summary'] = raw_summary
+                            logger.info(f"[BriefService] ✓ Summary for '{e.get('subject', '')[:40]}': {raw_summary}")
+                            return
+                        elif raw_summary:
+                            logger.warning(f"[BriefService] ✗ Too short ({len(raw_summary)}): {raw_summary}")
+                    except Exception as exc:
+                        logger.error(f"[BriefService] LLM attempt {attempt+1} failed for '{e.get('subject')}': {exc}")
+                    
+                    # Brief pause before retry
+                    if attempt == 0:
+                        await asyncio.sleep(1)
+                
+                # Fallback: use snippet (Gmail preview text) if available — much better than generic message
+                snippet = e.get('snippet', '') or e.get('summary', '')
+                if snippet and len(snippet) >= 20:
+                    sender = e.get('from', 'Someone').split()[0]
+                    e['summary'] = f"{sender} says: {snippet[:150]}"
+                    logger.info(f"[BriefService] ⚡ Snippet fallback for '{e.get('subject', '')[:40]}': {e['summary']}")
+                    return
+                
+                # Last resort
+                sender = e.get('from', 'Someone').split()[0]
+                e['summary'] = f"New email from {sender}"
+            
+            logger.info(f"[BriefService] Enhancing {len(emails)} emails with LLM")
+            results = await asyncio.gather(*(enhance_email(e) for e in emails), return_exceptions=True)
+            for i, r in enumerate(results):
+                if isinstance(r, Exception):
+                    logger.error(f"[BriefService] Email enhance error: {r}")
+
+        # Sort emails by received_at (newest first) for stable order between loads
+        emails.sort(key=lambda e: e.get('received_at', ''), reverse=True)
+
+        # Strip raw fields before sending to frontend — only `summary` should be rendered
+        for e in emails:
+            e.pop('body', None)     # Full HTML body — huge, only needed during LLM enhancement
+            e.pop('snippet', None)  # Raw Gmail preview text — never show to users
+
         return {
             "emails": emails,
             "todos": todos,
@@ -148,78 +207,81 @@ class BriefService:
         }
 
     async def _get_emails(self, user_id: int, fast_mode: bool = False) -> List[Dict]:
-        """Fetch important unread emails using Gmail's IMPORTANT label."""
+        """Fetch important primary-tab emails, excluding promotions, social, forums, and updates."""
         if not self.email_service:
             logger.warning("[BriefService] No email service available")
             return []
             
         try:
-            # Use structured parameters — search_emails builds its own Gmail query internally.
-            # Do NOT pass raw Gmail syntax (e.g. "in:inbox newer_than:2d") as the query arg
-            # because the search service strips/mangles it via junk-word removal.
-            recent_cutoff = (datetime.now() - timedelta(days=7)).strftime("%Y/%m/%d")
+            # Fetch recent inbox emails. We filter out promos via sender/subject patterns below.
+            # NOTE: category:primary doesn't work on all Gmail/Workspace accounts.
+            gmail_query = "newer_than:7d"
             
-            logger.info(f"[BriefService] Searching recent inbox emails since {recent_cutoff}")
-            
-            # Explicitly disable RAG in fast_mode to avoid hitting timeouts (>1s)
-            allow_rag = not fast_mode
+            logger.info(f"[BriefService] Fetching inbox emails: {gmail_query}")
             
             messages = await asyncio.to_thread(
                 self.email_service.search_emails,
-                query=None,           # No free-text query — just structural filters
-                folder="inbox",       # Inbox only
-                after_date=recent_cutoff,  # Last 7 days
-                is_unread=None,       # Both read AND unread
-                limit=25,             # Fetch more to survive promotional filtering
-                allow_rag=allow_rag
+                query=gmail_query,
+                folder="inbox",
+                limit=30,
             ) 
             
-            logger.info(f"[BriefService] Found {len(messages)} emails")
+            logger.info(f"[BriefService] Found {len(messages)} primary-tab emails")
             
-            # Promotional sender patterns to exclude (be specific to avoid over-filtering)
-            # Promotional sender patterns to exclude
-            promo_patterns = ConfigDefaults.EMAIL_PROMO_PATTERNS
+            # Second filter: catch stragglers that Gmail miscategorized
+            promo_senders = ConfigDefaults.EMAIL_PROMO_PATTERNS
+            
+            # Subject patterns that indicate newsletters/promos even from primary tab
+            promo_subjects = [
+                'daily digest', 'weekly digest', 'newsletter', 'unsubscribe',
+                'your daily', 'your weekly', 'top stories', 'best stories',
+                'trending', 'recommended for you', 'digest for',
+                'get paid by referring', 'get up to $', 'free credit',
+                'won\'t regret', 'don\'t miss', 'limited time',
+            ]
             
             brief_emails = []
+            seen_subjects = set()
             for msg in messages:
                 sender = msg.get('sender', '').lower()
-                logger.info(f"[BriefService] Checking email from: {sender}")
+                subject = msg.get('subject', '').lower()
                 
-                # Skip promotional emails
-                is_promo = any(pattern in sender for pattern in promo_patterns)
-                
-                if is_promo:
-                    logger.info(f"[BriefService] Skipping promotional email from: {sender}")
+                # Skip by sender pattern
+                if any(pattern in sender for pattern in promo_senders):
+                    logger.info(f"[BriefService] Skipping promo sender: {sender[:50]}")
                     continue
                 
-                # Snippet is the Gmail preview text
-                summary = msg.get('snippet', '')
+                # Skip by subject pattern
+                if any(pattern in subject for pattern in promo_subjects):
+                    logger.info(f"[BriefService] Skipping promo subject: {subject[:50]}")
+                    continue
                 
-                # Fallback if snippet is empty
-                if not summary:
-                    summary = "No preview available"
+                # Deduplicate by subject (keep first occurrence only)
+                subj_key = subject.strip()
+                if subj_key in seen_subjects:
+                    logger.info(f"[BriefService] Skipping duplicate subject: {subject[:50]}")
+                    continue
+                seen_subjects.add(subj_key)
+                    
+                summary = msg.get('snippet', '') or 'No preview available'
                 
                 brief_emails.append({
                     "id": msg.get('id'),
                     "subject": msg.get('subject', 'No Subject'),
                     "from": msg.get('sender', 'Unknown'),
                     "summary": summary,
+                    "snippet": summary,
                     "body": msg.get('body', ''),
                     "received_at": msg.get('date'),
                     "thread_id": msg.get('threadId')
                 })
                 
-                # Limit to 10 filtered emails
                 if len(brief_emails) >= 10:
                     break
                     
-            logger.info(f"[BriefService] Filtered to {len(brief_emails)} non-promotional emails")
+            logger.info(f"[BriefService] Final: {len(brief_emails)} important emails for briefs")
             return brief_emails
             
-        except Exception as e:
-            logger.error(f"[BriefService] Error fetching emails: {e}", exc_info=True)
-            return []
-
         except Exception as e:
             logger.error(f"[BriefService] Error fetching emails: {e}", exc_info=True)
             return []
@@ -762,9 +824,10 @@ class BriefService:
         # 1. Process Emails for Reminders
         # Combine unread 'emails' and 'urgent_emails' (which might be read)
         # Deduplicate by ID
-        all_candidate_emails = {e['id']: e for e in emails}
+        all_candidate_emails = {e.get('id'): e for e in emails if isinstance(e, dict) and e.get('id')}
         for e in urgent_emails:
-            all_candidate_emails[e['id']] = e # urgent_emails take precedence or are just added
+            if isinstance(e, dict) and e.get('id'):
+                all_candidate_emails[e.get('id')] = e # urgent_emails take precedence or are just added
             
         candidate_list = list(all_candidate_emails.values())
         
@@ -1168,6 +1231,15 @@ class BriefService:
                 if action_summary and action_summary != email_ctx.get('summary'):
                     # Keep original subject as context, but make title the action
                     item['title'] = action_summary
+                    item['summary'] = action_summary
+                    # Force overwrite the snippet so the UI doesn't fall back to the raw Gmail string
+                    item['snippet'] = action_summary
+                    
+                    # Also clean up the 'from' field to remove the strict email address brackets for UI cleanliness
+                    import re
+                    sender_match = re.search(r'^([^<]+)', str(item.get('from', '')))
+                    if sender_match:
+                        item['from'] = sender_match.group(1).strip().replace('"', '')
                     
             logger.info(f"[BriefService] Enhancing {len(email_items)} emails with LLM action summaries")
             await asyncio.gather(*(enhance_email(item) for item in email_items), return_exceptions=True)
@@ -1186,43 +1258,73 @@ class BriefService:
             "items": items
         }
     
-    async def _extract_actionable_summary(self, email: Dict) -> str:
+    async def _extract_actionable_summary(self, email: Dict, user_name: str = "the reader") -> str:
         """Extract a 1-sentence actionable summary from an email body using a fast LLM."""
         body = email.get('body', '')
+        subject = email.get('subject', '')
+        sender = email.get('from', '')
+        
         if not body or len(body.strip()) < 10:
-            return email.get('summary', 'No content available')
+            # No body — use subject as the content for summarization
+            logger.info(f"[BriefService] No body for '{subject}', using subject as content")
+            body = f"{subject}"  # LLM will summarize from subject + sender
             
         try:
             from src.ai.llm_factory import LLMFactory
-            # Use a fast subset of the body to keep latency and token count low
-            clean_body = body[:2000] # Content usually within first 2000 chars
             
-            prompt = f"""Extract the core ask or action needed from this email in a single, short sentence.
-If there is no specific action, summarize what the email is about in one sentence.
-Make it actionable and direct (e.g., "Review the presentation" or "John is asking for an update on Q3").
-Do not include introductory words like "The email is asking to...". Just the action.
+            # Strip HTML tags so the model gets clean plaintext
+            clean_body = re.sub(r'<[^>]+>', ' ', body)
+            clean_body = re.sub(r'&\w+;', ' ', clean_body)  # HTML entities
+            clean_body = re.sub(r'\s+', ' ', clean_body).strip()
+            clean_body = clean_body[:1500]  # First 1500 chars of clean text
+            
+            sender_first = sender.split()[0] if sender else 'Someone'
+            
+            prompt = f"""Write ONE sentence summarizing what this email is about. Be SPECIFIC.
 
-SUBJECT: {email.get('subject', '')}
-FROM: {email.get('from', '')}
+BAD (too vague — NEVER do this):
+- "Emmanuel is asking."
+- "Medium suggests you."
+- "Zohaib is introducing."
+- "The team curated."
 
-BODY:
-{clean_body}
+GOOD (specific — ALWAYS do this):
+- "Emmanuel is asking for access to the Engineering Sprint Plan document."
+- "Medium curated today's top stories on AI design tools and UX trends for you."
+- "Zohaib is introducing Resemble AI's deepfake detection and voice cloning platform."
+- "Sourabh wants to walk you through how their qualified SQLs can help Clavr grow."
 
-Single-sentence summary:"""
+Start with "{sender_first}" and include the KEY DETAIL from the email body.
+The email recipient is named {user_name} — refer to them as "you", never by name.
+Your answer must be ONE complete sentence ending with a period.
 
-            # We use the default model to avoid cold starts with alternative models
-            llm = LLMFactory.get_llm_for_provider(self.config, temperature=0.2, max_tokens=60)
+FROM: {sender}
+SUBJECT: {subject}
+EMAIL CONTENT: {clean_body}
+
+Specific one-sentence summary:"""
+
+            llm = LLMFactory.get_llm_for_provider(self.config, temperature=0.2, max_tokens=2048)
             response = await asyncio.to_thread(llm.invoke, prompt)
             content = response.content if hasattr(response, 'content') else str(response)
             
-            summary = content.strip().strip('"').strip("'")
-            if len(summary) > 200:
-                return email.get('summary', '')  # Fallback
+            # Join all lines into one (model may split across lines)
+            summary = ' '.join(content.strip().split('\n')).strip()
+            summary = summary.strip('"').strip("'").strip()
+            
+            # Take only the first sentence if model gave multiple
+            sentences = re.split(r'(?<=[.!?])\s+', summary)
+            if sentences:
+                summary = sentences[0].strip()
+            
+            logger.info(f"[BriefService] AI Summary for '{subject}': {summary}")
+            if len(summary) > 200 or len(summary) < 15:
+                return ''
             return summary
             
         except Exception as e:
             logger.error(f"[BriefService] Action extraction failed: {e}")
-            return email.get('summary', '')
+            return ''
 
     def _is_soon(self, start_time: Optional[str]) -> bool:
         """Check if a meeting is within the next 2 hours."""

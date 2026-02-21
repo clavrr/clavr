@@ -44,7 +44,8 @@ class EmailAutoResponder:
         sender_name: str,
         sender_email: str,
         user_style: Optional[Dict[str, Any]] = None,
-        num_options: int = 3
+        num_options: int = 3,
+        revenue_context: Optional[Dict[str, Any]] = None,
     ) -> List[Dict[str, Any]]:
         """
         Generate reply options for an email.
@@ -70,7 +71,8 @@ class EmailAutoResponder:
                     email_subject=email_subject,
                     sender_name=sender_name,
                     tone=tone,
-                    user_style=user_style
+                    user_style=user_style,
+                    revenue_context=revenue_context,
                 )
                 replies.append(reply)
             except Exception as e:
@@ -90,7 +92,8 @@ class EmailAutoResponder:
         email_subject: str,
         sender_name: str,
         tone: str,
-        user_style: Optional[Dict[str, Any]] = None
+        user_style: Optional[Dict[str, Any]] = None,
+        revenue_context: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Generate a single reply with a specific tone."""
         
@@ -116,6 +119,29 @@ IMPORTANT: Match the user's personal writing style:
             "brief": "Write a very short response. 1-2 sentences maximum. Get straight to the point."
         }
         
+        # Build revenue signal context for deal-aware drafts
+        revenue_instructions = ""
+        if revenue_context:
+            signal_type = revenue_context.get("signal_type", "")
+            urgency = revenue_context.get("urgency", "")
+            value = revenue_context.get("estimated_value")
+            reminder_count = revenue_context.get("reminder_count", 0)
+            value_str = f"${value:,.0f}" if value else "Unknown"
+            urgency_tone = (
+                "Be direct, action-oriented, and convey sense of priority"
+                if urgency in ("critical", "high")
+                else "Be warm but clear about next steps"
+            )
+            revenue_instructions = f"""
+REVENUE CONTEXT (use to tailor urgency and specificity):
+- Signal Type: {signal_type}
+- Urgency Level: {urgency}
+- Estimated Deal Value: {value_str}
+- Previous Reminders Sent: {reminder_count} (this is follow-up #{reminder_count + 1})
+- Tone Guidance: {urgency_tone}
+- If this is a follow-up, reference the original context and add urgency proportional to the deal value
+"""
+
         prompt = f"""Generate a reply to this email.
 
 ORIGINAL EMAIL:
@@ -127,13 +153,14 @@ TONE: {tone}
 Instructions: {tone_instructions.get(tone, '')}
 
 {style_instructions}
-
+{revenue_instructions}
 IMPORTANT RULES:
 1. Do NOT include subject line or email headers
 2. Just write the reply body text
 3. Sign off appropriately for the tone
 4. Keep it natural and conversational
 5. Address any questions or requests in the original email
+6. If revenue context is provided, tailor the response to reflect the deal's importance
 
 Generate ONLY the reply text:"""
 

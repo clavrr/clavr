@@ -273,8 +273,11 @@ async def get_dashboard_overview(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to fetch dashboard overview: {str(e)}"
         )
+from fastapi import APIRouter, Depends, HTTPException, status, BackgroundTasks
+
 @router.get("/briefs")
 async def get_briefs(
+    background_tasks: BackgroundTasks,
     current_user: User = Depends(get_current_user_required),
     config = Depends(get_config),
     db: Session = Depends(get_db)
@@ -290,53 +293,88 @@ async def get_briefs(
     """
     from src.services.dashboard.brief_service import BriefService
     from src.core.credential_provider import CredentialFactory
+    from src.utils.redis_store import RedisBackedStore
+    import json
     
     logger.info(f"[BRIEFS] Fetching briefs for user {current_user.id}")
     
-    try:
-        # Helper to initialize services via factory in a thread (since it involves sync DB ops)
-        def init_services():
-            factory = CredentialFactory(config)
+    # Bump this version number whenever the summarization prompt or payload shape changes.
+    # This auto-invalidates stale cached payloads so users always get the latest format.
+    BRIEFS_CACHE_VERSION = "v19"
+    
+    cache_store = RedisBackedStore(prefix="dashboard_briefs", ttl_seconds=3600)
+    cache_key = f"{BRIEFS_CACHE_VERSION}:user:{current_user.id}"
+    
+    async def fetch_and_cache_briefs():
+        try:
+            # Helper to initialize services via factory in a thread (since it involves sync DB ops)
+            def init_services():
+                # Note: creating a new DB session inside the background task to avoid detached instance errors
+                from src.database import get_db_context
+                with get_db_context() as bg_db:
+                    factory = CredentialFactory(config)
+                    try:
+                        e_svc = factory.create_service('email', user_id=current_user.id, db_session=bg_db)
+                    except Exception as e:
+                        logger.error(f"[BRIEFS_BG] Failed to init EmailService: {e}")
+                        e_svc = None
+                        
+                    try:
+                        t_svc = factory.create_service('task', user_id=current_user.id, db_session=bg_db)
+                    except Exception as e:
+                        logger.error(f"[BRIEFS_BG] Failed to init TaskService: {e}")
+                        t_svc = None
+                        
+                    try:
+                        c_svc = factory.create_service('calendar', user_id=current_user.id, db_session=bg_db)
+                    except Exception as e:
+                        logger.error(f"[BRIEFS_BG] Failed to init CalendarService: {e}")
+                        c_svc = None
+                        
+                    return e_svc, t_svc, c_svc
+
+            loop = asyncio.get_event_loop()
+            email_svc, task_svc, cal_svc = await loop.run_in_executor(None, init_services)
+
+            brief_service = BriefService(
+                config=config,
+                email_service=email_svc,
+                task_service=task_svc,
+                calendar_service=cal_svc
+            )
+            logger.info(f"[BRIEFS_BG] Services created for Background Fetch. Calendar Svc available: {cal_svc is not None}")
             
-            # Create services using factory (prioritizes UserIntegration -> falls back to Session)
-            try:
-                e_svc = factory.create_service('email', user_id=current_user.id, db_session=db)
-            except Exception as e:
-                logger.error(f"[BRIEFS] Failed to init EmailService: {e}")
-                e_svc = None
-                
-            try:
-                t_svc = factory.create_service('task', user_id=current_user.id, db_session=db)
-            except Exception as e:
-                logger.error(f"[BRIEFS] Failed to init TaskService: {e}")
-                t_svc = None
-                
-            try:
-                c_svc = factory.create_service('calendar', user_id=current_user.id, db_session=db)
-            except Exception as e:
-                logger.error(f"[BRIEFS] Failed to init CalendarService: {e}")
-                c_svc = None
-                
-            return e_svc, t_svc, c_svc
+            # Fetch fresh payload
+            fresh_briefs = await brief_service.get_dashboard_briefs(
+                user_id=current_user.id,
+                user_name=current_user.name or current_user.email.split('@')[0] if current_user.email else "there",
+                fast_mode=False
+            )
+            
+            # Update cache payload
+            cache_store.set(cache_key, fresh_briefs)
+            logger.info(f"[BRIEFS_BG] Background Cache Updated for User {current_user.id}")
+            return fresh_briefs
+            
+        except Exception as e:
+            logger.error(f"[BRIEFS_BG] Background Error fetching briefs: {e}", exc_info=True)
+            return None
 
-        # Run sync initialization in thread pool
-        loop = asyncio.get_event_loop()
-        email_svc, task_svc, cal_svc = await loop.run_in_executor(None, init_services)
-
-        # 3. Aggregation
-        brief_service = BriefService(
-            config=config,
-            email_service=email_svc,
-            task_service=task_svc,
-            calendar_service=cal_svc
-        )
-        logger.info(f"[BRIEFS] BriefService created. Calendar Svc available: {cal_svc is not None}")
-        
-        briefs = await brief_service.get_dashboard_briefs(
-            user_id=current_user.id,
-            user_name=current_user.name or current_user.email.split('@')[0] if current_user.email else "there"
-        )
-        return briefs
+    try:
+        # Check cache instantly 
+        cached_data = cache_store.get(cache_key)
+        if cached_data:
+            logger.info(f"[BRIEFS] Cache HIT for user {current_user.id}. Returning instantly and delegating refresh to background.")
+            background_tasks.add_task(fetch_and_cache_briefs)
+            return cached_data
+            
+        # Cache MISS - Block request and run synchronously
+        logger.info(f"[BRIEFS] Cache MISS for user {current_user.id}. Blocking request to generate initial payload.")
+        initial_payload = await fetch_and_cache_briefs()
+        if not initial_payload:
+            raise Exception("Failed to generate initial briefs payload")
+            
+        return initial_payload
         
     except Exception as e:
         logger.error(f"[BRIEFS] Error fetching briefs: {e}", exc_info=True)

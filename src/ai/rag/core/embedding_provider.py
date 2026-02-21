@@ -54,7 +54,8 @@ class GeminiEmbeddingProvider(EmbeddingProvider):
     - Separate task types for documents and queries
     """
     
-    def __init__(self, api_key: str, model_name: str = "models/text-embedding-004", 
+    def __init__(self, api_key: str, model_name: str = "models/gemini-embedding-001", 
+                 dimension: int = 3072,
                  cache_size: int = 1000, cache_ttl_hours: int = 24,
                  max_retries: int = 3, retry_base_delay: float = 1.0):
         """
@@ -92,7 +93,7 @@ class GeminiEmbeddingProvider(EmbeddingProvider):
         
         self._max_retries = max_retries
         self._base_delay = retry_base_delay
-        self._dimension = 768  # Gemini embeddings are 768D
+        self._dimension = dimension  # gemini-embedding-001 default: 3072, configurable via outputDimensionality
         
         # Shared ThreadPoolExecutor for batch processing
         max_workers = int(os.environ.get('EMBEDDING_PARALLEL_WORKERS', '10'))
@@ -103,11 +104,15 @@ class GeminiEmbeddingProvider(EmbeddingProvider):
         """Normalize known legacy aliases and ensure Gemini API model format."""
         normalized = model_name.strip()
 
+        # Map deprecated / legacy model IDs to their current replacements.
+        # gemini-embedding-001 is the recommended model as of 2025.
+        # text-embedding-004 and text-embedding-005 are older models.
+        # embedding-001 was the original Vertex model.
         legacy_aliases = {
-            "embedding-001": "models/text-embedding-004",
-            "models/embedding-001": "models/text-embedding-004",
-            "gemini-embedding-001": "models/text-embedding-004",
-            "models/gemini-embedding-001": "models/text-embedding-004",
+            "embedding-001": "models/gemini-embedding-001",
+            "models/embedding-001": "models/gemini-embedding-001",
+            "text-embedding-004": "models/gemini-embedding-001",
+            "models/text-embedding-004": "models/gemini-embedding-001",
         }
 
         normalized = legacy_aliases.get(normalized, normalized)
@@ -489,6 +494,7 @@ def create_embedding_provider(config: Config, rag_config: Optional[RAGConfig] = 
             return GeminiEmbeddingProvider(
                 api_key=config.ai.api_key,
                 model_name=rag_config.embedding_model,
+                dimension=rag_config.embedding_dimension,
                 cache_size=rag_config.embedding_cache_size,
                 cache_ttl_hours=rag_config.embedding_cache_ttl_hours,
                 max_retries=rag_config.max_retries,
