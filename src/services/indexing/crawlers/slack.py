@@ -134,6 +134,38 @@ class SlackCrawler(BaseIndexer):
                     to_node=message_node_id,
                     rel_type=RelationType.POSTED
                 ))
+                
+                # COMMUNICATES_WITH — Slack message = interaction signal
+                rels.append(Relationship(
+                    from_node=f"User/{self.user_id}",
+                    to_node=person_node.node_id,
+                    rel_type=RelationType.COMMUNICATES_WITH,
+                    properties={
+                        'source': 'slack',
+                        'last_interaction': datetime.fromtimestamp(float(ts)).isoformat(),
+                        'strength': 0.2,  # Slack message = lightweight interaction signal
+                    }
+                ))
+                
+                # KNOWS — ensure User knows this Slack contact
+                aliases = []
+                person_name = person_node.properties.get('name')
+                if person_name and person_name.strip():
+                    aliases.append(person_name)
+                    first_name = person_name.split()[0] if person_name.split() else None
+                    if first_name and first_name != person_name:
+                        aliases.append(first_name)
+                
+                rels.append(Relationship(
+                    from_node=f"User/{self.user_id}",
+                    to_node=person_node.node_id,
+                    rel_type=RelationType.KNOWS,
+                    properties={
+                        'aliases': aliases,
+                        'frequency': 1,
+                        'source': 'slack',
+                    }
+                ))
             
             # IN_CHANNEL relationship (Message -> Channel)
             if channel_node:

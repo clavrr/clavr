@@ -150,6 +150,19 @@ async def _process_slack_event(
         except Exception as e:
             logger.error(f"[SlackEvents] Failed to queue webhook for {inner_type}: {e}")
 
+    # --- 3. Autonomous Bridge dispatch ---
+    if inner_type in ("reaction_added", "app_mention"):
+        try:
+            from src.services.autonomous_bridge import AutonomousBridgeService
+
+            await AutonomousBridgeService.try_handle(
+                event_type=inner_type,
+                payload=payload,
+                user_id=user_id,
+            )
+        except Exception as e:
+            logger.error(f"[SlackEvents] Bridge dispatch error for {inner_type}: {e}")
+
 
 @router.post("/slack/events", status_code=status.HTTP_200_OK)
 async def handle_slack_event(

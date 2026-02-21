@@ -832,61 +832,58 @@ class EntityResolutionService:
         
         Called by indexers for 'Person' or 'Contact' nodes to link them
         without waiting for the background job.
+        
+        Strategies (in order):
+        1. Email-exact match (confidence: 1.0)
+        2. Nickname match (confidence: 0.85)
+        3. Exact name match when no email (confidence: 0.9)
         """
-        if node.node_type not in ['Person', 'Contact']:
+        node_type_str = node.node_type
+        if hasattr(node_type_str, 'value'):
+            node_type_str = node_type_str.value
+        
+        if node_type_str not in ('Person', 'Contact'):
             return
             
         try:
-            # 1. Email matching (Very fast, high confidence)
             properties = node.properties
             email = properties.get('email')
+            name = properties.get('name')
             node_id = node.node_id
             
+            # Build the full _id for SAME_AS dedup checks
+            node_full_id = f"{node_type_str}/{node_id}"
+            
+            # --- 1. Email-exact match ---
             if email:
-                # Find direct matches
                 query = """
                 FOR other IN UNION(
                     (FOR p IN Person RETURN p),
                     (FOR c IN Contact RETURN c)
                 )
-                    FILTER other.email == @email
-                    FILTER other.id != @node_id
+                    FILTER LOWER(other.email) == LOWER(@email)
+                    FILTER other._id != @node_full_id
                     
                     LET same_as_exists = LENGTH(
                         FOR r IN SAME_AS
-                        FILTER (r._from == other._id AND r._to == CONCAT('Person/', @node_id)) OR (r._from == CONCAT('Person/', @node_id) AND r._to == other._id)
-                         // Note: constructing _id might be tricky if @node_id is just ID not _id. 
-                         // Assuming node_id in vars is just the ID part. Use other.id check first.
-                         // Actually checking against just ID is safer if schema is consistent.
+                        FILTER (r._from == other._id AND r._to == @node_full_id)
+                            OR (r._from == @node_full_id AND r._to == other._id)
                         LIMIT 1
                         RETURN 1
                     ) > 0
-                    // Better check: 
-                    // FILTER NOT (LENGTH(FOR r IN SAME_AS FILTER (r._from == other._id AND r._to == @node_full_id) OR ...))
                     
                     FILTER NOT same_as_exists
+                    LIMIT 5
                     RETURN {
                         id: other.id, 
-                        labels: [PARSE_IDENTIFIER(other._id).collection],
-                        name: other.name
+                        name: other.name,
+                        collection: PARSE_IDENTIFIER(other._id).collection
                     }
                 """
                 
-                # Check if @node_id param is full ID or just part. usually it's passed as full ID or we construct it?
-                # The code passes `node.node_id`. If `node_id` is just '123', then `_id` is 'Person/123'.
-                # Let's assume we can pass `node_full_id`? 
-                
-                # Actually, ArangoDB queries usually don't mix `id` and `_id` easily without knowing collection.
-                # But here we UNION(Person, Contact).
-                # The `node_id` param seems to be the unique ID prop.
-                # Let's keep it simple: just filter by `other.id != @node_id`.
-                # For relationship check, we need the full _id of the new node.
-                # We can construct strictly if we know the type. `node.node_type` is available.
-                
-                
                 results = await self.graph.execute_query(query, {
-                    'email': email,
-                    'node_id': node_id
+                    'email': email.lower().strip(),
+                    'node_full_id': node_full_id
                 })
                 
                 if results:
@@ -896,35 +893,109 @@ class EntityResolutionService:
                             method="email_exact_immediate",
                             confidence=1.0
                         )
-                        logger.info(f"[EntityResolution] Immediate match (email): {properties.get('name')} == {res.get('name')}")
+                        logger.info(
+                            f"[EntityResolution] Immediate match (email): "
+                            f"{name} == {res.get('name')}"
+                        )
             
-            # 2. Name matching (slower but useful if no email)
-            name = properties.get('name')
+            # --- 2. Nickname match ---
+            if name:
+                first_name = name.strip().split()[0].lower() if name.strip().split() else None
+                
+                if first_name and first_name in NICKNAME_MAP:
+                    variants = list(NICKNAME_MAP[first_name])
+                    last_name_parts = name.strip().split()[1:]
+                    last_name = last_name_parts[-1].lower() if last_name_parts else None
+                    
+                    for variant in variants:
+                        variant_query = """
+                        FOR other IN UNION(
+                            (FOR p IN Person RETURN p),
+                            (FOR c IN Contact RETURN c)
+                        )
+                            FILTER other._id != @node_full_id
+                            FILTER LOWER(other.name) != null
+                            LET other_parts = SPLIT(LOWER(other.name), ' ')
+                            FILTER LENGTH(other_parts) > 0
+                            FILTER other_parts[0] == @variant
+                            FILTER @last_name == null 
+                                OR LENGTH(other_parts) < 2 
+                                OR other_parts[-1] == @last_name
+                            
+                            LET same_as_exists = LENGTH(
+                                FOR r IN SAME_AS
+                                FILTER (r._from == other._id AND r._to == @node_full_id)
+                                    OR (r._from == @node_full_id AND r._to == other._id)
+                                LIMIT 1
+                                RETURN 1
+                            ) > 0
+                            FILTER NOT same_as_exists
+                            LIMIT 3
+                            RETURN { id: other.id, name: other.name }
+                        """
+                        
+                        try:
+                            results = await self.graph.execute_query(variant_query, {
+                                'variant': variant,
+                                'last_name': last_name,
+                                'node_full_id': node_full_id
+                            })
+                            
+                            if results:
+                                for res in results:
+                                    await self._create_same_as_link(
+                                        node_id, res['id'],
+                                        method="nickname_immediate",
+                                        confidence=self.CONFIDENCE_SCORES.get("nickname", 0.85)
+                                    )
+                                    logger.info(
+                                        f"[EntityResolution] Immediate nickname match: "
+                                        f"{name} ~ {res.get('name')}"
+                                    )
+                        except Exception:
+                            pass  # Nickname matching is best-effort
+            
+            # --- 3. Exact name match (only if no email) ---
             if name and not email:
-                # Basic exact name matching for immediate resolution
                 query = """
-                FOR other IN UNION(Person, Contact)
+                FOR other IN UNION(
+                    (FOR p IN Person RETURN p),
+                    (FOR c IN Contact RETURN c)
+                )
                     FILTER LOWER(other.name) == LOWER(@name)
-                    FILTER other.id != @node_id
-                    # Skip relationship check for speed or assume none exist if new
+                    FILTER other._id != @node_full_id
+                    
+                    LET same_as_exists = LENGTH(
+                        FOR r IN SAME_AS
+                        FILTER (r._from == other._id AND r._to == @node_full_id)
+                            OR (r._from == @node_full_id AND r._to == other._id)
+                        LIMIT 1
+                        RETURN 1
+                    ) > 0
+                    FILTER NOT same_as_exists
                     LIMIT 5
                     RETURN { id: other.id, name: other.name }
                 """
                 
                 results = await self.graph.execute_query(query, {
                     'name': name,
-                    'node_id': node_id
+                    'node_full_id': node_full_id
                 })
                 
                 if results:
                     for res in results:
-                        # Slightly lower confidence for name only
                         await self._create_same_as_link(
                             node_id, res['id'],
                             method="name_exact_immediate",
                             confidence=0.9
                         )
-                        logger.info(f"[EntityResolution] Immediate match (name): {name} == {res.get('name')}")
+                        logger.info(
+                            f"[EntityResolution] Immediate match (name): "
+                            f"{name} == {res.get('name')}"
+                        )
 
         except Exception as e:
-            logger.warning(f"[EntityResolution] Immediate resolution failed for {node.node_id}: {e}")
+            logger.warning(
+                f"[EntityResolution] Immediate resolution failed for "
+                f"{node.node_id}: {e}"
+            )

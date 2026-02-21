@@ -26,6 +26,7 @@ CRAWLER_CALENDAR = 'calendar'
 CRAWLER_TASKS = 'google_tasks'
 CRAWLER_KEEP = 'google_keep'
 CRAWLER_LINEAR = 'linear'
+CRAWLER_CONTACTS = 'google_contacts'
 
 # Service Names
 SERVICE_UNIFIED_INDEXER = '[UnifiedIndexer]'

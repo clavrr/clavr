@@ -72,12 +72,25 @@ class AsanaService:
     def is_available(self) -> bool:
         """Check if Asana service is available."""
         return self._client.is_available
+
+    @property
+    def unavailable_reason(self) -> Optional[str]:
+        """Return reason code when service is unavailable."""
+        return self._client.unavailable_reason
     
     def _ensure_available(self):
         """Ensure service is available."""
         if not self.is_available:
+            reason = self.unavailable_reason
+            if reason == "sdk_missing":
+                raise AsanaServiceException(
+                    "Asana SDK is not installed on this backend. Run: pip install asana"
+                )
+            if reason == "token_missing":
+                raise AsanaAuthenticationException("No Asana access token configured")
+
             raise AsanaServiceException(
-                "Asana is not available. Check ASANA_ACCESS_TOKEN environment variable."
+                "Asana is not available. Check SDK installation and OAuth configuration."
             )
     
     def _normalize_due_date(self, due_date: Optional[str]) -> Optional[str]:
@@ -121,6 +134,7 @@ class AsanaService:
         notes: Optional[str] = None,
         priority: Optional[str] = None,
         project_id: Optional[str] = None,
+        project_name: Optional[str] = None,
         assignee: Optional[str] = None,
         **kwargs
     ) -> Dict[str, Any]:
@@ -133,6 +147,7 @@ class AsanaService:
             notes: Task notes/description
             priority: Priority level (mapped to custom field if available)
             project_id: Project to add task to
+            project_name: Project name to resolve to an Asana project ID
             assignee: Assignee (use 'me' for current user)
             
         Returns:
@@ -142,6 +157,12 @@ class AsanaService:
         
         if not title:
             raise AsanaValidationException("title", "Task title is required")
+
+        if not project_id and project_name:
+            project = self.find_project_by_name(project_name)
+            if not project:
+                raise AsanaValidationException("project_name", f"Project not found: {project_name}")
+            project_id = project["id"]
         
         # Normalize due date
         due_on = self._normalize_due_date(due_date)
@@ -369,6 +390,36 @@ class AsanaService:
         except Exception as e:
             logger.error(f"Failed to list Asana projects: {e}")
             raise AsanaServiceException(f"Failed to list projects: {e}")
+
+    def find_project_by_name(self, project_name: str) -> Optional[Dict[str, Any]]:
+        """Find an Asana project by name (case-insensitive exact match)."""
+        if not project_name:
+            return None
+
+        target = project_name.strip().lower()
+        for project in self.list_projects(limit=100):
+            name = (project.get("name") or "").strip().lower()
+            if name == target:
+                return project
+        return None
+
+    def create_project(self, name: str, notes: Optional[str] = None) -> Dict[str, Any]:
+        """Create a new Asana project."""
+        self._ensure_available()
+
+        if not name or not name.strip():
+            raise AsanaValidationException("project_name", "Project name is required")
+
+        try:
+            created = self._client.create_project(name=name.strip(), notes=notes)
+            return {
+                "id": created.get("gid"),
+                "name": created.get("name"),
+                "archived": created.get("archived", False),
+            }
+        except Exception as e:
+            logger.error(f"Failed to create Asana project: {e}")
+            raise AsanaServiceException(f"Failed to create project: {e}")
     
     # ========================================================================
     # Helpers

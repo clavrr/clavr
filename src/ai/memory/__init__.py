@@ -47,7 +47,8 @@ from .memory_config import (
 )
 
 # Person/contact management
-from .person_intelligence import PersonIntelligenceService, PersonContext
+from src.services.person_intelligence import PersonIntelligenceService
+from src.services.person_intelligence import PersonDossier as PersonContext
 from .person_unification import PersonUnificationService, UnifiedPerson
 from .resolution import EntityResolutionService
 

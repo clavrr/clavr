@@ -482,10 +482,29 @@ class QdrantVectorStore(VectorStore):
                     vectors_config=self.models.VectorParams(
                         size=self.embedding_dim,
                         distance=self.models.Distance.COSINE
-                    )
+                    ),
+                    # V1: Add sparse vector config for hybrid search
+                    sparse_vectors_config={
+                        "text-sparse": self.models.SparseVectorParams(
+                            modifier=self.models.Modifier.IDF,  # TF-IDF weighting
+                        )
+                    },
                 )
+                self._has_sparse = True
+                logger.info(f"Collection created with sparse-dense hybrid support")
+            else:
+                # Check if collection has sparse vectors configured
+                try:
+                    info = self.client.get_collection(self.collection_name)
+                    self._has_sparse = bool(
+                        hasattr(info.config, 'sparse_vectors_config') and 
+                        info.config.sparse_vectors_config
+                    )
+                except Exception:
+                    self._has_sparse = False
         except Exception as e:
             logger.error(f"Failed to ensure Qdrant collection: {e}")
+            self._has_sparse = False
             raise
 
     def add_document(self, doc_id: str, content: str, metadata: Optional[Dict[str, Any]] = None) -> None:
@@ -522,31 +541,59 @@ class QdrantVectorStore(VectorStore):
         )
         logger.debug(f"Added document to Qdrant: {doc_id}")
 
+    def _build_sparse_vector(self, text: str) -> Optional[Dict[str, Any]]:
+        """
+        Build a sparse vector from text using simple term frequency.
+        
+        Qdrant's IDF modifier (configured on collection) handles the IDF part.
+        We just need to provide term frequencies as sparse indices/values.
+        
+        Returns dict with 'indices' and 'values' lists, or None on failure.
+        """
+        try:
+            import re
+            from collections import Counter
+            
+            # Simple tokenization: split on non-alphanumeric, lowercase, filter short
+            tokens = re.findall(r'\b[a-zA-Z0-9]{2,}\b', text.lower())
+            
+            # Remove very common English stopwords
+            STOPWORDS = {'the', 'a', 'an', 'is', 'are', 'was', 'were', 'be', 'been',
+                        'being', 'have', 'has', 'had', 'do', 'does', 'did', 'will',
+                        'would', 'could', 'should', 'may', 'might', 'can', 'shall',
+                        'to', 'of', 'in', 'for', 'on', 'with', 'at', 'by', 'from',
+                        'and', 'or', 'but', 'not', 'so', 'if', 'as', 'it', 'its',
+                        'this', 'that', 'these', 'those', 'he', 'she', 'we', 'they',
+                        'me', 'him', 'her', 'us', 'them', 'my', 'your', 'his',
+                        'our', 'their'}
+            tokens = [t for t in tokens if t not in STOPWORDS]
+            
+            if not tokens:
+                return None
+            
+            # Count term frequencies
+            tf = Counter(tokens)
+            
+            # Convert tokens to indices using hash (deterministic mapping)
+            indices = []
+            values = []
+            for token, count in tf.most_common(200):  # Limit to top 200 terms
+                # Hash token to a positive integer index
+                idx = abs(hash(token)) % (2**31)  # Keep within int32 range
+                indices.append(idx)
+                values.append(float(count))
+            
+            return {'indices': indices, 'values': values}
+            
+        except Exception as e:
+            logger.debug(f"Sparse vector generation failed: {e}")
+            return None
+
     def add_documents(self, documents: List[Dict[str, Any]]) -> None:
         """Add multiple documents to the vector store."""
         if not documents:
             return
             
-        points = []
-        for doc in documents:
-            content = doc.get('content', '')
-            if not content:
-                continue
-                
-            # Handle different content types
-            if hasattr(content, 'text'):
-                content_str = content.text
-            else:
-                content_str = str(content)
-                
-            doc_id = doc.get('id', str(uuid.uuid4()))
-            
-            # Generate embedding (if not already provided? usually provider handles batch)
-            # Here we need batch encoding.
-            # But wait, we iterate documents. 
-            # Ideally we batch encode first.
-            pass 
-        
         # Efficient batch implementation
         contents = []
         valid_docs = []
@@ -565,7 +612,7 @@ class QdrantVectorStore(VectorStore):
         if not contents:
             return
             
-        # Batch encode
+        # Batch encode dense vectors
         embeddings = self.embedding_provider.encode_batch(contents)
         embeddings = [emb.tolist() if hasattr(emb, 'tolist') else list(emb) for emb in embeddings]
         
@@ -588,11 +635,33 @@ class QdrantVectorStore(VectorStore):
             # Encrypt payload
             encrypted_payload = _encrypt_payload(payload)
             
-            points.append(self.models.PointStruct(
-                id=point_id,
-                vector=embeddings[i],
-                payload=encrypted_payload
-            ))
+            # V1: Build sparse vector for hybrid search
+            vector_data = embeddings[i]  # Dense vector as default
+            sparse_vector = None
+            if getattr(self, '_has_sparse', False):
+                sparse_vector = self._build_sparse_vector(contents[i])
+            
+            if sparse_vector:
+                # Named vectors: dense + sparse
+                point = self.models.PointStruct(
+                    id=point_id,
+                    vector={
+                        "": embeddings[i],  # Default dense vector
+                        "text-sparse": self.models.SparseVector(
+                            indices=sparse_vector['indices'],
+                            values=sparse_vector['values']
+                        )
+                    },
+                    payload=encrypted_payload
+                )
+            else:
+                point = self.models.PointStruct(
+                    id=point_id,
+                    vector=embeddings[i],
+                    payload=encrypted_payload
+                )
+            
+            points.append(point)
             
         # Batch upsert
         batch_size = 100
@@ -609,14 +678,56 @@ class QdrantVectorStore(VectorStore):
         logger.info(f"Added {len(points)} documents to Qdrant")
 
     def search(self, query_embedding: List[float], k: int = 5, 
-               filters: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
-        """Search for similar documents using query embedding."""
+               filters: Optional[Dict[str, Any]] = None,
+               query_text: Optional[str] = None) -> List[Dict[str, Any]]:
+        """Search for similar documents using query embedding.
+        
+        V1 improvement: When sparse vectors are available and query_text is provided,
+        uses prefetch + RRF fusion for hybrid dense+sparse search.
+        """
         
         try:
             # Convert filters to Qdrant filter
             q_filter = self._build_qdrant_filter(filters) if filters else None
             
-            # Use query_points instead of search (more robust/newer API)
+            # V1: If sparse vectors available and we have query text, use hybrid RRF
+            if getattr(self, '_has_sparse', False) and query_text:
+                sparse_vector = self._build_sparse_vector(query_text)
+                
+                if sparse_vector:
+                    try:
+                        # Two-stage prefetch + Reciprocal Rank Fusion
+                        results = self.client.query_points(
+                            collection_name=self.collection_name,
+                            prefetch=[
+                                self.models.Prefetch(
+                                    query=query_embedding,
+                                    limit=k * 3,  # Fetch more for fusion
+                                    using="",  # Default dense vector
+                                ),
+                                self.models.Prefetch(
+                                    query=self.models.SparseVector(
+                                        indices=sparse_vector['indices'],
+                                        values=sparse_vector['values']
+                                    ),
+                                    limit=k * 3,
+                                    using="text-sparse",
+                                ),
+                            ],
+                            query=self.models.FusionQuery(
+                                fusion=self.models.Fusion.RRF
+                            ),
+                            limit=k,
+                            query_filter=q_filter,
+                            with_payload=True
+                        ).points
+                        
+                        logger.debug(f"Hybrid RRF search returned {len(results)} results")
+                        return self._format_search_results(results)
+                    except Exception as e:
+                        logger.debug(f"Hybrid search failed, falling back to dense: {e}")
+            
+            # Fallback: Dense-only search
             results = self.client.query_points(
                 collection_name=self.collection_name,
                 query=query_embedding,
@@ -625,23 +736,7 @@ class QdrantVectorStore(VectorStore):
                 with_payload=True
             ).points
             
-            formatted_results = []
-            for res in results:
-                payload = res.payload or {}
-                # Decrypt payload
-                decrypted_payload = _decrypt_payload(payload)
-                decrypted_content = decrypted_payload.pop('content', '')
-                original_id = decrypted_payload.pop('original_id', str(res.id))
-                
-                formatted_results.append({
-                    'content': decrypted_content,
-                    'metadata': decrypted_payload,
-                    'distance': res.score, # Cosine similarity
-                    'score': res.score,
-                    'id': original_id
-                })
-                
-            return formatted_results
+            return self._format_search_results(results)
             
         except Exception as e:
             # Handle empty collection or other API errors gracefully
@@ -651,12 +746,32 @@ class QdrantVectorStore(VectorStore):
             else:
                 logger.warning(f"Qdrant search error: {e}")
             return []
+    
+    def _format_search_results(self, results) -> List[Dict[str, Any]]:
+        """Format Qdrant search results into standard dict format."""
+        formatted_results = []
+        for res in results:
+            payload = res.payload or {}
+            # Decrypt payload
+            decrypted_payload = _decrypt_payload(payload)
+            decrypted_content = decrypted_payload.pop('content', '')
+            original_id = decrypted_payload.pop('original_id', str(res.id))
+            
+            formatted_results.append({
+                'content': decrypted_content,
+                'metadata': decrypted_payload,
+                'distance': res.score, # Cosine similarity
+                'score': res.score,
+                'id': original_id
+            })
+            
+        return formatted_results
 
     def search_by_text(self, query_text: str, k: int = 5, 
                       filters: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
-        """Search using query text."""
+        """Search using query text. Uses hybrid RRF when sparse vectors are available."""
         query_embedding = self.embedding_provider.encode_query(query_text)
-        return self.search(query_embedding, k, filters)
+        return self.search(query_embedding, k, filters, query_text=query_text)
 
     def delete_document(self, doc_id: str) -> None:
         """Delete a document."""
@@ -738,14 +853,33 @@ class QdrantVectorStore(VectorStore):
             return False
 
     def _build_qdrant_filter(self, filters: Dict[str, Any]):
-        """Convert simple dict filters to Qdrant Filter."""
+        """Convert simple dict filters to Qdrant Filter.
+        
+        Supports:
+        - Simple value match: {'key': 'value'}
+        - List match (any): {'key': ['val1', 'val2']}
+        - Range operators: {'key': {'$gte': 10, '$lte': 100}}
+        """
         if not filters:
             return None
             
         conditions = []
         for key, value in filters.items():
-            # Handle simple direct matches
-            if isinstance(value, (str, int, bool)):
+            if isinstance(value, dict):
+                # Range operators for date/numeric filtering
+                range_kwargs = {}
+                op_map = {'$gte': 'gte', '$lte': 'lte', '$gt': 'gt', '$lt': 'lt'}
+                for op, qdrant_op in op_map.items():
+                    if op in value:
+                        range_kwargs[qdrant_op] = value[op]
+                if range_kwargs:
+                    conditions.append(
+                        self.models.FieldCondition(
+                            key=key,
+                            range=self.models.Range(**range_kwargs)
+                        )
+                    )
+            elif isinstance(value, (str, int, bool)):
                 conditions.append(
                     self.models.FieldCondition(
                         key=key,

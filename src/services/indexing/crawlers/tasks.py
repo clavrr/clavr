@@ -50,7 +50,8 @@ class TasksCrawler(BaseIndexer):
         super().__init__(config, user_id, **kwargs)
         self.task_service = task_service
         self.last_sync_time = datetime.now() - timedelta(days=ServiceConstants.INITIAL_LOOKBACK_DAYS)
-        self._task_cache = {}  # Cache task IDs with update timestamps
+        # NOTE: In-memory _task_cache replaced by self._persisted_cache (from BaseIndexer)
+        # Durable sync state is loaded automatically in run_sync_cycle
         
         # Tasks-specific settings from ServiceConstants
         self.sync_interval = ServiceConstants.TASK_SYNC_INTERVAL
@@ -82,10 +83,10 @@ class TasksCrawler(BaseIndexer):
                 task_id = task.get('id')
                 updated = task.get('updated')
                 
-                if task_id not in self._task_cache or self._task_cache[task_id] != updated:
+                if task_id not in self._persisted_cache or self._persisted_cache[task_id] != updated:
                     task['_status'] = 'pending'
                     new_items.append(task)
-                    self._task_cache[task_id] = updated
+                    self._persisted_cache[task_id] = updated
             
             # 2. Fetch recently completed tasks (for tracking completion)
             completed_tasks = await asyncio.to_thread(
@@ -99,10 +100,10 @@ class TasksCrawler(BaseIndexer):
                 task_id = task.get('id')
                 updated = task.get('updated')
                 
-                if task_id not in self._task_cache or self._task_cache[task_id] != updated:
+                if task_id not in self._persisted_cache or self._persisted_cache[task_id] != updated:
                     task['_status'] = 'completed'
                     new_items.append(task)
-                    self._task_cache[task_id] = updated
+                    self._persisted_cache[task_id] = updated
             
             logger.info(f"[TasksCrawler] Found {len(new_items)} tasks to index")
             return new_items

@@ -52,7 +52,8 @@ class KeepCrawler(BaseIndexer):
         super().__init__(config, user_id, **kwargs)
         self.keep_service = keep_service
         self.last_sync_time = datetime.now() - timedelta(days=ServiceConstants.INITIAL_LOOKBACK_DAYS_NOTES)  # Notes need longer lookback
-        self._note_cache = {}  # Track indexed notes
+        # NOTE: In-memory _note_cache replaced by self._persisted_cache (from BaseIndexer)
+        # Durable sync state is loaded automatically in run_sync_cycle
         
         # Keep-specific settings from ServiceConstants
         self.sync_interval = ServiceConstants.KEEP_SYNC_INTERVAL
@@ -82,10 +83,10 @@ class KeepCrawler(BaseIndexer):
                 note_id = note.get('name') or note.get('id')
                 updated = note.get('update_time') or note.get('create_time')
                 
-                # Check if note is new or updated
-                if note_id not in self._note_cache or self._note_cache.get(note_id) != updated:
+                # Check if note is new or updated (using durable _persisted_cache)
+                if note_id not in self._persisted_cache or self._persisted_cache.get(note_id) != updated:
                     new_items.append(note)
-                    self._note_cache[note_id] = updated
+                    self._persisted_cache[note_id] = updated
             
             logger.info(f"[KeepCrawler] Found {len(new_items)} notes to index")
             return new_items

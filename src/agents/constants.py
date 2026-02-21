@@ -44,12 +44,13 @@ INTENT_KEYWORDS = {
         'search': ['search', 'find', 'show', 'list', 'check', 'get', 'read', 'inbox']
     },
     'calendar': {
-        'schedule': ['book', 'set up', 'new meeting', 'new event', 'create event', 'schedule', 'create', 'meeting', 'event', 'add'],
+        'schedule': ['book', 'set up', 'new meeting', 'new event', 'create event', 'schedule', 'create', 'add'],
         'update': ['reschedule', 'move', 'change', 'update', 'cancel', 'edit'],
-        'list': ['agenda', 'calendar', 'show', 'list', 'what do i have', 'meetings', 'events', 'summarize', 'my schedule']
+        'list': ['agenda', 'calendar', 'show', 'list', 'what do i have', 'meetings', 'events', 'meeting', 'event', 'summarize', 'my schedule', 'upcoming', 'today', 'tomorrow', 'this week'],
+        'availability': ['free', 'busy', 'available', 'gap', 'open', 'different time', 'another time', 'find time', 'find a slot', 'when can']
     },
     'tasks': {
-        'create': ['add', 'remind me', 'new task', 'new todo', 'buy'],
+        'create': ['create', 'add', 'make', 'set', 'remind me', 'new task', 'new todo', 'buy'],
         'complete': ['complete', 'finish', 'check off', 'done', 'mark complete'],
         'list': ['list', 'show', 'tasks', 'todos', 'outstanding', 'pending', 'summarize', 'get', 'what are']
     },
@@ -88,7 +89,7 @@ TIME_SENSITIVE_KEYWORDS = ["today", "tonight", "morning", "afternoon", "evening"
 HIGH_PRIORITY_KEYWORDS = ["high", "important", "top", "priority"]
 
 # Schema Validation Constants (moved from schemas.py)
-VALID_DOMAINS = ["email", "calendar", "task", "tasks", "notion", "notes", "research", "drive", "general"]
+VALID_DOMAINS = ["email", "calendar", "task", "tasks", "asana", "notion", "notes", "research", "drive", "general"]
 VALID_ACTIONS = ["search", "list", "create", "update", "delete", "send", "schedule", "complete", "summarize", "manage"]
 
 # Formatting Limits
@@ -222,7 +223,7 @@ DOMAIN_EMOJIS = {
 DOMAIN_DISPLAY_NAMES = {
     'email': 'Gmail',
     'calendar': 'Google Calendar',
-    'tasks': 'Google Tasks',
+    'tasks': 'Tasks',
     'drive': 'Google Drive',
     'keep': 'Google Keep',
     'notes': 'Google Keep',
@@ -265,6 +266,8 @@ DOMAIN_ALIASES = {
     'gcal': 'calendar',
     'google_tasks': 'tasks', 
     'todo': 'tasks',
+    'asana': 'tasks',
+    'asana_tool': 'tasks',
     'keep': 'notes',
     'google_keep': 'notes',
     'google_drive': 'drive',

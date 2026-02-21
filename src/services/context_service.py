@@ -27,6 +27,54 @@ class ContextService:
             cls._instance = ContextService()
         return cls._instance
     
+    @staticmethod
+    def _needs_graph_context(query: str) -> bool:
+        """
+        Determine if a query would benefit from graph context.
+        
+        Simple action queries (list/check/send/create) skip graph entirely.
+        Relationship, insight, pattern, and cross-domain queries use graph.
+        """
+        if not query:
+            return False
+            
+        q = query.lower()
+        
+        # Signals that graph context IS needed
+        graph_signals = [
+            # Relationship queries
+            'who ', 'relationship', 'connected', 'related to', 'between',
+            'about ', 'regarding', 'involve', 'mention',
+            # Insight / pattern queries
+            'pattern', 'trend', 'insight', 'summary of', 'overview',
+            'how often', 'how many times', 'history with', 'frequently',
+            # Cross-domain queries
+            'and also', 'as well as', 'together with',
+            # Context-heavy questions
+            'tell me about', 'what do you know about', 'background on',
+            'context', 'summarize', 'brief me',
+        ]
+        
+        # If any graph signal is present, use graph
+        if any(signal in q for signal in graph_signals):
+            return True
+        
+        # Simple action verbs that never need graph
+        simple_actions = [
+            'list', 'check', 'show', 'read', 'open', 'pull up', 'get',
+            'send', 'reply', 'forward', 'draft', 'compose',
+            'create', 'add', 'schedule', 'set', 'update', 'delete', 'remove',
+            'mark', 'complete', 'done',
+            'what new', 'what are my', 'do i have', 'any new',
+            'what time', 'when is', "what's on", "what's next",
+        ]
+        
+        if any(action in q for action in simple_actions):
+            return False
+        
+        # Default: use graph for ambiguous queries (safer)
+        return True
+    
     async def get_unified_context(
         self,
         user_id: int,
@@ -78,7 +126,7 @@ class ContextService:
                     history_lines = []
                     for msg in recent[-limit_history:]:
                         role = msg.get('role', 'user')
-                        content = msg.get('content', '')[:500]
+                        content = msg.get('content', '')[:800]
                         history_lines.append(f"{role.upper()}: {content}")
                     if history_lines:
                         return "\n\nRecent conversation (for context/pronoun resolution):\n" + "\n".join(history_lines)
@@ -125,15 +173,52 @@ class ContextService:
                 logger.debug(f"Could not fetch semantic context: {e}")
             return ""
 
-        # 4. Fetch Graph Context (Knowledge Graph)
+        # 4. Fetch Graph Context (Knowledge Graph + Deep Traversal)
         async def fetch_graph_context():
-            if not query: return "" # Need query for graph search
+            if not query: return ""
             logger.info(f"[ContextService] Fetching graph context for query: {query[:50]}...")
+            
+            # Primary: Use GraphContextAssembler for deep multi-hop traversal
+            try:
+                from src.services.graph_context_assembler import GraphContextAssembler
+                
+                # Reuse cached graph manager (avoid new connection per call)
+                if not hasattr(cls, '_graph_manager') or cls._graph_manager is None:
+                    from src.services.indexing.graph.manager import KnowledgeGraphManager
+                    cls._graph_manager = KnowledgeGraphManager()
+                
+                assembler = GraphContextAssembler(graph_manager=cls._graph_manager)
+                # Timeout-cap graph context at 3s — planning shouldn't wait longer
+                graph_ctx = await asyncio.wait_for(
+                    assembler.assemble_context(
+                        query=query,
+                        user_id=user_id,
+                        max_depth=2,         # Reduced from 3 for speed
+                        max_results_per_type=3,  # Reduced from 5
+                    ),
+                    timeout=3.0
+                )
+                
+                if not graph_ctx.is_empty():
+                    formatted = graph_ctx.format_for_prompt(max_length=2000)
+                    if formatted:
+                        logger.info(
+                            f"[ContextService] Graph context assembled: "
+                            f"{graph_ctx.entity_count} entities, "
+                            f"{len(graph_ctx.related_emails)} emails, "
+                            f"{len(graph_ctx.related_meetings)} meetings"
+                        )
+                        return f"\n\n[GRAPH INTELLIGENCE]\n{formatted}"
+            except ImportError:
+                pass
+            except Exception as e:
+                logger.debug(f"GraphContextAssembler failed, falling back: {e}")
+            
+            # Fallback: Basic graph search via GraphSearchService
             try:
                 from src.services.graph_search_service import GraphSearchService
                 graph_service = GraphSearchService.get_instance()
                 if graph_service:
-                    # Pass user_id explicitly to prevent data leaks
                     related = await graph_service.search(query, user_id=user_id, max_results=5)
                     if related:
                         graph_parts = []
@@ -151,12 +236,20 @@ class ContextService:
             return ""
 
         # Execute parallel tasks
+        # Smart gating: only fetch graph context when the query actually needs it.
+        # Simple action queries (list emails, check calendar, send, create) skip graph entirely.
+        needs_graph = self._needs_graph_context(query)
+        
         retrieval_tasks = {
             "conversation_context": fetch_history(),
             "entity_context": fetch_entities(),
             "semantic_context": fetch_prefs(),
-            "graph_context": fetch_graph_context()
         }
+        
+        if needs_graph:
+            retrieval_tasks["graph_context"] = fetch_graph_context()
+        else:
+            logger.info(f"[ContextService] Skipping graph context — simple action query")
         
         task_names = list(retrieval_tasks.keys())
         task_coros = list(retrieval_tasks.values())

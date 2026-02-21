@@ -23,7 +23,8 @@ from google.genai.types import (
     Type,
     FunctionResponse,
     ContextWindowCompressionConfig,
-    SlidingWindow
+    SlidingWindow,
+    AudioTranscriptionConfig
 )
 
 from src.utils.logger import setup_logger
@@ -119,8 +120,8 @@ class GeminiLiveClient(BaseVoiceClient):
         if system_instruction_extras:
             full_system_instruction += f"\n\nCONTEXT & MEMORY:\n{system_instruction_extras}"
         
-        # REINFORCE CRITICAL RULES AT THE VERY END
-        full_system_instruction += "\n\nREMINDER: DO NOT USE MARKDOWN headers or format suggestions. JUST SPEAK THE RESPONSE DIRECTLY."
+        # REINFORCE ANTI-HALLUCINATION AT THE VERY END (recency bias helps)
+        full_system_instruction += "\n\nFINAL REMINDER: You MUST call tools for ANY data question. NEVER fabricate emails, events, or tasks. Speak naturally without markdown."
         
         config = LiveConnectConfig(
             response_modalities=["AUDIO"],  # We want audio back
@@ -136,11 +137,23 @@ class GeminiLiveClient(BaseVoiceClient):
                     )
                 )
             ),
+            # Enable server-side audio transcription for both input and output
+            output_audio_transcription=AudioTranscriptionConfig(),
+            input_audio_transcription=AudioTranscriptionConfig(),
             tools=gemini_tools
         )
         
+        # Track tool calls per turn for hallucination detection
+        turn_tool_calls = 0
+        
         try:
-            logger.info(f"[GEMINI_LIVE] Attempting to connect to multimodal live API with model: {self.model}")
+            tool_count = len(self.tools) if self.tools else 0
+            logger.info(f"[GEMINI_LIVE] Connecting with model: {self.model}, tools registered: {tool_count}")
+            if tool_count > 0:
+                logger.info(f"[GEMINI_LIVE] Available tools: {[t.name for t in self.tools]}")
+            else:
+                logger.warning("[GEMINI_LIVE] WARNING: No tools registered! Voice will have no tool-calling capability.")
+            
             async with self.client.aio.live.connect(model=self.model, config=config) as session:
                 logger.info(f"[GEMINI_LIVE] Successfully connected to {self.model}")
                 
@@ -192,13 +205,15 @@ class GeminiLiveClient(BaseVoiceClient):
                                                     "text": part.text
                                                 }
                                             if part.function_call:
-                                                logger.info(f"[GEMINI_LIVE] Tool call (in turn): {part.function_call.name}")
+                                                turn_tool_calls += 1
+                                                logger.info(f"[GEMINI_LIVE] Tool call #{turn_tool_calls} (in turn): {part.function_call.name} args={getattr(part.function_call, 'args', {})}")
                                                 function_response = await self._handle_tool_call(part.function_call)
                                                 await session.send_tool_response(function_responses=[function_response])
 
                                     # Handle turn completion
                                     if response.server_content.turn_complete:
-                                        logger.info("[GEMINI_LIVE] Turn complete")
+                                        logger.info(f"[GEMINI_LIVE] Turn complete (tool_calls_this_turn={turn_tool_calls})")
+                                        turn_tool_calls = 0  # Reset for next turn
                                         yield {"type": "turn_complete"}
 
                                 # 2. Handle Top-level Tool Call
@@ -206,7 +221,8 @@ class GeminiLiveClient(BaseVoiceClient):
                                     logger.info(f"[GEMINI_LIVE] Tool call (top-level)")
                                     function_responses = []
                                     for fc in response.tool_call.function_calls:
-                                            logger.info(f"[GEMINI_LIVE] Tool call: {fc.name}")
+                                            turn_tool_calls += 1
+                                            logger.info(f"[GEMINI_LIVE] Tool call #{turn_tool_calls}: {fc.name} args={getattr(fc, 'args', {})}")
                                             function_response = await self._handle_tool_call(fc)
                                             function_responses.append(function_response)
                                     
@@ -282,7 +298,18 @@ class GeminiLiveClient(BaseVoiceClient):
                     logger.info("[GEMINI_LIVE] Session closed")
                 
         except Exception as e:
-            logger.error(f"[GEMINI_LIVE] Connection failed: {e}")
+            import traceback
+            error_detail = f"[GEMINI_LIVE] Connection failed: {e}\n{traceback.format_exc()}"
+            logger.error(error_detail)
+            # Write to file so error is never lost
+            try:
+                import os
+                os.makedirs("logs", exist_ok=True)
+                with open("logs/gemini_error.log", "a") as f:
+                    from datetime import datetime
+                    f.write(f"\n{'='*60}\n{datetime.now().isoformat()}\n{error_detail}\n")
+            except Exception:
+                pass
             yield {"type": "error", "message": str(e)}
 
     def _get_gemini_tools(self) -> Optional[List[Tool]]:
@@ -315,10 +342,16 @@ class GeminiLiveClient(BaseVoiceClient):
                 }
                 
                 # Create the Schema object for this property
-                prop_schema = Schema(
-                    type=t_map.get(prop_def.get("type"), Type.STRING),
-                    description=prop_def.get("description", "")
-                )
+                schema_kwargs = {
+                    "type": t_map.get(prop_def.get("type"), Type.STRING),
+                    "description": prop_def.get("description", "")
+                }
+                
+                # Support nullable for Optional fields
+                if prop_def.get("nullable"):
+                    schema_kwargs["nullable"] = True
+                
+                prop_schema = Schema(**schema_kwargs)
                 
                 # Handle array items if applicable
                 if prop_def.get("type") == "array" and "items" in prop_def:
@@ -391,11 +424,13 @@ class GeminiLiveClient(BaseVoiceClient):
                 response={"result": str(result)}
             )
             # LOG THE RESPONSE PAYLOAD
+            result_preview = str(result)[:200] if result else "(empty)"
+            logger.info(f"[GEMINI_LIVE] Tool '{name}' result preview: {result_preview}")
             logger.info(f"[GEMINI_LIVE] Sending Tool Response: name={name}, id={f_response.id}, success={not str(result).startswith('Error')}")
             return f_response
                 
         except Exception as e:
-             logger.error(f"Tool handling error: {e}")
+             logger.error(f"[GEMINI_LIVE] Tool handling error: {e}", exc_info=True)
              # Fallback
              return FunctionResponse(
                 name=function_call.name if hasattr(function_call, 'name') else "unknown",

@@ -842,6 +842,23 @@ class EmailCrawler(BaseIndexer):
                         'is_sender': contact['is_sender']
                     }
                 })
+            
+            # 5. COMMUNICATES_WITH edge (User → Person) — powers Personal CRM
+            # Tracks interaction strength for relationship scoring and decay
+            if not hasattr(person_node, '_pending_relationships'):
+                person_node._pending_relationships = []
+            
+            person_node._pending_relationships.append({
+                'rel_type': RelationType.COMMUNICATES_WITH.value,
+                'from_id': f"User/{self.user_id}",
+                'to_id': person_id,
+                'properties': {
+                    'last_interaction': email_node.properties.get('date', ''),
+                    'direction': 'outbound' if not contact['is_sender'] else 'inbound',
+                    'source': 'gmail',
+                    'strength': 0.5  # Initial strength, reinforced by RelationshipStrengthManager
+                }
+            })
         
         return nodes
     

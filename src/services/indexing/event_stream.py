@@ -17,9 +17,13 @@ from src.utils.config import Config
 from src.services.indexing.parsers.base import ParsedNode
 from src.services.indexing.graph import KnowledgeGraphManager
 from src.services.indexing.hybrid_index import HybridIndexCoordinator
+from src.services.indexing.enrichment_pipeline import EnrichmentPipeline
 from src.ai.rag import RAGEngine
 
 logger = setup_logger(__name__)
+
+# Maximum dedup cache entries to prevent unbounded memory growth
+_MAX_DEDUP_CACHE_SIZE = 10_000
 
 
 class EventType(str, Enum):
@@ -68,9 +72,6 @@ class EventStreamHandler:
         self.config = config
         self.rag_engine = rag_engine
         self.graph_manager = graph_manager
-        self.topic_extractor = topic_extractor
-        self.temporal_indexer = temporal_indexer
-        self.relationship_manager = relationship_manager
         self.insight_service = insight_service
         
         # Initialize hybrid coordinator
@@ -81,6 +82,16 @@ class EventStreamHandler:
             )
         else:
             self.hybrid_index = None
+
+        # Shared enrichment pipeline (replaces inline enrichment methods)
+        self._enrichment = EnrichmentPipeline(
+            indexer_name="realtime",
+            user_id=0,  # set per-event in handle_event
+            topic_extractor=topic_extractor,
+            temporal_indexer=temporal_indexer,
+            relationship_manager=relationship_manager,
+            graph_manager=graph_manager,
+        )
             
         # Track recently processed events to avoid duplicates
         self._processed_events: Dict[str, datetime] = {}
@@ -158,16 +169,11 @@ class EventStreamHandler:
                     result["indexed"] = True
                     self._events_processed += 1
                     
-                    # 1. Extract topics from content
-                    await self._extract_topics(nodes, user_id)
+                    # Run shared enrichment pipeline (topics, temporal, relationships)
+                    self._enrichment._user_id = user_id
+                    await self._enrichment.enrich_nodes(nodes)
                     
-                    # 2. Link to TimeBlocks for temporal queries
-                    await self._link_temporal(nodes, user_id)
-                    
-                    # 3. Reinforce relationship strengths
-                    await self._reinforce_relationships(nodes)
-                    
-                    # 4. Generate immediate insights
+                    # Generate immediate insights
                     insights = await self._generate_immediate_insights(nodes, user_id)
                     result["insights"] = insights
                     
@@ -491,78 +497,6 @@ class EventStreamHandler:
             return []
         
         
-    async def _extract_topics(self, nodes: List[ParsedNode], user_id: int):
-        """Extract topics from processed nodes"""
-        if not self.topic_extractor:
-            return
-            
-        for node in nodes:
-            if node.searchable_text and len(node.searchable_text) > 50:
-                try:
-                    await self.topic_extractor.extract_topics(
-                        content=node.searchable_text,
-                        source="realtime",
-                        source_node_id=node.node_id,
-                        user_id=user_id
-                    )
-                except Exception as e:
-                    logger.debug(f"[EventStream] Topic extraction failed: {e}")
-
-    async def _link_temporal(self, nodes: List[ParsedNode], user_id: int):
-        """Link nodes to TimeBlocks for temporal queries."""
-        if not self.temporal_indexer:
-            return
-            
-        for node in nodes:
-            try:
-                # Get timestamp from node properties
-                timestamp_str = (
-                    node.properties.get('timestamp') or 
-                    node.properties.get('created_at') or
-                    node.properties.get('date')
-                )
-                
-                if not timestamp_str:
-                    continue
-                
-                # Parse timestamp
-                if isinstance(timestamp_str, str):
-                    try:
-                        timestamp = datetime.fromisoformat(timestamp_str.replace('Z', '+00:00'))
-                    except ValueError:
-                        continue
-                else:
-                    timestamp = timestamp_str
-                
-                # Link to TimeBlock
-                await self.temporal_indexer.link_event_to_timeblock(
-                    event_id=node.node_id,
-                    timestamp=timestamp,
-                    granularity="day",
-                    user_id=user_id
-                )
-                
-            except Exception as e:
-                logger.debug(f"[EventStream] Temporal linking failed: {e}")
-
-    async def _reinforce_relationships(self, nodes: List[ParsedNode]):
-        """Reinforce relationship strengths for indexed nodes."""
-        if not self.relationship_manager:
-            return
-            
-        for node in nodes:
-            try:
-                relationships = getattr(node, 'relationships', [])
-                for rel in relationships:
-                    await self.relationship_manager.reinforce_relationship(
-                        from_id=rel.from_node,
-                        to_id=rel.to_node,
-                        rel_type=rel.rel_type,
-                        interaction_weight=1.5  # Boost for real-time events
-                    )
-            except Exception as e:
-                logger.debug(f"[EventStream] Relationship reinforcement failed: {e}")
-
     async def _generate_immediate_insights(
         self,
         nodes: List[ParsedNode],
@@ -1018,7 +952,7 @@ class EventStreamHandler:
             logger.warning(f"[EventStream] Failed to queue outbound webhook: {e}")
 
     def _cleanup_old_events(self):
-        """Remove old events from dedup cache"""
+        """Remove old events from dedup cache. Also caps size to prevent memory leaks."""
         now = datetime.utcnow()
         expired = [
             eid for eid, ts in self._processed_events.items()
@@ -1026,6 +960,13 @@ class EventStreamHandler:
         ]
         for eid in expired:
             del self._processed_events[eid]
+
+        # Hard cap: if still too large, evict oldest entries
+        if len(self._processed_events) > _MAX_DEDUP_CACHE_SIZE:
+            sorted_events = sorted(self._processed_events.items(), key=lambda x: x[1])
+            to_remove = len(self._processed_events) - _MAX_DEDUP_CACHE_SIZE
+            for eid, _ in sorted_events[:to_remove]:
+                del self._processed_events[eid]
             
     def get_stats(self) -> Dict[str, int]:
         """Get processing statistics"""

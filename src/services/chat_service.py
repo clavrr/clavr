@@ -18,9 +18,47 @@ from src.utils import extract_first_name
 logger = setup_logger(__name__)
 
 class ChatService:
+    # Regex pattern to match Fernet-encrypted tokens (base64 starting with gAAAAAB)
+    _FERNET_PATTERN = None
+
     def __init__(self, db: AsyncSession, config: Config):
         self.db = db
         self.config = config
+        if ChatService._FERNET_PATTERN is None:
+            import re
+            # Match Fernet tokens: gAAAAAB followed by base64 characters (40+ chars)
+            ChatService._FERNET_PATTERN = re.compile(r'gAAAAAB[A-Za-z0-9_\-+=/.]{40,}')
+
+    def _strip_encrypted_tokens(self, text: str) -> str:
+        """Strip Fernet-encrypted tokens from AI response text.
+        
+        Encrypted Gmail access/refresh tokens can leak into the AI's output
+        as 'Suggestion: gAAAAAB...' strings. This method removes them.
+        """
+        if not text or 'gAAAAAB' not in text:
+            return text
+        
+        import re
+        # Remove the Fernet token itself
+        cleaned = self._FERNET_PATTERN.sub('[REDACTED]', text)
+        
+        # Remove entire 'Suggestion:' lines that contained encrypted tokens
+        lines = cleaned.split('\n')
+        filtered_lines = []
+        for line in lines:
+            stripped = line.strip()
+            # Skip lines that are just a Suggestion with redacted content
+            if stripped.startswith('💡') and '[REDACTED]' in stripped:
+                continue
+            if stripped.startswith('Suggestion:') and '[REDACTED]' in stripped:
+                continue
+            if stripped == '💡 Suggestion:' or stripped == 'Suggestion:':
+                continue
+            if stripped == '[REDACTED]':
+                continue
+            filtered_lines.append(line)
+        
+        return '\n'.join(filtered_lines)
 
     async def process_chat_query(self, user: Any, query_text: str, max_results: int, request: Any) -> Dict[str, Any]:
         """
@@ -48,10 +86,11 @@ class ChatService:
     async def execute_unified_query(self, user: Any, query_text: str, request: Any, stream: bool = False) -> Any:
         """Execute query using SupervisorAgent."""
         from api.dependencies import AppState
+        import uuid
         
         user_id = user.id
         user_first_name = extract_first_name(user.name, user.email)
-        session_id = getattr(request.state, 'session_id', None) or f"session_{user_id}"
+        session_id = f"conv-{uuid.uuid4().hex[:12]}"
         
         # === INCREMENTAL LEARNING HOOK ===
         # Extract and learn facts from user message (fire-and-forget)
@@ -88,7 +127,8 @@ class ChatService:
         )
         
         if stream:
-            return self._stream_response(agent, query_text, user_id, user_first_name, session_id)
+            # Use the real streaming implementation with event queues
+            return self.execute_unified_query_stream(user, query_text, request, conversation_id=session_id)
         
         response = await agent.route_and_execute(
             query=query_text, 
@@ -97,13 +137,14 @@ class ChatService:
             session_id=session_id
         )
 
-        # PERSISTENCE: Save Assistant Response
+        # PERSISTENCE: Save Assistant Response (strip encrypted tokens before saving)
         try:
+            clean_response = self._strip_encrypted_tokens(str(response))
             await memory.add_message(
                 user_id=user_id,
                 session_id=session_id,
                 role="assistant",
-                content=response
+                content=clean_response
             )
         except Exception as e:
             logger.error(f"Failed to save assistant response: {e}")
@@ -132,28 +173,13 @@ class ChatService:
             # Non-critical - don't break chat if learning fails
             logger.debug(f"[ChatService] Message learning failed: {e}")
 
-    async def _stream_response(self, agent: SupervisorAgent, query: str, user_id: int, user_name: str, session_id: str):
-        """Generator to stream agent response."""
-        response = await agent.route_and_execute(
-            query=query, 
-            user_id=user_id, 
-            user_name=user_name, 
-            session_id=session_id
-        )
-        
-        # For now, we simulate streaming by yielding the full response in chunks
-        # Ideally, SupervisorAgent should support streaming natively.
-        chunk_size = 50
-        for i in range(0, len(response), chunk_size):
-            yield response[i:i + chunk_size]
-            await asyncio.sleep(0.01) # Small delay for realism
-
-    async def execute_unified_query_stream(self, user: Any, query_text: str, request: Any):
+    async def execute_unified_query_stream(self, user: Any, query_text: str, request: Any, conversation_id: str = None):
         """Execute query and stream the response in chunks with real-time events."""
         from api.dependencies import AppState
         from src.events import WorkflowEventEmitter
         import json
         import asyncio
+        import uuid
         
         # FAST PATH: Check if query requires an unconnected integration
         fast_response = await self._check_and_respond_if_not_connected(query_text, request)
@@ -164,7 +190,10 @@ class ChatService:
         
         user_id = user.id
         user_first_name = extract_first_name(user.name, user.email)
-        session_id = getattr(request.state, 'session_id', None) or f"session_{user_id}"
+        # Use conversation_id from frontend if provided, otherwise generate a unique one.
+        # IMPORTANT: Do NOT use request.state.session_id (the auth token) as the conversation
+        # session_id — that causes all chats to share the same session and overlap.
+        session_id = conversation_id or f"conv-{uuid.uuid4().hex[:12]}"
         
         rag_engine = AppState.get_rag_engine()
         memory = ConversationMemory(self.db, rag_engine=rag_engine)
@@ -253,6 +282,9 @@ class ChatService:
                         content_emitted = True
                         chunk_content = str(event_data.get("message", ""))
                         
+                        # Strip encrypted tokens (Fernet gAAAAAB...) from output
+                        chunk_content = self._strip_encrypted_tokens(chunk_content)
+                        
                         # Sub-chunking for ultra-smooth typewriter effect 
                         # especially if LLM sends large fragments
                         if len(chunk_content) > 15:
@@ -299,7 +331,7 @@ class ChatService:
         # NOTE: Real-time streaming is now handled via CONTENT_CHUNK events above.
         # Fallback: if no chunks were emitted, simulate streaming for better UX
         if not content_emitted and response_holder["response"]:
-            full_text = str(response_holder["response"])
+            full_text = self._strip_encrypted_tokens(str(response_holder["response"]))
             chunk_size = 20 # Small chunks for smooth animation
             
             for i in range(0, len(full_text), chunk_size):
@@ -315,15 +347,16 @@ class ChatService:
         # Send final done signal
         yield json.dumps({"type": "done", "content": "", "done": True})
 
-        # PERSISTENCE: Save Assistant Response (Full)
+        # PERSISTENCE: Save Assistant Response (Full, strip encrypted tokens before saving)
         try:
             full_response = response_holder["response"]
             if full_response:
+                clean_response = self._strip_encrypted_tokens(str(full_response))
                 await memory.add_message(
                     user_id=user_id,
                     session_id=session_id,
                     role="assistant",
-                    content=str(full_response)
+                    content=clean_response
                 )
         except Exception as e:
             logger.error(f"Failed to save assistant response (stream): {e}")
@@ -507,10 +540,10 @@ class ChatService:
             is_connected_db = False
             try:
                 if uid:
-                    # Check if active tasks integration exists
+                    # Check if active tasks integration exists (Google Tasks OR Asana)
                     stmt = select(UserIntegration).where(
                         UserIntegration.user_id == uid,
-                        UserIntegration.provider == 'google_tasks',
+                        UserIntegration.provider.in_(['google_tasks', 'asana']),
                         UserIntegration.is_active == True
                     )
                     result = await self.db.execute(stmt)

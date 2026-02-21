@@ -202,6 +202,8 @@ class ThreadAnalyzerAgent:
             await self._alert_user(analysis, user_id, payload)
         elif action_type in ["decision", "action_items"]:
             await self._alert_user(analysis, user_id, payload)
+            # Persist decisions to the knowledge graph for future reference
+            await self._persist_decision(analysis, user_id, payload)
     
     async def _draft_linear_issue(self, analysis: Dict[str, Any], user_id: int, payload: Dict[str, Any]):
         """Draft a Linear issue, persist it, and notify user."""
@@ -264,6 +266,113 @@ class ThreadAnalyzerAgent:
         )
         
         await self.notification_service.send_notification(req)
+
+    async def _persist_decision(
+        self, analysis: Dict[str, Any], user_id: int, payload: Dict[str, Any]
+    ):
+        """
+        Persist detected decisions into the knowledge graph as Decision nodes.
+
+        This creates a searchable, queryable decision history — enabling
+        questions like "What did we decide about X?" to be answered from
+        the graph rather than by re-reading Slack history.
+        """
+        if not self.graph:
+            logger.debug("[Ghost] No graph manager — skipping decision persistence")
+            return
+
+        action_type = analysis.get("action_type", "")
+        if action_type not in ("decision", "action_items"):
+            return
+
+        try:
+            channel = payload.get("channel", "Unknown")
+            thread_ts = payload.get("thread_ts", "")
+            messages = payload.get("messages", [])
+
+            # Extract participants from the thread
+            participants = list({
+                m.get("user", "unknown")
+                for m in messages
+                if m.get("user")
+            })
+
+            # Build the Decision node
+            decision_data = {
+                "type": "Decision",
+                "title": analysis.get("summary", "Untitled Decision")[:200],
+                "description": analysis.get("draft_description", analysis.get("summary", "")),
+                "action_type": action_type,
+                "channel": channel,
+                "thread_ts": thread_ts,
+                "participants": participants,
+                "confidence": analysis.get("confidence", 0.0),
+                "status": "detected",  # detected → confirmed → implemented
+                "user_id": str(user_id),
+                "created_at": datetime.utcnow().isoformat(),
+                "source": "slack_thread",
+            }
+
+            # Upsert the Decision node in ArangoDB
+            query = """
+            UPSERT { thread_ts: @thread_ts, channel: @channel, user_id: @user_id }
+            INSERT @decision
+            UPDATE {
+                title: @decision.title,
+                description: @decision.description,
+                confidence: @decision.confidence,
+                participants: @decision.participants,
+                updated_at: DATE_ISO8601(DATE_NOW())
+            }
+            IN Decision
+            OPTIONS { waitForSync: true }
+            RETURN NEW
+            """
+
+            result = await self.graph.execute_query(query, {
+                "thread_ts": thread_ts,
+                "channel": channel,
+                "user_id": str(user_id),
+                "decision": decision_data,
+            })
+
+            if result:
+                decision_id = result[0].get("_key", "unknown") if result else "unknown"
+                logger.info(
+                    f"[Ghost] Decision persisted to graph: {decision_id} "
+                    f"({action_type} in #{channel})"
+                )
+
+                # Link decision to participants
+                for participant in participants:
+                    link_query = """
+                    LET person = FIRST(
+                        FOR p IN Person
+                            FILTER p.slack_id == @participant
+                            LIMIT 1
+                            RETURN p
+                    )
+                    FILTER person != null
+                    UPSERT { _from: @decision_id, _to: person._id }
+                    INSERT { 
+                        _from: @decision_id, 
+                        _to: person._id, 
+                        rel_type: "PARTICIPATED_IN",
+                        created_at: DATE_ISO8601(DATE_NOW())
+                    }
+                    UPDATE {}
+                    IN edges
+                    """
+                    try:
+                        await self.graph.execute_query(link_query, {
+                            "participant": participant,
+                            "decision_id": f"Decision/{decision_id}",
+                        })
+                    except Exception:
+                        pass  # Non-critical linking
+
+        except Exception as e:
+            logger.error(f"[Ghost] Decision graph persistence failed: {e}")
 
     async def _send_fallback_email(self, title, description, analysis, user_id, channel):
         """Original email logic moved to fallback."""

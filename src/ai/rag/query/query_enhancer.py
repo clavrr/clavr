@@ -6,7 +6,10 @@ Includes query expansion, reformulation, and intent understanding.
 """
 import re
 from typing import List, Dict, Any, Optional
-import spacy
+try:
+    import spacy
+except ImportError:
+    spacy = None
 import dateparser
 from ....utils.logger import setup_logger
 from ..utils.utils import extract_keywords
@@ -82,6 +85,9 @@ class QueryEnhancer:
     def _load_spacy_if_needed(self):
         """Lazy load spaCy model."""
         if self.nlp is None:
+            if spacy is None:
+                logger.warning("spaCy not installed. NER features disabled. Install with: pip install spacy")
+                return
             try:
                 self.nlp = spacy.load("en_core_web_sm")
             except OSError:
@@ -155,6 +161,9 @@ class QueryEnhancer:
         expanded = self._expand_query(original)
         reformulated = self._reformulate_query(original, intent, entities)
         
+        # Build suggested metadata filters from intent + query content (V2 improvement)
+        suggested_filters = self._build_suggested_filters(original, intent)
+        
         result = {
             'original': original,
             'expanded': expanded,
@@ -162,13 +171,65 @@ class QueryEnhancer:
             'intent': intent,
             'entities': entities,
             'temporal': temporal,
-            'keywords': extract_keywords(expanded)
+            'keywords': extract_keywords(expanded),
+            'suggested_filters': suggested_filters,
         }
         
         if isinstance(temporal, dict):
              result['temporal_metadata'] = temporal
         
         return result
+    
+    def _build_suggested_filters(self, query: str, intent: str) -> Dict[str, Any]:
+        """
+        Build metadata filters from the query intent and source mentions.
+        
+        These filters are passed to Qdrant to narrow the search space
+        BEFORE semantic scoring, dramatically improving precision.
+        """
+        filters = {}
+        query_lower = query.lower()
+        
+        # Source-based filters: detect explicit integration mentions
+        SOURCE_KEYWORDS = {
+            'slack': 'slack',
+            'asana': 'asana',
+            'linear': 'linear',
+            'calendar': 'calendar',
+            'meeting': 'calendar',
+            'drive': 'drive',
+            'google doc': 'drive',
+            'notion': 'notion',
+            'keep': 'keep',
+            'note': 'keep',
+        }
+        for keyword, source in SOURCE_KEYWORDS.items():
+            if keyword in query_lower:
+                filters['source'] = source
+                break
+        
+        # Doc-type filters: map intent to document type
+        INTENT_TO_DOC_TYPE = {
+            'sender': 'email',
+            'financial': 'email',  # Receipts/invoices are typically emails
+        }
+        if intent in INTENT_TO_DOC_TYPE and 'source' not in filters:
+            filters['doc_type'] = INTENT_TO_DOC_TYPE[intent]
+        
+        # Explicit doc-type mentions override intent mapping
+        DOC_TYPE_KEYWORDS = {
+            'email': 'email',
+            'task': 'task',
+            'issue': 'linear_issue',
+            'event': 'calendar_event',
+            'document': 'document',
+        }
+        for keyword, doc_type in DOC_TYPE_KEYWORDS.items():
+            if keyword in query_lower:
+                filters['doc_type'] = doc_type
+                break
+        
+        return filters
     
     @staticmethod
     def detect_intent(query: str) -> str:

@@ -99,6 +99,8 @@ async def diagnose(user_id: int = 7):
             print(f"   ✓ Gmail integration found for user {user_id}")
             
             # Get credentials
+            from src.utils.config import load_config
+            config = load_config()
             cred_provider = CredentialProvider(config, integration.user_id)
             creds = cred_provider.get_gmail_credentials()
             

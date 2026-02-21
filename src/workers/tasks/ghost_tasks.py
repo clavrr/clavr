@@ -297,3 +297,361 @@ def _build_cycle_report(result) -> str:
     
     return "\n".join(lines)
 
+
+@celery_app.task(base=IdempotentTask, bind=True)
+def sweep_follow_ups(self) -> Dict[str, Any]:
+    """
+    Periodic task to advance overdue follow-ups.
+
+    For each user, loads overdue threads and calls `tracker.advance()`
+    so they progress through the escalation chain (e.g. WAITING → NUDGE → ESCALATED).
+    """
+    logger.info("Starting Follow-Up sweep cycle")
+
+    results = {
+        "processed": 0,
+        "advanced": 0,
+        "errors": 0,
+        "timestamp": datetime.utcnow().isoformat(),
+    }
+
+    try:
+        config = load_config()
+        from api.dependencies import AppState
+
+        tracker = AppState.get_follow_up_tracker()
+
+        with get_db_context() as db:
+            users = db.query(User).all()
+
+            for user in users:
+                try:
+                    overdue = tracker.get_overdue(user.id)
+                    for thread in overdue:
+                        key = f"{user.id}:{thread.thread_id}"
+                        tracker.advance(key)
+                        results["advanced"] += 1
+                    results["processed"] += 1
+                except Exception as e:
+                    logger.error(f"Follow-up sweep failed for user {user.id}: {e}")
+                    results["errors"] += 1
+
+        logger.info(f"Follow-Up sweep complete: {results}")
+        return results
+
+    except Exception as e:
+        logger.error(f"Global follow-up sweep failed: {e}")
+        raise
+
+
+@celery_app.task(base=IdempotentTask, bind=True)
+def run_meeting_closer(self) -> Dict[str, Any]:
+    """
+    Periodic task to process recently-ended meetings.
+
+    Looks at calendar events that ended in the last 30 minutes,
+    runs MeetingCloser.handle_event for each applicable event.
+    """
+    logger.info("Starting Meeting Closer cycle")
+
+    results = {
+        "processed": 0,
+        "action_items_created": 0,
+        "skipped": 0,
+        "errors": 0,
+        "timestamp": datetime.utcnow().isoformat(),
+    }
+
+    try:
+        config = load_config()
+        from src.features.ghost.meeting_closer import MeetingCloser
+        from src.core.credential_provider import CredentialFactory
+        from src.integrations.google_calendar.service import CalendarService
+        import asyncio
+
+        factory = CredentialFactory(config)
+
+        with get_db_context() as db:
+            users = db.query(User).all()
+
+            for user in users:
+                try:
+                    creds = factory.get_credentials(user.id, provider="google_calendar")
+                    if not creds:
+                        results["skipped"] += 1
+                        continue
+
+                    cal_svc = CalendarService(config, credentials=creds)
+
+                    # Get events that ended in the last 35 minutes
+                    from datetime import timedelta
+                    now = datetime.utcnow()
+                    window_start = now - timedelta(minutes=35)
+
+                    events = cal_svc.list_events(
+                        start_date=window_start.isoformat() + "Z",
+                        end_date=now.isoformat() + "Z",
+                        max_results=10,
+                    )
+
+                    if not events:
+                        results["skipped"] += 1
+                        continue
+
+                    closer = MeetingCloser(db, config)
+
+                    for event in events:
+                        try:
+                            result = asyncio.run(
+                                closer.handle_event("calendar.event.ended", event, user.id)
+                            )
+                            if result and result.get("action_items"):
+                                results["action_items_created"] += len(result["action_items"])
+                            results["processed"] += 1
+                        except Exception as e:
+                            logger.warning(f"Meeting closer failed for event: {e}")
+                            results["errors"] += 1
+
+                except Exception as e:
+                    logger.error(f"Meeting closer failed for user {user.id}: {e}")
+                    results["errors"] += 1
+
+        logger.info(f"Meeting Closer cycle complete: {results}")
+        return results
+
+    except Exception as e:
+        logger.error(f"Global Meeting Closer failed: {e}")
+        raise
+
+
+@celery_app.task(base=IdempotentTask, bind=True)
+def check_pr_bottlenecks(self) -> Dict[str, Any]:
+    """
+    Periodic task to detect PR review bottlenecks.
+
+    For each user with GitHub configured, scans open PRs
+    and sends a notification if bottlenecks are found.
+    """
+    logger.info("Starting PR Bottleneck check cycle")
+
+    results = {
+        "processed": 0,
+        "bottlenecks_found": 0,
+        "notifications_sent": 0,
+        "errors": 0,
+        "timestamp": datetime.utcnow().isoformat(),
+    }
+
+    try:
+        config = load_config()
+        from src.features.ghost.pr_bottleneck_detector import PRBottleneckDetector
+        from src.integrations.github import GitHubService
+        from src.services.notifications import (
+            NotificationService,
+            NotificationRequest,
+            NotificationType,
+            NotificationPriority,
+        )
+        import asyncio
+        import os
+
+        # Skip if no GitHub token configured
+        if not os.getenv("GITHUB_TOKEN"):
+            logger.info("[PRBottleneck] No GITHUB_TOKEN set, skipping")
+            return results
+
+        with get_db_context() as db:
+            users = db.query(User).all()
+
+            for user in users:
+                try:
+                    github = GitHubService(config)
+                    if not github.is_available:
+                        continue
+
+                    detector = PRBottleneckDetector(config, github)
+
+                    # Use default repo from env or user config
+                    owner = os.getenv("GITHUB_OWNER", "")
+                    repo = os.getenv("GITHUB_REPO", "")
+                    if not owner or not repo:
+                        continue
+
+                    report = asyncio.run(
+                        detector.detect_bottlenecks(user.id, owner, repo)
+                    )
+                    results["processed"] += 1
+                    results["bottlenecks_found"] += len(report.bottlenecks)
+
+                    message = detector.format_notification(report)
+                    if message:
+                        notification_service = NotificationService(db)
+                        request = NotificationRequest(
+                            user_id=user.id,
+                            title="🔍 PR Bottleneck Alert",
+                            message=message,
+                            notification_type=NotificationType.SYSTEM,
+                            priority=NotificationPriority.NORMAL,
+                            icon="git-pull-request",
+                            expires_in_hours=24,
+                        )
+                        asyncio.run(notification_service.send_notification(request))
+                        results["notifications_sent"] += 1
+
+                    asyncio.run(github.close())
+
+                except Exception as e:
+                    logger.error(f"PR bottleneck check failed for user {user.id}: {e}")
+                    results["errors"] += 1
+
+        logger.info(f"PR Bottleneck check complete: {results}")
+        return results
+
+    except Exception as e:
+        logger.error(f"Global PR Bottleneck check failed: {e}")
+        raise
+
+
+@celery_app.task(base=IdempotentTask, bind=True)
+def run_sprint_retro(self) -> Dict[str, Any]:
+    """
+    Weekly task to generate sprint retrospective summaries.
+
+    Runs Friday afternoon after the Cycle Planner.
+    Uses Linear cycle data, GitHub PR stats, and velocity trends.
+    """
+    logger.info("Starting Sprint Retro generation")
+
+    results = {
+        "processed": 0,
+        "retros_sent": 0,
+        "errors": 0,
+        "timestamp": datetime.utcnow().isoformat(),
+    }
+
+    try:
+        config = load_config()
+        from src.features.ghost.sprint_retro_summarizer import SprintRetroSummarizer
+        from src.integrations.linear.service import LinearService
+        from src.integrations.github import GitHubService
+        from src.services.sprint_velocity import SprintVelocityService
+        from src.services.notifications import (
+            NotificationService,
+            NotificationRequest,
+            NotificationType,
+            NotificationPriority,
+        )
+        import asyncio
+
+        with get_db_context() as db:
+            users = db.query(User).all()
+
+            for user in users:
+                try:
+                    linear = LinearService(config, user_id=user.id)
+                    github = GitHubService(config)
+                    velocity = SprintVelocityService(config)
+
+                    summarizer = SprintRetroSummarizer(
+                        config, linear, github, velocity,
+                    )
+
+                    report = asyncio.run(
+                        summarizer.generate_retro(user.id)
+                    )
+
+                    if report:
+                        message = summarizer.format_notification(report)
+                        notification_service = NotificationService(db)
+                        request = NotificationRequest(
+                            user_id=user.id,
+                            title=f"📊 Sprint Retro: {report.cycle_name}",
+                            message=message,
+                            notification_type=NotificationType.SYSTEM,
+                            priority=NotificationPriority.NORMAL,
+                            icon="bar-chart-2",
+                            expires_in_hours=168,  # 1 week
+                        )
+                        asyncio.run(notification_service.send_notification(request))
+                        results["retros_sent"] += 1
+
+                    results["processed"] += 1
+
+                    asyncio.run(linear.close())
+                    asyncio.run(github.close())
+
+                except Exception as e:
+                    logger.error(f"Sprint retro failed for user {user.id}: {e}")
+                    results["errors"] += 1
+
+        logger.info(f"Sprint Retro generation complete: {results}")
+        return results
+
+    except Exception as e:
+        logger.error(f"Global Sprint Retro generation failed: {e}")
+        raise
+
+
+@celery_app.task(base=IdempotentTask, bind=True)
+def send_morning_digest(self) -> Dict[str, Any]:
+    """
+    Daily task to send a comprehensive morning digest.
+
+    Aggregates calendar, follow-ups, PR bottlenecks, customer health,
+    sprint velocity, and urgent insights into a single notification.
+    """
+    logger.info("Starting Morning Digest cycle")
+
+    results = {
+        "sent": 0,
+        "skipped": 0,
+        "errors": 0,
+        "timestamp": datetime.utcnow().isoformat(),
+    }
+
+    try:
+        config = load_config()
+        from src.features.ghost.morning_digest import MorningDigestAgent
+        from src.services.notifications import (
+            NotificationService,
+            NotificationRequest,
+            NotificationType,
+            NotificationPriority,
+        )
+        import asyncio
+
+        with get_db_context() as db:
+            users = db.query(User).all()
+
+            for user in users:
+                try:
+                    agent = MorningDigestAgent(config)
+                    digest = asyncio.run(agent.send_digest(user.id, db))
+
+                    if digest.has_content:
+                        message = agent.format_notification(digest)
+                        notification_service = NotificationService(db)
+                        request = NotificationRequest(
+                            user_id=user.id,
+                            title="☀️ Morning Digest",
+                            message=message,
+                            notification_type=NotificationType.SYSTEM,
+                            priority=NotificationPriority.NORMAL,
+                            icon="sunrise",
+                            expires_in_hours=16,  # expires by end of day
+                        )
+                        asyncio.run(notification_service.send_notification(request))
+                        results["sent"] += 1
+                    else:
+                        results["skipped"] += 1
+
+                except Exception as e:
+                    logger.error(f"Morning digest failed for user {user.id}: {e}")
+                    results["errors"] += 1
+
+        logger.info(f"Morning Digest cycle complete: {results}")
+        return results
+
+    except Exception as e:
+        logger.error(f"Global Morning Digest failed: {e}")
+        raise

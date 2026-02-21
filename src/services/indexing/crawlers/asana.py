@@ -57,7 +57,6 @@ class AsanaCrawler(BaseIndexer):
         self._project_cache = {}
         
         # Asana-specific settings from ServiceConstants
-        from src.services.service_constants import ServiceConstants
         self.sync_interval = ServiceConstants.ASANA_SYNC_INTERVAL
     
     @property
@@ -164,6 +163,9 @@ class AsanaCrawler(BaseIndexer):
             
             searchable_text = ' '.join(searchable_parts)
             
+            # Extract custom fields for schema mapping
+            schema_props = self._extract_custom_fields(item.get('custom_fields', []))
+            
             # Create ActionItem node
             node_id = f"asana_task_{task_id}"
             
@@ -182,6 +184,7 @@ class AsanaCrawler(BaseIndexer):
                     'created_at': created_at,
                     'completed': item.get('completed', False),
                     'priority': self._extract_priority(item),
+                    'schema_properties': schema_props,
                 },
                 searchable_text=searchable_text[:10000],
                 relationships=[]
@@ -216,6 +219,52 @@ class AsanaCrawler(BaseIndexer):
         except Exception as e:
             logger.warning(f"[AsanaCrawler] Task transform failed: {e}")
             return None
+
+    def _extract_custom_fields(self, custom_fields: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """
+        Extract Asana custom fields into a flat schema dictionary.
+        """
+        schema_props = {}
+        
+        for field in custom_fields:
+            try:
+                name = field.get('name')
+                if not name:
+                    continue
+                    
+                field_type = field.get('type')
+                value = None
+                
+                if field_type == 'text':
+                    value = field.get('text_value')
+                elif field_type == 'number':
+                    value = field.get('number_value')
+                elif field_type == 'enum':
+                    enum_value = field.get('enum_value')
+                    if enum_value:
+                        value = enum_value.get('name')
+                elif field_type == 'multi_enum':
+                    multi_enum_values = field.get('multi_enum_values', [])
+                    value = [v.get('name') for v in multi_enum_values]
+                elif field_type == 'date':
+                    date_value = field.get('date_value')
+                    if date_value:
+                        value = date_value.get('date') or date_value.get('date_time')
+                elif field_type == 'people':
+                    people_value = field.get('people_value', [])
+                    value = [p.get('name') for p in people_value]
+                else:
+                    # Fallback to display value
+                    value = field.get('display_value')
+
+                if value is not None and value != "" and value != []:
+                    schema_props[name] = value
+                    
+            except Exception as e:
+                logger.debug(f"Failed to extract custom field {field.get('name')}: {e}")
+                continue
+                
+        return schema_props
     
     async def _transform_project(self, item: Dict[str, Any]) -> Optional[List[ParsedNode]]:
         """Transform an Asana project into a graph node."""
@@ -270,6 +319,40 @@ class AsanaCrawler(BaseIndexer):
         else:
             person_node_id = generate_person_id(source='asana', source_id=user_id)
         
+        # Build COMMUNICATES_WITH + KNOWS relationships
+        extra_rels = []
+        
+        # COMMUNICATES_WITH — Asana task = work collaboration signal
+        extra_rels.append(Relationship(
+            from_node=f"User/{self.user_id}",
+            to_node=person_node_id,
+            rel_type=RelationType.COMMUNICATES_WITH,
+            properties={
+                'source': 'asana',
+                'last_interaction': datetime.utcnow().isoformat(),
+                'strength': 0.25,  # Task collaboration = moderate signal
+            }
+        ))
+        
+        # KNOWS — ensure User knows this Asana contact
+        aliases = []
+        if name and name.strip() and name != 'Unknown':
+            aliases.append(name)
+            first_name = name.split()[0] if name.split() else None
+            if first_name and first_name != name:
+                aliases.append(first_name)
+        
+        extra_rels.append(Relationship(
+            from_node=f"User/{self.user_id}",
+            to_node=person_node_id,
+            rel_type=RelationType.KNOWS,
+            properties={
+                'aliases': aliases,
+                'frequency': 1,
+                'source': 'asana',
+            }
+        ))
+        
         person_node = ParsedNode(
             node_id=person_node_id,
             node_type=NodeType.PERSON,
@@ -279,7 +362,8 @@ class AsanaCrawler(BaseIndexer):
                 'asana_user_id': user_id,
                 'source': 'asana',
             },
-            searchable_text=f"{name} {email or ''}"
+            searchable_text=f"{name} {email or ''}",
+            relationships=extra_rels,
         )
         
         relationship = Relationship(

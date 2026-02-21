@@ -34,6 +34,8 @@ class InjectionReason(str, Enum):
     OPPORTUNITY = "opportunity"  # Opportunity based on context
     PROTECTION_ADVISORY = "protection_advisory"  # Advice based on Deep Work status
     CROSS_STACK_INSIGHT = "cross_stack_insight"  # Insight synthesized from multiple sources
+    WORKLOAD_ADVISORY = "workload_advisory"  # User has heavy calendar or overdue items
+    RELATIONSHIP_NUDGE = "relationship_nudge"  # Fading contact or open loop with someone mentioned
 
 
 @dataclass
@@ -147,7 +149,8 @@ class ProactiveInjector:
             self._find_conflict_memories(context),
             self._find_opportunity_memories(context),
             self._find_linear_proactive_memories(context),
-            self._find_protection_memories(context)
+            self._find_protection_memories(context),
+            self._find_workload_memories(context)
         ]
         
         try:
@@ -449,6 +452,66 @@ class ProactiveInjector:
         
         # If the user is in Deep Work, inject a reminder for the agent to be brief
         # and not ask for elaborate clarifications unless necessary.
+        return memories
+
+    async def _find_workload_memories(
+        self, 
+        context: InjectionContext
+    ) -> List[ProactiveMemory]:
+        """Find workload advisories — nudge when user is overloaded."""
+        memories = []
+        
+        if not self.graph_manager:
+            return memories
+        
+        try:
+            # Check how many meetings the user has today
+            if hasattr(self.graph_manager, "query"):
+                now = datetime.utcnow()
+                today_start = now.replace(hour=0, minute=0, second=0)
+                today_end = now.replace(hour=23, minute=59, second=59)
+                
+                query = """
+                FOR e IN CalendarEvent
+                    FILTER e.user_id == @user_id
+                      AND e.start_time >= @today_start
+                      AND e.start_time <= @today_end
+                    COLLECT WITH COUNT INTO total
+                    RETURN total
+                """
+                
+                results = await self.graph_manager.query(
+                    query,
+                    {
+                        "user_id": context.user_id,
+                        "today_start": today_start.isoformat(),
+                        "today_end": today_end.isoformat()
+                    }
+                )
+                
+                meeting_count = results[0] if results else 0
+                
+                if meeting_count >= 6:
+                    memories.append(ProactiveMemory(
+                        content=f"User has {meeting_count} meetings today",
+                        reason=InjectionReason.WORKLOAD_ADVISORY,
+                        relevance_score=0.8,
+                        source="graph",
+                        explanation=f"Heavy day — {meeting_count} meetings. Keep responses tight and offer to defer non-critical items.",
+                        urgency="high"
+                    ))
+                elif meeting_count >= 4:
+                    memories.append(ProactiveMemory(
+                        content=f"User has {meeting_count} meetings today",
+                        reason=InjectionReason.WORKLOAD_ADVISORY,
+                        relevance_score=0.6,
+                        source="graph",
+                        explanation=f"Busy day with {meeting_count} meetings. Be mindful of the user's time.",
+                        urgency="normal"
+                    ))
+        except Exception as e:
+            logger.debug(f"[ProactiveInjector] Workload check failed: {e}")
+        
         return memories
     
     def _filter_candidates(

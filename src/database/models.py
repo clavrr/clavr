@@ -479,7 +479,7 @@ class MeetingTemplate(Base):
     id = Column(Integer, primary_key=True, index=True)
     user_id = Column(Integer, ForeignKey('users.id'), nullable=False, index=True)
     name = Column(String(255), nullable=False)
-    title = Column(EncryptedString(500))
+    title = Column(EncryptedString)
     duration_minutes = Column(Integer, default=60)
     description = Column(EncryptedString)
     location = Column(String(500))
@@ -531,7 +531,7 @@ class TaskTemplate(Base):
     id = Column(Integer, primary_key=True, index=True)
     user_id = Column(Integer, ForeignKey('users.id'), nullable=False, index=True)
     name = Column(String(255), nullable=False)
-    description = Column(EncryptedString(500))  # Template display name
+    description = Column(EncryptedString)  # Template display name
     task_description = Column(EncryptedString, nullable=False)  # Task description (supports {variables})
     priority = Column(String(20), default='medium')  # 'low', 'medium', 'high'
     category = Column(String(100))  # e.g., 'work', 'personal', 'project'
@@ -585,7 +585,7 @@ class EmailTemplate(Base):
     id = Column(Integer, primary_key=True, index=True)
     user_id = Column(Integer, ForeignKey('users.id'), nullable=False, index=True)
     name = Column(String(255), nullable=False)
-    subject = Column(EncryptedString(500))  # Email subject (supports {variables})
+    subject = Column(EncryptedString)  # Email subject (supports {variables})
     body = Column(EncryptedString, nullable=False)  # Email body (supports {variables})
     to_recipients = Column(JSON)  # Default recipients (list of email addresses)
     cc_recipients = Column(JSON)  # Default CC recipients
@@ -860,6 +860,11 @@ class GhostDraft(Base):
     
     # Resulting entity (if posted)
     resolved_entity_id = Column(String(255), nullable=True)
+
+    # Reasoning Feedback Loop — user confirms/denies ghost agent patterns
+    feedback_rating = Column(Integer, nullable=True)  # 1-5 rating
+    feedback_useful = Column(Boolean, nullable=True)  # was this suggestion useful?
+    feedback_note = Column(Text, nullable=True)  # free-text feedback
     
     created_at = Column(DateTime, default=datetime.utcnow, index=True)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
@@ -913,3 +918,180 @@ class MessageClassification(Base):
     
     def __repr__(self):
         return f"<MessageClassification(id={self.id}, source={self.source_type}, needs_response={self.needs_response}, urgency='{self.urgency}')>"
+
+
+class ConversationSummary(Base):
+    """
+    Warm-tier conversation retention.
+    
+    When conversations age past the hot tier (30 days), raw messages are
+    deleted but an LLM-generated summary is retained here for up to 180 days.
+    This preserves searchability and key facts without the storage cost of
+    full message history.
+    
+    Tier architecture:
+    - Hot (0-30 days): Full ConversationMessage rows in PostgreSQL
+    - Warm (30-180 days): This table (1 row per session with summary + key facts)
+    - Cold (180+ days): Only Qdrant vectors survive for semantic recall
+    """
+    __tablename__ = 'conversation_summaries'
+    
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey('users.id'), nullable=False, index=True)
+    session_id = Column(String(255), nullable=False, index=True)
+    
+    # LLM-generated summary of the conversation
+    summary = Column(Text, nullable=False)
+    
+    # Key facts extracted from the conversation
+    key_facts = Column(JSON, default=[])  # e.g., ["User prefers morning meetings", "Project X deadline is March 1"]
+    
+    # Quick-access metadata
+    topic = Column(String(200))            # Primary topic discussed
+    message_count = Column(Integer, default=0)
+    primary_agent = Column(String(50))     # Most-used agent in the session
+    
+    # Time range of original messages
+    first_message_at = Column(DateTime)
+    last_message_at = Column(DateTime)
+    
+    # Timestamps for warm→cold transition
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    expires_at = Column(DateTime)  # When to delete (180 days after creation)
+    
+    # Relationship
+    user = relationship("User", backref="conversation_summaries")
+    
+    __table_args__ = (
+        Index('idx_conv_summary_user_session', 'user_id', 'session_id', unique=True),
+        Index('idx_conv_summary_expires', 'expires_at'),
+    )
+
+
+class CrawlerState(Base):
+    """
+    Persistent sync state for background crawlers.
+    
+    Stores sync cursors/tokens so crawlers can resume from where they left off
+    after a server restart, instead of re-processing all items.
+    
+    Used by: KeepCrawler, TasksCrawler, LinearIndexer, and any crawler
+    that needs durable delta tracking beyond in-memory caches.
+    """
+    __tablename__ = 'crawler_states'
+    
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey('users.id'), nullable=False, index=True)
+    
+    crawler_name = Column(String(50), nullable=False)  # e.g., "google_keep", "google_tasks", "linear"
+    
+    # Sync cursor (flexible — could be a token, timestamp, or item ID)
+    last_sync_token = Column(Text, nullable=True)       # API sync token (e.g., Google sync token)
+    last_sync_time = Column(DateTime, nullable=True)    # Last successful sync timestamp
+    last_item_id = Column(String(255), nullable=True)   # Last processed item ID
+    
+    # Cache data (JSON blob of item_id → update_timestamp mappings)
+    item_cache = Column(JSON, default={})  # Replaces in-memory _note_cache / _task_cache
+    
+    # Stats
+    items_processed = Column(Integer, default=0)
+    errors_count = Column(Integer, default=0)
+    
+    # Timestamps
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+    
+    # Relationship
+    user = relationship("User", backref="crawler_states")
+    
+    __table_args__ = (
+        Index('idx_crawler_state_user_name', 'user_id', 'crawler_name', unique=True),
+    )
+    
+    def __repr__(self):
+        return f"<CrawlerState(user_id={self.user_id}, crawler='{self.crawler_name}', items={self.items_processed})>"
+
+
+class WorkingMemorySnapshot(Base):
+    """
+    Persisted snapshot of session-scoped WorkingMemory.
+    
+    Stores the turn buffer, active entities, topics, pending facts,
+    and current goal so they survive server restarts.
+    
+    WorkingMemory.to_dict() / from_dict() already exist — this table
+    provides the durable backing store.
+    """
+    __tablename__ = 'working_memory_snapshots'
+    
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey('users.id'), nullable=False, index=True)
+    session_id = Column(String(255), nullable=False, index=True)
+    
+    # Serialized WorkingMemory state (from WorkingMemory.to_dict())
+    snapshot_data = Column(JSON, nullable=False)
+    
+    # Quick-access fields (for queries without deserializing full blob)
+    turn_count = Column(Integer, default=0)
+    active_entities = Column(JSON, default=[])   # e.g., ["Carol", "Budget Report"]
+    active_topics = Column(JSON, default=[])     # e.g., ["scheduling", "budget"]
+    current_goal = Column(String(500), nullable=True)
+    
+    # Timestamps
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+    
+    # Relationship
+    user = relationship("User", backref="working_memory_snapshots")
+    
+    __table_args__ = (
+        Index('idx_wm_snapshot_user_session', 'user_id', 'session_id', unique=True),
+        Index('idx_wm_snapshot_updated', 'updated_at'),
+    )
+    
+    def __repr__(self):
+        return f"<WorkingMemorySnapshot(user_id={self.user_id}, session='{self.session_id[:20]}...', turns={self.turn_count})>"
+
+
+class UserPreferenceModel(Base):
+    """
+    Persistent storage for learned user preferences.
+    
+    Replaces the in-memory UserPreference dataclass with a durable store.
+    Preferences are learned from successful query executions and interaction patterns.
+    
+    Examples:
+    - "prefers 30-minute meetings" (preference_type='scheduling')
+    - "always uses Google Tasks over Asana" (preference_type='tool_choice')
+    - "sends emails in formal tone" (preference_type='communication')
+    """
+    __tablename__ = 'user_learned_preferences'
+    
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey('users.id'), nullable=False, index=True)
+    
+    preference_type = Column(String(100), nullable=False, index=True)  # scheduling, communication, tool_choice, etc.
+    pattern = Column(String(500), nullable=False)                      # The observed pattern
+    frequency = Column(Integer, default=1)                             # How often this pattern was observed
+    confidence = Column(Float, default=0.5)                            # Confidence score (0-1)
+    
+    # Context
+    source_intent = Column(String(100), nullable=True)  # Intent that triggered this preference
+    tools_used = Column(JSON, default=[])               # Tools associated with this preference
+    
+    # Timestamps
+    last_used = Column(DateTime, default=datetime.utcnow, nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+    
+    # Relationship
+    user = relationship("User", backref="learned_preferences")
+    
+    __table_args__ = (
+        Index('idx_user_pref_type', 'user_id', 'preference_type'),
+        Index('idx_user_pref_confidence', 'user_id', 'confidence'),
+    )
+    
+    def __repr__(self):
+        return f"<UserPreferenceModel(user_id={self.user_id}, type='{self.preference_type}', pattern='{self.pattern[:40]}...', confidence={self.confidence})>"
+

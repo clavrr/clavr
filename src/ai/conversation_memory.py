@@ -166,6 +166,61 @@ class ConversationMemory:
                 logger.debug(f"{LOG_INFO} Database rollback before message add failed: {e}")
                 pass  # Ignore errors - rollback is best-effort cleanup
             
+            # --- DEDUPLICATION GUARD (in-memory, session-scoped) ---
+            # Prevents the same message from being saved multiple times within
+            # the SAME session (e.g. ChatService + MemoryOrchestrator both saving).
+            # Content is Fernet-encrypted (non-deterministic), so SQL equality
+            # won't work — we use an in-memory hash instead.
+            # NOTE: session_id IS included so cross-session saves are NOT blocked.
+            # Cross-session duplicates (frontend vs backend creating separate sessions)
+            # are handled at the list_conversations level instead.
+            import hashlib, re as _re
+            now = datetime.utcnow()
+            
+            # Normalize: strip trailing separators, whitespace, and "---" blocks
+            normalized = _re.sub(r'[\s\-]+$', '', content.strip())
+            content_hash = hashlib.sha256(
+                f"{user_id}:{session_id}:{role}:{normalized}".encode()
+            ).hexdigest()
+            
+            # Role+session proximity key
+            role_key = f"{user_id}:{session_id}:{role}"
+            
+            # Lazy-init class-level dedup caches
+            if not hasattr(ConversationMemory, '_dedup_cache'):
+                ConversationMemory._dedup_cache = {}       # content hash → timestamp
+                ConversationMemory._role_dedup_cache = {}   # role key → timestamp
+            
+            # Check content hash (same content in same session within 60s)
+            last_seen = ConversationMemory._dedup_cache.get(content_hash)
+            if last_seen and (now - last_seen).total_seconds() < 60:
+                logger.info(
+                    f"{LOG_INFO} Dedup: skipping duplicate {role} message (content hash match)"
+                )
+                return None
+            
+            # Check role+session proximity (same role in same session within 15s)
+            role_last_seen = ConversationMemory._role_dedup_cache.get(role_key)
+            if role_last_seen and (now - role_last_seen).total_seconds() < 15:
+                logger.info(
+                    f"{LOG_INFO} Dedup: skipping duplicate {role} message (same role in session within 15s)"
+                )
+                return None
+            
+            # Record in both caches
+            ConversationMemory._dedup_cache[content_hash] = now
+            ConversationMemory._role_dedup_cache[role_key] = now
+            
+            # Periodic cleanup
+            if len(ConversationMemory._dedup_cache) > 200:
+                cutoff = now - timedelta(seconds=120)
+                ConversationMemory._dedup_cache = {
+                    k: v for k, v in ConversationMemory._dedup_cache.items() if v > cutoff
+                }
+                ConversationMemory._role_dedup_cache = {
+                    k: v for k, v in ConversationMemory._role_dedup_cache.items() if v > cutoff
+                }
+            
             message = ConversationMessage(
                 user_id=user_id,
                 session_id=session_id,
@@ -291,10 +346,15 @@ class ConversationMemory:
         days: int = DEFAULT_CLEANUP_DAYS
     ) -> int:
         """
-        Clean up old messages (for privacy/storage management) - async.
+        Tiered conversation retention: summarize → then delete raw messages.
+        
+        Tier architecture:
+        - Hot (0-30 days): Full messages in ConversationMessage
+        - Warm (30-180 days): Summarized into ConversationSummary (1 row per session)
+        - Cold (180+ days): Only Qdrant vectors survive for semantic recall
         
         Args:
-            days: Delete messages older than N days (default: 30)
+            days: Summarize and delete messages older than N days (default: 30)
             
         Returns:
             Number of messages deleted (0 on error)
@@ -302,6 +362,99 @@ class ConversationMemory:
         try:
             cutoff = datetime.utcnow() - timedelta(days=days)
             
+            # 1. Find sessions with messages about to be deleted
+            from sqlalchemy import func, distinct
+            
+            session_query = (
+                select(
+                    ConversationMessage.session_id,
+                    ConversationMessage.user_id,
+                    func.count(ConversationMessage.id).label('msg_count'),
+                    func.min(ConversationMessage.timestamp).label('first_msg'),
+                    func.max(ConversationMessage.timestamp).label('last_msg'),
+                )
+                .where(ConversationMessage.timestamp < cutoff)
+                .group_by(ConversationMessage.session_id, ConversationMessage.user_id)
+            )
+            
+            result = await self.db.execute(session_query)
+            sessions_to_summarize = result.fetchall()
+            
+            # 2. For each session, create a warm-tier summary
+            from src.database.models import ConversationSummary
+            
+            for row in sessions_to_summarize:
+                session_id = row.session_id
+                user_id = row.user_id
+                
+                # Check if summary already exists
+                existing = await self.db.execute(
+                    select(ConversationSummary).where(
+                        ConversationSummary.user_id == user_id,
+                        ConversationSummary.session_id == session_id
+                    )
+                )
+                if existing.scalar_one_or_none():
+                    continue  # Already summarized
+                
+                # Fetch messages for this session to build summary
+                msgs_result = await self.db.execute(
+                    select(ConversationMessage)
+                    .where(
+                        ConversationMessage.session_id == session_id,
+                        ConversationMessage.user_id == user_id,
+                        ConversationMessage.timestamp < cutoff
+                    )
+                    .order_by(ConversationMessage.timestamp)
+                    .limit(50)
+                )
+                messages = msgs_result.scalars().all()
+                
+                if not messages:
+                    continue
+                
+                # Build text summary (lightweight — no LLM needed for the basic version)
+                conversation_lines = []
+                key_facts = []
+                agents_used = {}
+                
+                for msg in messages:
+                    role_label = "User" if msg.role == "user" else "Assistant"
+                    content_preview = (msg.content or "")[:150]
+                    conversation_lines.append(f"{role_label}: {content_preview}")
+                    
+                    # Track agents used
+                    if msg.active_agent:
+                        agents_used[msg.active_agent] = agents_used.get(msg.active_agent, 0) + 1
+                    
+                    # Extract intents as key facts
+                    if msg.intent and msg.intent not in key_facts:
+                        key_facts.append(f"Intent: {msg.intent}")
+                
+                # Determine primary agent
+                primary_agent = max(agents_used, key=agents_used.get) if agents_used else None
+                
+                # Build summary text
+                summary_text = f"Conversation with {len(messages)} messages. "
+                if key_facts:
+                    summary_text += f"Topics: {', '.join(key_facts[:5])}. "
+                summary_text += "Excerpt: " + " | ".join(conversation_lines[:5])
+                
+                # Create warm-tier summary
+                summary = ConversationSummary(
+                    user_id=user_id,
+                    session_id=session_id,
+                    summary=summary_text[:2000],
+                    key_facts=key_facts[:20],
+                    message_count=row.msg_count,
+                    primary_agent=primary_agent,
+                    first_message_at=row.first_msg,
+                    last_message_at=row.last_msg,
+                    expires_at=datetime.utcnow() + timedelta(days=180),
+                )
+                self.db.add(summary)
+            
+            # 3. Now delete the raw messages (they're preserved in summaries)
             stmt = delete(ConversationMessage).where(
                 ConversationMessage.timestamp < cutoff
             )
@@ -311,7 +464,10 @@ class ConversationMemory:
             
             deleted = result.rowcount
             
-            logger.info(f"{LOG_INFO} Deleted {deleted} old conversation messages (older than {days} days)")
+            logger.info(
+                f"{LOG_INFO} Tiered cleanup: summarized {len(sessions_to_summarize)} sessions, "
+                f"deleted {deleted} old messages (older than {days} days)"
+            )
             return deleted
             
         except Exception as e:
@@ -320,6 +476,32 @@ class ConversationMemory:
                 exc_info=True,
                 extra={'days': days}
             )
+            await self.db.rollback()
+            return 0
+    
+    async def clear_warm_tier(self, max_age_days: int = 180) -> int:
+        """
+        Cold-tier transition: delete warm summaries older than max_age_days.
+        After this, only Qdrant vectors survive for semantic recall.
+        """
+        try:
+            from src.database.models import ConversationSummary
+            
+            cutoff = datetime.utcnow() - timedelta(days=max_age_days)
+            
+            stmt = delete(ConversationSummary).where(
+                ConversationSummary.expires_at < cutoff
+            )
+            result = await self.db.execute(stmt)
+            await self.db.commit()
+            
+            deleted = result.rowcount
+            if deleted > 0:
+                logger.info(f"{LOG_INFO} Cold-tier cleanup: removed {deleted} expired conversation summaries")
+            return deleted
+            
+        except Exception as e:
+            logger.error(f"{LOG_ERROR} Warm-tier cleanup failed: {e}")
             await self.db.rollback()
             return 0
     
@@ -431,8 +613,27 @@ class ConversationMemory:
                     'message_count': session.message_count
                 })
             
-            logger.info(f"{LOG_OK} Listed {len(conversations)} conversations for user {user_id}")
-            return conversations
+            # --- CROSS-SESSION DEDUP ---
+            # The frontend and backend may create separate sessions for the same
+            # query. Deduplicate by preview text: if multiple conversations share
+            # the same first user message, keep only the one with the most messages
+            # (or most recent activity as tiebreaker).
+            seen_previews = {}  # preview → index in deduped list
+            deduped = []
+            for conv in conversations:
+                preview_text = conv.get('preview', '')
+                if preview_text and preview_text != DEFAULT_PREVIEW_TEXT:
+                    if preview_text in seen_previews:
+                        # Keep the one with more messages
+                        existing_idx = seen_previews[preview_text]
+                        if conv['message_count'] > deduped[existing_idx]['message_count']:
+                            deduped[existing_idx] = conv
+                        continue
+                    seen_previews[preview_text] = len(deduped)
+                deduped.append(conv)
+            
+            logger.info(f"{LOG_OK} Listed {len(deduped)} conversations for user {user_id} (deduped from {len(conversations)})")
+            return deduped
             
         except Exception as e:
             await self.db.rollback()
@@ -470,7 +671,8 @@ class ConversationMemory:
                 limit=limit or DEFAULT_CONVERSATION_MESSAGES_LIMIT
             )
             
-            formatted = [self._format_message(msg) for msg in messages]
+            # Reverse to chronological order (oldest first) since _query_messages returns newest first
+            formatted = [self._format_message(msg) for msg in reversed(messages)]
             
             session_display = self._format_session_id(session_id)
             logger.info(f"{LOG_OK} Retrieved {len(formatted)} messages for session {session_display}")
@@ -1109,9 +1311,25 @@ class ConversationMemory:
     
     def _format_message(self, msg: ConversationMessage) -> Dict[str, Any]:
         """Format a ConversationMessage object into a dictionary."""
+        content = msg.content
+        # Defense-in-depth: strip any encrypted tokens that may have been
+        # persisted before the saving-side fix was applied.
+        if content and 'gAAAAAB' in content:
+            import re
+            _fernet_re = re.compile(r'gAAAAAB[A-Za-z0-9_\-+=/.]{40,}')
+            content = _fernet_re.sub('', content)
+            # Remove leftover "Suggestion:" labels that held tokens
+            lines = content.split('\n')
+            lines = [
+                ln for ln in lines
+                if not ln.strip().startswith('💡 Suggestion:')
+                and not ln.strip().startswith('Suggestion:')
+                and ln.strip() not in ('💡 Suggestion:', 'Suggestion:', '💡', '---')
+            ]
+            content = '\n'.join(lines).strip()
         return {
             'role': msg.role,
-            'content': msg.content,
+            'content': content,
             'intent': msg.intent,
             'entities': msg.entities or {},
             'timestamp': msg.timestamp.isoformat() if msg.timestamp else None

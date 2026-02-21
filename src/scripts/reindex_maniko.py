@@ -16,6 +16,8 @@ from src.services.indexing.crawlers.email import EmailCrawler
 from src.core.credential_provider import CredentialProvider
 from src.core import GoogleGmailClient
 from sqlalchemy import select, update
+from src.services.indexing.topic_extractor import TopicExtractor
+from src.ai.llm_factory import LLMFactory
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
@@ -47,18 +49,45 @@ async def reindex_maniko():
     logger.info("Postgres state reset.")
 
     # 2. Clear existing ArangoDB data for this user
-    logger.info("Step 2: Clearing existing ArangoDB data for this user...")
+    logger.info("Step 2: Clearing existing ArangoDB graph data...")
     # Clean up both correct user_id (7) and legacy/incorrect user_id (3)
     user_ids_to_clean = [user_id, 3]
     
-    aql_delete_by_id = "FOR d IN Email FILTER d.user_id IN @user_ids REMOVE d IN Email"
-    # Try by email too
-    aql_delete_by_email = "FOR d IN Email FILTER d.sender_email == @email OR @email IN d.recipients REMOVE d IN Email"
+    # Collections to clear for full graph rebuild with new relationships
+    collections_to_clear = [
+        'Email',
+        'Person', 
+        'Identity',
+        'ActionItem',
+        'Topic',
+        'Receipt',
+        'Contact'
+    ]
     
     try:
-        graph_manager.db.aql.execute(aql_delete_by_id, bind_vars={'user_ids': user_ids_to_clean})
-        graph_manager.db.aql.execute(aql_delete_by_email, bind_vars={'email': email})
-        logger.info(f"ArangoDB data cleared for users {user_ids_to_clean}.")
+        # Clear nodes from each collection
+        for collection in collections_to_clear:
+            try:
+                # Try to clear by user_id first
+                aql_delete = f"FOR d IN {collection} FILTER d.user_id IN @user_ids REMOVE d IN {collection}"
+                graph_manager.db.aql.execute(aql_delete, bind_vars={'user_ids': user_ids_to_clean})
+                logger.info(f"Cleared {collection} nodes for users {user_ids_to_clean}")
+            except Exception as e:
+                # If collection doesn't exist or has different structure, skip
+                logger.debug(f"Could not clear {collection}: {e}")
+        
+        # Also clean up edges that reference these nodes
+        edge_collections = ['FROM', 'TO', 'CC', 'HAS_IDENTITY', 'KNOWS', 'CONTAINS', 'DISCUSSES']
+        for edge_coll in edge_collections:
+            try:
+                # Delete orphaned edges
+                aql_delete_edges = f"FOR e IN {edge_coll} REMOVE e IN {edge_coll}"
+                graph_manager.db.aql.execute(aql_delete_edges)
+                logger.info(f"Cleared {edge_coll} edge collection")
+            except Exception as e:
+                logger.debug(f"Could not clear {edge_coll} edges: {e}")
+        
+        logger.info(f"ArangoDB graph data cleared for users {user_ids_to_clean}.")
     except Exception as e:
         logger.error(f"ArangoDB clear failed: {e}")
 
@@ -192,12 +221,19 @@ async def reindex_maniko():
                     logger.error("No credentials attached to gmail_client!")
 
             logger.info("Starting crawler.run_sync_cycle()...")
+            # Initialize TopicExtractor
+            topic_extractor = TopicExtractor(
+                config=config,
+                graph_manager=graph_manager
+            )
+            
             crawler = EmailCrawler(
                 config=config,
                 user_id=user_id,
                 rag_engine=rag_engine,
                 graph_manager=graph_manager,
-                google_client=gmail_client
+                google_client=gmail_client,
+                topic_extractor=topic_extractor
             )
             
             logger.info("Starting crawler.run_sync_cycle()...")

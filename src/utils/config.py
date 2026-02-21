@@ -59,7 +59,7 @@ class ConfigDefaults:
     
     # RAG defaults
     RAG_EMBEDDING_PROVIDER_GEMINI = "gemini"
-    RAG_EMBEDDING_MODEL_DEFAULT = "models/embedding-001"
+    RAG_EMBEDDING_MODEL_DEFAULT = "models/text-embedding-004"
     RAG_EMBEDDING_DIMENSION_DEFAULT = 768
     RAG_VECTOR_STORE_BACKEND_AUTO = "auto"
     RAG_COLLECTION_NAME_DEFAULT = "email-knowledge"

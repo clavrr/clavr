@@ -126,70 +126,28 @@ class BaseAgent(ABC):
     async def retrieve_user_preferences(self, user_id: Optional[int] = None) -> str:
         """
         Retrieve user preferences to personalize agent interactions.
-        Uses Unified Memory System (MemoryOrchestrator) with legacy fallback.
+        Uses Unified Memory System (MemoryOrchestrator).
         """
-        if not user_id:
+        if not user_id or not self.memory_orchestrator:
             return ""
 
-        # 1. Try to get preferences via MemoryOrchestrator (Unified System)
-        if self.memory_orchestrator:
-            try:
-                context = await self.memory_orchestrator.get_context_for_agent(
-                    user_id=user_id,
-                    agent_name=self.name,
-                    query="What are the user's general and domain-specific preferences?",
-                    include_layers=["semantic"] # Preferences mostly live in semantic layer
-                )
-                if context.user_preferences:
-                    pref_str = "KNOWN PREFERENCES:\n"
-                    for pref in context.user_preferences:
-                        content = pref.get('content', '')
-                        if content:
-                            pref_str += f"- {content}\n"
-                    return pref_str
-            except Exception as e:
-                logger.debug(f"[{self.name}] MemoryOrchestrator preference retrieval failed: {e}")
-
-        # 2. Legacy Fallback: Direct memory access
-        if not self.domain_context:
-            return ""
-            
         try:
-            # Try to get explicit preferences from Memory Lane (Behavioral)
-            if self.memory_lane:
-                facts = self.memory_lane.get_facts_for_context(category="preference")
-                if facts:
-                    context_str = "KNOWN PREFERENCES:\n"
-                    for fact in facts:
-                        context_str += f"- {fact.content}\n"
-                    return context_str
-            
-            # 2. Fallback to Vector Search for historical preferences
-            if self.domain_context.vector_store:
-                # Search for general and domain-specific preference keywords
-                pref_query = f"user preferences for {self.name} {self.name} settings always never likes dislikes"
-                with LatencyMonitor(f"[{self.name}] Pref Query"):
-                    results = await self.domain_context.vector_store.asearch(
-                        query=pref_query, 
-                        filters={"user_id": user_id},
-                        k=3, 
-                        min_confidence=0.75
-                    )
-                
-                if not results:
-                    return ""
-                    
-                context_str = "HISTORICAL PREFERENCES:\n"
-                for res in results:
-                    content = res.get('content', '').strip()
+            context = await self.memory_orchestrator.get_context_for_agent(
+                user_id=user_id,
+                agent_name=self.name,
+                query="What are the user's general and domain-specific preferences?",
+                include_layers=["semantic"]
+            )
+            if context.user_preferences:
+                pref_str = "KNOWN PREFERENCES:\n"
+                for pref in context.user_preferences:
+                    content = pref.get('content', '')
                     if content:
-                        context_str += f"- {content}\n"
-                
-                return context_str
-                
+                        pref_str += f"- {content}\n"
+                return pref_str
         except Exception as e:
-            logger.warning(f"[{self.name}] Failed to retrieve user preferences: {e}")
-            
+            logger.debug(f"[{self.name}] Preference retrieval failed: {e}")
+
         return ""
 
     async def learn_fact(self, user_id: int, content: str, category: str = "general") -> bool:
@@ -296,10 +254,6 @@ class BaseAgent(ABC):
                         session_id=session_id
                     )
                 
-                # Proactive relationship reinforcement if applicable
-                # Proactive relationship reinforcement is now handled by 'remember' (graph nodes)
-                # Left empty intentionally as previous specific logic is deprecated.
-                     
             except Exception as e:
                 logger.warning(f"[{self.name}] Failed to record discrete interaction: {e}")
                 success_recorded = False
@@ -370,20 +324,11 @@ class BaseAgent(ABC):
             
         schema_str = json.dumps(schema, indent=2)
         
-        try:
-            # Format prompt with or without memory context
-            # We handle the KeyException strictly in case the prompt template wasn't updated yet
-            system_prompt = PARAMETER_EXTRACTION_SYSTEM_PROMPT.format(
-                current_time_str=current_time_str,
-                schema_str=schema_str,
-                memory_context=memory_context
-            )
-        except KeyError:
-            # Fallback for old prompt template without memory_context
-            system_prompt = PARAMETER_EXTRACTION_SYSTEM_PROMPT.format(
-                current_time_str=current_time_str,
-                schema_str=schema_str
-            )
+        system_prompt = PARAMETER_EXTRACTION_SYSTEM_PROMPT.format(
+            current_time_str=current_time_str,
+            schema_str=schema_str,
+            memory_context=memory_context
+        )
         
         # Select LLM - Default to Fast model for simple extraction unless overridden
         # We try to use a cheaper/faster model for simple tasks
@@ -500,14 +445,156 @@ class BaseAgent(ABC):
         """Filter out None values from a dictionary."""
         return {k: v for k, v in d.items() if v is not None}
 
+    # Maximum output length before truncation (improvement #10)
+    MAX_TOOL_OUTPUT_CHARS = 4000
+
+    def _normalize_tool_output(self, result: Any, tool_name: str = "") -> str:
+        """
+        Normalize and truncate tool output (improvement #10 + #12 graceful degradation).
+        
+        - Converts non-string results (dict, list) to JSON strings
+        - Truncates oversized results to MAX_TOOL_OUTPUT_CHARS
+        - Strips wrapper markdown if present
+        """
+        # Handle non-string results gracefully (#12)
+        if result is None:
+            return f"Tool {tool_name} returned no result."
+        if isinstance(result, (dict, list)):
+            try:
+                result = json.dumps(result, indent=2, default=str)
+            except Exception:
+                result = str(result)
+        elif not isinstance(result, str):
+            result = str(result)
+        
+        # Truncate oversized results (#10)
+        if len(result) > self.MAX_TOOL_OUTPUT_CHARS:
+            logger.info(
+                f"[{self.name}] Truncating {tool_name} output from {len(result)} to {self.MAX_TOOL_OUTPUT_CHARS} chars"
+            )
+            result = result[:self.MAX_TOOL_OUTPUT_CHARS] + f"\n\n[...truncated {len(result) - self.MAX_TOOL_OUTPUT_CHARS} chars]"
+        
+        return result
+
+    # Exceptions that are safe to retry (transient failures)
+    RETRYABLE_ERRORS = (
+        asyncio.TimeoutError,
+        ConnectionError,
+        ConnectionResetError,
+        OSError,  # Covers network-level errors
+    )
+    
+    # Cached preflight validator
+    _preflight_validator = None
+    
+    def _get_preflight_validator(self):
+        """Lazy-load preflight validator (improvement #4)."""
+        if self._preflight_validator is None:
+            try:
+                from src.tools.preflight_validator import ToolPreflightValidator
+                graph_manager = self.domain_context.graph_manager if self.domain_context else None
+                if graph_manager:
+                    self._preflight_validator = ToolPreflightValidator(graph_manager=graph_manager)
+            except Exception as e:
+                logger.debug(f"[{self.name}] Preflight validator init failed: {e}")
+        return self._preflight_validator
+
+    async def _run_preflight_validation(
+        self, tool_name: str, tool_input: Dict[str, Any], user_id: Optional[int]
+    ) -> Optional[str]:
+        """
+        Run preflight validation for write operations (improvement #4).
+        Returns clarification prompt if validation fails, None if OK.
+        Merges resolved args into tool_input in-place.
+        """
+        if not user_id:
+            return None
+        validator = self._get_preflight_validator()
+        if not validator:
+            return None
+        
+        action = tool_input.get("action", "").lower()
+        try:
+            result = None
+            # Calendar write operations
+            if "calendar" in tool_name.lower() and action in ("create", "schedule"):
+                attendees = tool_input.get("attendees", [])
+                if attendees:
+                    result = await asyncio.wait_for(
+                        validator.validate_calendar_args(
+                            user_id=user_id,
+                            attendees=attendees,
+                            start_time=tool_input.get("start_time"),
+                            end_time=tool_input.get("end_time"),
+                            check_conflicts=True
+                        ),
+                        timeout=3.0
+                    )
+            # Email write operations
+            elif "email" in tool_name.lower() or "gmail" in tool_name.lower():
+                if action in ("send", "reply"):
+                    to = tool_input.get("to", [])
+                    if to and isinstance(to, list):
+                        result = await asyncio.wait_for(
+                            validator.validate_email_args(
+                                user_id=user_id,
+                                to=to,
+                                cc=tool_input.get("cc"),
+                                bcc=tool_input.get("bcc")
+                            ),
+                            timeout=3.0
+                        )
+            
+            if result and not result.can_proceed:
+                return result.clarification_prompt or "I need more information to proceed."
+            if result and result.resolved_args:
+                tool_input.update(result.resolved_args)
+                
+        except asyncio.TimeoutError:
+            logger.info(f"[{self.name}] Preflight validation timed out (3s), proceeding without validation")
+        except Exception as e:
+            logger.debug(f"[{self.name}] Preflight validation failed: {e}")
+        
+        return None
+
+    def _get_working_memory_hints(self, user_id: Optional[int], session_id: Optional[str] = None) -> Dict[str, Any]:
+        """
+        Get active context hints from working memory (improvement #6).
+        Returns a dict of hints for tool disambiguation.
+        """
+        if not self.memory_orchestrator or not user_id:
+            return {}
+        try:
+            sid = session_id or self._current_session_id
+            if not sid:
+                return {}
+            wm = self.memory_orchestrator.get_working_memory(user_id, sid)
+            if not wm:
+                return {}
+            active_ctx = wm.get_active_context()
+            hints = {}
+            if active_ctx.get("active_entities"):
+                hints["active_entities"] = active_ctx["active_entities"][:5]
+            if active_ctx.get("active_topics"):
+                hints["last_topic"] = active_ctx["active_topics"][0]
+            if active_ctx.get("current_goal"):
+                hints["current_goal"] = active_ctx["current_goal"]
+            return hints
+        except Exception:
+            return {}
+
     async def _safe_tool_execute(
         self,
         alias_list: List[str],
         tool_input: Dict[str, Any],
-        action_description: str = "operation"
+        action_description: str = "operation",
+        max_retries: int = 2,
+        timeout_seconds: float = 30.0
     ) -> str:
         """
-        Safely execute a tool with standard error handling and event emission.
+        Safely execute a tool with preflight validation, retry logic, timeout, and event emission.
+        
+        Improvements: #1 (retry), #4 (preflight validation for writes), #6 (working memory hints).
         """
         tool, error = self._get_tool_or_fail(alias_list)
         if error:
@@ -519,58 +606,100 @@ class BaseAgent(ABC):
             x in action_name for x in ["create", "send", "update", "delete", "schedule", "archive", "trash"]
         )
         
-        try:
-            clean_input = self._filter_none_values(tool_input)
-            
-            # 1. Emit start events
-            if self.event_emitter:
-                # Always emit generic tool call start
-                await self.event_emitter.emit_tool_call_start(
-                    tool_name=tool.name,
-                    action=action_name,
-                    data={"input": clean_input}
-                )
-                
-                # For write actions, emit specific ACTION_EXECUTING event
-                if is_write_action:
-                    await self.event_emitter.emit_action_executing(
-                        action=action_description,
-                        data={"tool": tool.name, "params": clean_input}
+        clean_input = self._filter_none_values(tool_input)
+        
+        # Preflight validation for write operations
+        if is_write_action:
+            user_id = clean_input.get("user_id") or (
+                getattr(self, '_current_user_id', None)
+            )
+            clarification = await self._run_preflight_validation(tool.name, clean_input, user_id)
+            if clarification:
+                return clarification
+        
+        # Inject working memory hints (non-blocking)
+        wm_hints = self._get_working_memory_hints(
+            clean_input.get("user_id"), 
+            clean_input.get("session_id") or self._current_session_id
+        )
+        if wm_hints:
+            clean_input["_context_hints"] = wm_hints
+        last_error = None
+        
+        for attempt in range(max_retries + 1):
+            try:
+                # Emit start events (only on first attempt)
+                if attempt == 0 and self.event_emitter:
+                    await self.event_emitter.emit_tool_call_start(
+                        tool_name=tool.name,
+                        action=action_name,
+                        data={"input": clean_input}
                     )
-            
-            # 2. Execute
-            result = await tool.arun(clean_input)
-            
-            # 3. Emit completion events
-            if self.event_emitter:
-                # Generic tool completion
-                summary = result[:100] + "..." if len(result) > 100 else result
-                await self.event_emitter.emit_tool_complete(
-                    tool_name=tool.name,
-                    result_summary=summary
-                )
-                
-                # For write actions, emit ACTION_COMPLETE
-                if is_write_action:
-                    await self.event_emitter.emit_action_complete(
-                        action=action_description,
-                        result=summary
+                    if is_write_action:
+                        await self.event_emitter.emit_action_executing(
+                            action=action_description,
+                            data={"tool": tool.name, "params": clean_input}
+                        )
+                elif attempt > 0:
+                    logger.warning(
+                        f"[{self.name}] Retry {attempt}/{max_retries} for {tool.name}: {last_error}"
                     )
-            
-            return result
-            
-        except Exception as e:
-            error_msg = f"Error in {action_description}: {e}"
-            logger.error(f"[{self.name}] {error_msg}")
-            
-            if self.event_emitter:
-                await self.event_emitter.emit_error(
-                    error_type="tool",
-                    message=error_msg,
-                    data={"tool": tool.name if tool else "unknown", "error": str(e)}
+                
+                # Execute with timeout
+                result = await asyncio.wait_for(
+                    tool.arun(clean_input),
+                    timeout=timeout_seconds
                 )
                 
-            return error_msg
+                # Normalize tool output (graceful degradation for non-string outputs)
+                result = self._normalize_tool_output(result, tool.name)
+                
+                # Emit completion events
+                if self.event_emitter:
+                    summary = result[:100] + "..." if len(result) > 100 else result
+                    await self.event_emitter.emit_tool_complete(
+                        tool_name=tool.name,
+                        result_summary=summary
+                    )
+                    if is_write_action:
+                        await self.event_emitter.emit_action_complete(
+                            action=action_description,
+                            result=summary
+                        )
+                
+                return result
+                
+            except self.RETRYABLE_ERRORS as e:
+                last_error = e
+                if attempt < max_retries:
+                    backoff = 0.5 * (2 ** attempt)  # 0.5s, 1s
+                    await asyncio.sleep(backoff)
+                    continue
+                # Final attempt failed
+                error_msg = f"Error in {action_description} after {max_retries + 1} attempts: {e}"
+                logger.error(f"[{self.name}] {error_msg}")
+                if self.event_emitter:
+                    await self.event_emitter.emit_error(
+                        error_type="tool_retry_exhausted",
+                        message=error_msg,
+                        data={"tool": tool.name, "attempts": max_retries + 1, "error": str(e)}
+                    )
+                return error_msg
+                
+            except Exception as e:
+                # Non-retryable error — fail immediately
+                error_msg = f"Error in {action_description}: {e}"
+                logger.error(f"[{self.name}] {error_msg}")
+                if self.event_emitter:
+                    await self.event_emitter.emit_error(
+                        error_type="tool",
+                        message=error_msg,
+                        data={"tool": tool.name if tool else "unknown", "error": str(e)}
+                    )
+                return error_msg
+        
+        # Should never reach here, but safety net
+        return f"Error in {action_description}: unexpected retry loop exit"
 
     def set_session_id(self, session_id: str):
         """Set the current session ID for working memory integration."""
@@ -585,12 +714,9 @@ class BaseAgent(ABC):
         session_id: Optional[str] = None
     ) -> str:
         """
-        Retrieve relevant memory content from all memory layers.
+        Retrieve relevant memory content via the unified MemoryOrchestrator.
         
-        If a MemoryOrchestrator is available, uses the unified Perfect Memory system.
-        Otherwise falls back to legacy retrieval methods.
-        
-        This enhanced method provides:
+        Provides:
         - Working memory (recent turns, active entities/topics)
         - Semantic search via RAG (conversation history)
         - Multi-hop graph traversal (cross-app relationships)
@@ -606,86 +732,31 @@ class BaseAgent(ABC):
         Returns:
             Formatted string of relevant memories from all sources
         """
-        # Use provided session_id or fall back to current session
+        if not self.memory_orchestrator or not user_id:
+            return ""
+        
         effective_session_id = session_id or self._current_session_id
         
-        # NEW: Use MemoryOrchestrator if available (Perfect Memory path)
-        if self.memory_orchestrator and user_id:
-            try:
-                with LatencyMonitor(f"[{self.name}] Perfect Memory Retrieval"):
-                    context = await self.memory_orchestrator.get_context_for_agent(
-                        user_id=user_id,
-                        agent_name=self.name,
-                        query=query,
-                        session_id=effective_session_id,
-                        task_type=task_type
-                    )
-                formatted = context.to_prompt_string()
-                if formatted:
-                    logger.debug(
-                        f"[{self.name}] Retrieved {len(formatted)} chars from MemoryOrchestrator "
-                        f"(sources: {context.sources_queried})"
-                    )
-                    return "\n" + formatted
-            except Exception as e:
-                logger.warning(f"[{self.name}] MemoryOrchestrator retrieval failed, falling back: {e}")
-        
-        # LEGACY: Fall back to direct memory access
-        if not self.domain_context or not user_id:
-            return ""
-        
-        memory_parts = []
-            
         try:
-
-            # Parallelize independent fetch operations
-            async def _fetch_vector():
-                if self.domain_context.vector_store:
-                    with LatencyMonitor(f"[{self.name}] Vector Search"):
-                        results = await self.domain_context.vector_store.asearch(
-                            query=query,
-                            filters={"user_id": user_id},
-                            k=3,
-                            min_confidence=0.65
-                        )
-                        if results:
-                            semantic_text = "CONVERSATION CONTEXT:\n"
-                            for res in results:
-                                content = res.get('content', '').strip()
-                                if content:
-                                    semantic_text += f"- {content}\n"
-                            return semantic_text
-                return None
-
-            async def _fetch_graph():
-                return await self._retrieve_graph_context(query, user_id, task_type)
-                
-            async def _fetch_insights():
-                return await self._retrieve_relevant_insights(query, user_id)
-
-            # Execute all in parallel
-            results = await asyncio.gather(
-                _fetch_vector(),
-                _fetch_graph(),
-                _fetch_insights(),
-                return_exceptions=True
-            )
-            
-            # Process results (results is a list: [vector, graph, insights])
-            for res in results:
-                if isinstance(res, Exception):
-                    logger.debug(f"[{self.name}] One memory source failed: {res}")
-                    continue
-                if res:
-                    memory_parts.append(res)
-            
-            if memory_parts:
-                return "\n" + "\n".join(memory_parts)
-            return ""
-            
+            with LatencyMonitor(f"[{self.name}] Perfect Memory Retrieval"):
+                context = await self.memory_orchestrator.get_context_for_agent(
+                    user_id=user_id,
+                    agent_name=self.name,
+                    query=query,
+                    session_id=effective_session_id,
+                    task_type=task_type
+                )
+            formatted = context.to_prompt_string()
+            if formatted:
+                logger.debug(
+                    f"[{self.name}] Retrieved {len(formatted)} chars from MemoryOrchestrator "
+                    f"(sources: {context.sources_queried})"
+                )
+                return "\n" + formatted
         except Exception as e:
             logger.warning(f"[{self.name}] Memory retrieval failed: {e}")
-            return ""
+        
+        return ""
     
     async def _retrieve_graph_context(self, query: str, user_id: int, task_type: str = "general") -> str:
         """

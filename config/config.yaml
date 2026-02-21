@@ -57,7 +57,7 @@ database:
 rag:
   # Embedding configuration
   embedding_provider: "gemini"  # "gemini" or "sentence-transformers"
-  embedding_model: "models/embedding-001"  # Gemini embedding model
+  embedding_model: "${RAG_EMBEDDING_MODEL:-models/text-embedding-004}"  # Gemini embedding model
   embedding_dimension: 768  # 768 for Gemini/all-mpnet-base-v2
   
   # Vector store configuration
@@ -130,6 +130,7 @@ filters:
 # Speech-to-Text and Text-to-Speech settings for voice interactions
 voice:
   enabled: true  # Enable/disable voice features
+  model: "${VOICE_AI_MODEL:-gemini-2.5-flash-native-audio-preview-12-2025}"  # Google AI Live native audio model
   
   # Speech-to-Text (STT) Configuration
   stt:

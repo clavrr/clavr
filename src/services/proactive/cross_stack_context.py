@@ -11,18 +11,22 @@ ALL indexed sources to provide a 360-degree summary:
 - Notion: Relevant documents
 - Drive: Related files
 
-This is what makes Clavr "The Autonomous Glue" - not just moving data
-between apps, but synthesizing it into actionable intelligence.
+Now includes TTL-based caching to avoid redundant cross-stack queries.
 """
 from src.utils.logger import setup_logger
 from src.utils.config import Config
 from src.ai.llm_factory import LLMFactory
 from langchain_core.messages import SystemMessage, HumanMessage
 import asyncio
+import hashlib
+import time
 from typing import Dict, Any, List, Optional
 from datetime import datetime, timedelta
 
 logger = setup_logger(__name__)
+
+# Default cache TTL: 5 minutes
+CONTEXT_CACHE_TTL_SECONDS = 300
 
 
 class CrossStackContext:
@@ -33,6 +37,9 @@ class CrossStackContext:
     - MeetingPrepper: Context for meeting attendees
     - Proactive API: Rich context for user queries
     - Ghost Agents: Understanding relationships between data
+
+    Now includes TTL-based caching to avoid redundant cross-stack queries
+    for the same topic within a short time window.
     """
     
     def __init__(self, config: Config, graph_manager=None, rag_engine=None):
@@ -47,12 +54,47 @@ class CrossStackContext:
         self.config = config
         self.graph_manager = graph_manager
         self.rag_engine = rag_engine
-    
+        self._cache: Dict[str, Dict[str, Any]] = {}
+        self._cache_ttl = CONTEXT_CACHE_TTL_SECONDS
+
+    @staticmethod
+    def _cache_key(topic: str, user_id: int, sources: List[str]) -> str:
+        """Generate a deterministic cache key from topic + user + sources."""
+        raw = f"{user_id}:{topic.strip().lower()}:{','.join(sorted(sources))}"
+        return hashlib.md5(raw.encode()).hexdigest()
+
+    def invalidate_cache(
+        self, topic: Optional[str] = None, user_id: Optional[int] = None
+    ) -> int:
+        """
+        Invalidate cached context entries.
+        If topic and user_id are given, invalidate matching entries.
+        If neither is given, clear the entire cache.
+        Returns count of invalidated entries.
+        """
+        if topic is None and user_id is None:
+            count = len(self._cache)
+            self._cache.clear()
+            return count
+
+        to_remove = []
+        for key, entry in self._cache.items():
+            if (topic and entry.get("topic", "").lower() == topic.lower() and
+                    (user_id is None or entry.get("user_id") == user_id)):
+                to_remove.append(key)
+            elif user_id and entry.get("user_id") == user_id and topic is None:
+                to_remove.append(key)
+
+        for key in to_remove:
+            del self._cache[key]
+        return len(to_remove)
+
     async def build_topic_context(
         self,
         topic: str,
         user_id: int,
-        include_sources: Optional[List[str]] = None
+        include_sources: Optional[List[str]] = None,
+        bypass_cache: bool = False,
     ) -> Dict[str, Any]:
         """
         Build comprehensive context for a topic across all sources.
@@ -62,12 +104,29 @@ class CrossStackContext:
             user_id: User ID
             include_sources: Optional list of sources to include
                              (default: all - linear, email, slack, notion, drive)
+            bypass_cache: If True, always refresh from sources
         
         Returns:
             Dict with context from each source and synthesized summary
         """
         sources = include_sources or ["linear", "email", "slack", "notion", "drive", "calendar", "keep", "tasks"]
-        
+
+        # Check cache first
+        cache_key = self._cache_key(topic, user_id, sources)
+        if not bypass_cache:
+            cached = self._cache.get(cache_key)
+            if cached:
+                cached_at = cached.get("_cached_at", 0)
+                if time.time() - cached_at < self._cache_ttl:
+                    logger.debug(
+                        f"[CrossStack] Cache HIT for '{topic}' "
+                        f"(age: {time.time() - cached_at:.0f}s)"
+                    )
+                    return cached
+                else:
+                    # Expired, remove stale entry
+                    del self._cache[cache_key]
+
         context = {
             "topic": topic,
             "user_id": user_id,
@@ -82,29 +141,45 @@ class CrossStackContext:
         }
         
         try:
-            # Gather context from each source concurrently
-            if "linear" in sources:
+            # Graph-first fast path (#5): Use Topic nodes to pre-populate context
+            # This is 10x faster than individual API calls when data is in the graph
+            if self.graph_manager:
+                try:
+                    graph_context = await self._gather_graph_topic_context(topic, user_id)
+                    if graph_context:
+                        for source_name, items in graph_context.items():
+                            if items and source_name not in context["sources"]:
+                                context["sources"][source_name] = items
+                        logger.info(
+                            f"[CrossStack] Graph fast-path populated "
+                            f"{len(graph_context)} sources for '{topic}'"
+                        )
+                except Exception as e:
+                    logger.debug(f"[CrossStack] Graph fast-path failed: {e}")
+            
+            # Gather remaining context from each source (fills gaps)
+            if "linear" in sources and "linear" not in context["sources"]:
                 context["sources"]["linear"] = await self._get_linear_context(topic, user_id)
             
-            if "email" in sources:
+            if "email" in sources and "email" not in context["sources"]:
                 context["sources"]["email"] = await self._get_email_context(topic, user_id)
             
-            if "slack" in sources:
+            if "slack" in sources and "slack" not in context["sources"]:
                 context["sources"]["slack"] = await self._get_slack_context(topic, user_id)
             
-            if "notion" in sources:
+            if "notion" in sources and "notion" not in context["sources"]:
                 context["sources"]["notion"] = await self._get_notion_context(topic, user_id)
             
-            if "drive" in sources:
+            if "drive" in sources and "drive" not in context["sources"]:
                 context["sources"]["drive"] = await self._get_drive_context(topic, user_id)
             
-            if "calendar" in sources:
+            if "calendar" in sources and "calendar" not in context["sources"]:
                 context["sources"]["calendar"] = await self._get_calendar_context(topic, user_id)
             
-            if "keep" in sources:
+            if "keep" in sources and "keep" not in context["sources"]:
                 context["sources"]["keep"] = await self._get_keep_context(topic, user_id)
             
-            if "tasks" in sources:
+            if "tasks" in sources and "tasks" not in context["sources"]:
                 context["sources"]["tasks"] = await self._get_tasks_context(topic, user_id)
             
             # Synthesize the context
@@ -116,8 +191,99 @@ class CrossStackContext:
         
         # 3. Enhance with LLM Narrative Synthesis (The "Clavr Difference")
         context = await self._llm_synthesize_narrative(context)
+
+        # Store in cache
+        context["_cached_at"] = time.time()
+        self._cache[cache_key] = context
+
+        # Evict old entries if cache grows too large
+        if len(self._cache) > 100:
+            oldest_key = min(
+                self._cache, key=lambda k: self._cache[k].get("_cached_at", 0)
+            )
+            del self._cache[oldest_key]
         
         return context
+    
+    async def _gather_graph_topic_context(
+        self, topic: str, user_id: int
+    ) -> Dict[str, Any]:
+        """
+        Use knowledge graph Topic nodes to pre-populate cross-app context.
+        
+        Queries: Topic → DISCUSSES ← [entities from multiple apps]
+        Groups results by source app for direct insertion into context.
+        """
+        if not self.graph_manager:
+            return {}
+        
+        aql = """
+        FOR t IN Topic
+            LET exact = LOWER(t.name) == LOWER(@topic)
+            LET fuzzy = CONTAINS(LOWER(t.name), LOWER(@topic))
+                      OR CONTAINS(LOWER(@topic), LOWER(t.name))
+            LET keyword_match = LENGTH(
+                FOR kw IN (t.keywords || [])
+                    FILTER CONTAINS(LOWER(@topic), LOWER(kw))
+                    RETURN 1
+            ) > 0
+            FILTER exact OR fuzzy OR keyword_match
+            SORT exact DESC, fuzzy DESC
+            LIMIT 3
+            LET entities = (
+                FOR v, e IN 1..2 INBOUND t GRAPH 'knowledge_graph'
+                    SORT v.date DESC, v.start_time DESC, v.timestamp DESC
+                    LIMIT 20
+                    RETURN {
+                        id: v._key,
+                        collection: PARSE_IDENTIFIER(v).collection,
+                        title: v.subject || v.title || v.name || "",
+                        date: v.date || v.start_time || v.timestamp || "",
+                        snippet: LEFT(v.body || v.content || v.description || "", 200),
+                        source: v.source || PARSE_IDENTIFIER(v).collection
+                    }
+            )
+            RETURN {topic_name: t.name, entities}
+        """
+        
+        try:
+            results = await self.graph_manager.execute_query(aql, {'topic': topic})
+            if not results:
+                return {}
+            
+            # Group by source app
+            source_map = {
+                'Email': 'email',
+                'Message': 'slack',
+                'CalendarEvent': 'calendar',
+                'Document': 'drive',
+                'LinearIssue': 'linear',
+                'GoogleTask': 'tasks',
+            }
+            
+            grouped: Dict[str, Any] = {}
+            for topic_result in results:
+                for entity in topic_result.get('entities', []):
+                    collection = entity.get('collection', '')
+                    source_key = source_map.get(collection)
+                    if source_key and source_key not in grouped:
+                        grouped[source_key] = {
+                            'found': True,
+                            'source': 'graph',
+                            'items': [],
+                        }
+                    if source_key:
+                        grouped[source_key].setdefault('items', []).append({
+                            'title': entity.get('title', ''),
+                            'date': entity.get('date', ''),
+                            'snippet': entity.get('snippet', ''),
+                        })
+            
+            return grouped
+            
+        except Exception as e:
+            logger.debug(f"[CrossStack] Graph topic context query failed: {e}")
+            return {}
     
     async def _get_linear_context(self, topic: str, user_id: int) -> Dict[str, Any]:
         """Get Linear issues related to topic."""

@@ -120,6 +120,7 @@ class NodeType(str, Enum):
     
     # NEW: Business Intelligence types
     LEAD = "Lead"  # Potential business opportunity
+    DEAL = "Deal"  # Revenue opportunity with stage tracking
     
     # NEW: Third-party integration types
     LINEAR_ISSUE = "LinearIssue"
@@ -227,6 +228,8 @@ class RelationType(str, Enum):
     
     # NEW: Business Intelligence relationships
     INTERESTED_IN = "INTERESTED_IN"  # Lead INTERESTED_IN Topic/Project
+    DEAL_CONTACT = "DEAL_CONTACT"  # Deal DEAL_CONTACT Person/Contact
+    DEAL_STAGE_CHANGED = "DEAL_STAGE_CHANGED"  # Deal DEAL_STAGE_CHANGED Deal (self-edge for history)
     
     # NEW: Ownership relationships for ensuring graph connectivity
     BELONGS_TO = "BELONGS_TO"  # Any node with user_id BELONGS_TO User (prevents orphans)
@@ -305,6 +308,7 @@ class GraphSchema:
         NodeType.IDENTITY: {"type", "value"},  # type: email, phone, slack; value: the actual address/number
         # NEW: Business Intelligence
         NodeType.LEAD: {"name", "source"},
+        NodeType.DEAL: {"name", "stage", "source"},
         # NEW: Third-party integrations
         NodeType.LINEAR_ISSUE: {"id", "identifier", "title", "state", "user_id"},
         NodeType.GOOGLE_TASK: {"id", "title", "status", "user_id"},
@@ -335,13 +339,15 @@ class GraphSchema:
             "docling_metadata", "summary", "document_type", "key_points", "entities",
             "topics", "action_items", "financial_data", "parsed_at", "parser",
             # Drive-specific metadata
-            "owner_email", "owners", "parent_folder_id", "web_link", "shared_with_count"
+            "owner_email", "owners", "parent_folder_id", "web_link", "shared_with_count",
+            # Flexible Schema Ingestion
+            "schema_properties"
         },
         NodeType.FOLDER: {
             "folder_id", "parent_folder_id", "web_link", "owner_email"
         },
         NodeType.RECEIPT: {"items", "tax", "tip", "category", "location", "subtotal", "time", "payment_method", "currency", "receipt_number"},
-        NodeType.ACTION_ITEM: {"priority", "due_date", "assigned_to", "urgency", "amount", "type"},
+        NodeType.ACTION_ITEM: {"priority", "due_date", "assigned_to", "urgency", "amount", "type", "schema_properties"},
         NodeType.TOPIC: {
             "category", "keywords", "description", "source", "confidence",
             "related_apps", "entity_count", "last_mentioned"
@@ -408,6 +414,11 @@ class GraphSchema:
         NodeType.LEAD: {
             "interest_level", "potential_value", "last_contacted", "user_id", "email",
             "company", "notes", "last_email_id", "created_at"
+        },
+        NodeType.DEAL: {
+            "value", "company", "contacts", "close_date", "health_score",
+            "last_activity", "stale_days", "user_id", "created_at", "updated_at",
+            "description", "notes", "probability"
         },
         # NEW: Third-party integrations
         NodeType.LINEAR_ISSUE: {
@@ -612,6 +623,8 @@ class GraphSchema:
         "related_apps": PropertyType.ARRAY,
         "entity_count": PropertyType.INTEGER,
         "last_mentioned": PropertyType.DATETIME,
+        # Flexible Schema Ingestion
+        "schema_properties": PropertyType.OBJECT,
     }
     
     # Valid relationship constraints (from_type -> rel_type -> to_type)

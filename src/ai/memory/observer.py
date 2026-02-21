@@ -209,9 +209,9 @@ class GraphObserverService:
                     if target_user_id: break
                 
                 props = {
-                    "content": insight['content'],
-                    "type": insight['type'],
-                    "confidence": float(insight['confidence']),
+                    "content": insight.get('content', 'Generated insight'),
+                    "type": insight.get('type', 'suggestion'),
+                    "confidence": float(insight.get('confidence', 0.5)),
                     "actionable": insight.get('actionable', False),
                     "created_at": datetime.utcnow().isoformat(),
                     "source": "GraphObserver",
@@ -312,9 +312,9 @@ class GraphObserverService:
                 
             # 3. Store insight in graph
             props = {
-                "content": insight_data['content'],
-                "type": insight_data['type'],
-                "confidence": float(insight_data['confidence']),
+                "content": insight_data.get('content', 'Immediate action required'),
+                "type": insight_data.get('type', 'action'),
+                "confidence": float(insight_data.get('confidence', 0.9)),
                 "actionable": True,
                 "created_at": datetime.utcnow().isoformat(),
                 "source": "GraphObserver_Immediate",
@@ -618,6 +618,117 @@ class GraphObserverService:
                     if draft:
                         insight['content'] += f" Draft: {draft[:100]}..."
                         insight['draft_body'] = draft
+
+            # 4. Detect Overdue Tasks (Google Tasks + Asana ActionItems)
+            overdue_tasks_query = """
+            FOR task IN GoogleTask
+                FILTER task.status == 'pending' OR task.status == 'needsAction'
+                FILTER task.due != null
+                FILTER task.due < DATE_ISO8601(DATE_NOW())
+                LIMIT 10
+                RETURN {
+                    id: task._id,
+                    title: task.title,
+                    due: task.due,
+                    source: 'google_tasks',
+                    user_id: task.user_id
+                }
+            """
+            
+            try:
+                overdue_results = await self.graph.execute_query(overdue_tasks_query)
+                for task in overdue_results or []:
+                    watchdog_insights.append({
+                        "type": "follow_up",
+                        "subtype": "overdue_task",
+                        "content": f"Task '{task['title']}' is overdue (due: {task.get('due', 'unknown')}).",
+                        "related_node_ids": [task['id']],
+                        "confidence": 0.9,
+                        "actionable": True,
+                        "metadata": {"title": task['title'], "due": task.get('due'), "source": task.get('source')},
+                        "user_id": task.get('user_id')
+                    })
+            except Exception as e:
+                logger.debug(f"[GraphObserver] Overdue tasks query failed (collection may not exist): {e}")
+            
+            # Also check Asana ActionItem overdue
+            overdue_asana_query = """
+            FOR item IN ActionItem
+                FILTER item.source == 'asana'
+                FILTER item.status IN ['pending', 'not_started', 'in_progress']
+                FILTER item.due_date != null
+                FILTER item.due_date < DATE_ISO8601(DATE_NOW())
+                LIMIT 10
+                RETURN {
+                    id: item._id,
+                    title: item.title,
+                    due: item.due_date,
+                    source: 'asana',
+                    user_id: item.user_id
+                }
+            """
+            
+            try:
+                overdue_asana = await self.graph.execute_query(overdue_asana_query)
+                for item in overdue_asana or []:
+                    watchdog_insights.append({
+                        "type": "follow_up",
+                        "subtype": "overdue_task",
+                        "content": f"Asana task '{item['title']}' is overdue (due: {item.get('due', 'unknown')}).",
+                        "related_node_ids": [item['id']],
+                        "confidence": 0.9,
+                        "actionable": True,
+                        "metadata": {"title": item['title'], "due": item.get('due'), "source": "asana"},
+                        "user_id": item.get('user_id')
+                    })
+            except Exception as e:
+                logger.debug(f"[GraphObserver] Overdue Asana query failed: {e}")
+            
+            # 5. Detect Stale Linear Issues (no update in 7+ days, not completed)
+            stale_linear_query = """
+            FOR issue IN LinearIssue
+                FILTER issue.stateType NOT IN ['completed', 'cancelled', 'done']
+                FILTER issue.updated_at != null
+                FILTER DATE_DIFF(issue.updated_at, DATE_NOW(), 'day') > 7
+                LIMIT 10
+                RETURN {
+                    id: issue._id,
+                    title: issue.title,
+                    identifier: issue.identifier,
+                    state: issue.state,
+                    updated_at: issue.updated_at,
+                    user_id: issue.user_id
+                }
+            """
+            
+            try:
+                stale_issues = await self.graph.execute_query(stale_linear_query)
+                for issue in stale_issues or []:
+                    days_stale = 7  # minimum
+                    if issue.get('updated_at'):
+                        try:
+                            updated = datetime.fromisoformat(str(issue['updated_at']).replace('Z', '+00:00'))
+                            days_stale = (datetime.utcnow() - updated.replace(tzinfo=None)).days
+                        except (ValueError, AttributeError):
+                            pass
+                    
+                    watchdog_insights.append({
+                        "type": "follow_up",
+                        "subtype": "stale_issue",
+                        "content": f"Linear issue {issue.get('identifier', '')} '{issue['title']}' hasn't been updated in {days_stale} days (state: {issue.get('state', 'unknown')}).",
+                        "related_node_ids": [issue['id']],
+                        "confidence": 0.85,
+                        "actionable": True,
+                        "metadata": {
+                            "identifier": issue.get('identifier'),
+                            "title": issue['title'],
+                            "state": issue.get('state'),
+                            "days_stale": days_stale
+                        },
+                        "user_id": issue.get('user_id')
+                    })
+            except Exception as e:
+                logger.debug(f"[GraphObserver] Stale Linear issues query failed: {e}")
 
         except Exception as e:
             logger.error(f"[GraphObserver] Business Watchdog failed: {e}")

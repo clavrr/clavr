@@ -6,7 +6,7 @@ from typing import Any, Optional
 from src.utils.logger import setup_logger
 from src.services.indexing.indexing_constants import (
     CRAWLER_EMAIL, CRAWLER_DRIVE, CRAWLER_SLACK, CRAWLER_NOTION, CRAWLER_ASANA,
-    CRAWLER_CALENDAR, CRAWLER_TASKS, CRAWLER_KEEP, CRAWLER_LINEAR,
+    CRAWLER_CALENDAR, CRAWLER_TASKS, CRAWLER_KEEP, CRAWLER_LINEAR, CRAWLER_CONTACTS,
     PROVIDER_GMAIL, PROVIDER_GOOGLE_DRIVE, PROVIDER_SLACK, PROVIDER_NOTION, PROVIDER_ASANA,
     PROVIDER_CALENDAR, PROVIDER_GOOGLE_TASKS, PROVIDER_GOOGLE_KEEP, PROVIDER_LINEAR
 )
@@ -240,6 +240,26 @@ class IndexerFactory:
                     user_id=user_id,
                     rag_engine=rag_engine,
                     graph_manager=graph_manager,
+                    topic_extractor=topic_extractor,
+                    temporal_indexer=temporal_indexer,
+                    relationship_manager=relationship_manager,
+                    entity_resolver=entity_resolver,
+                    observer_service=observer_service
+                )
+            
+            elif crawler_type == CRAWLER_CONTACTS:
+                from src.services.indexing.crawlers.contacts import GoogleContactsCrawler
+                
+                if not hasattr(creds, 'token'):
+                    logger.warning("Invalid credentials for GoogleContactsCrawler")
+                    return None
+                
+                return GoogleContactsCrawler(
+                    config=config,
+                    user_id=user_id,
+                    rag_engine=rag_engine,
+                    graph_manager=graph_manager,
+                    credentials=creds,
                     topic_extractor=topic_extractor,
                     temporal_indexer=temporal_indexer,
                     relationship_manager=relationship_manager,

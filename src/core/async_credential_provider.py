@@ -86,7 +86,7 @@ class AsyncCredentialProvider:
                 
                 stmt_int = select(UserIntegration).where(
                     UserIntegration.user_id == user_id,
-                    UserIntegration.provider == 'google'
+                    UserIntegration.provider == 'gmail'
                 )
                 res_int = await db.execute(stmt_int)
                 integration = res_int.scalars().first()

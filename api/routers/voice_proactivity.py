@@ -22,10 +22,7 @@ from api.dependencies import get_config
 logger = setup_logger(__name__)
 router = APIRouter(prefix="/voice", tags=["voice-proactivity"])
 
-
-# ============================================================
 # Wake-Word Verification
-# ============================================================
 
 @router.post("/wake")
 async def verify_wake_word(
@@ -65,9 +62,7 @@ async def verify_wake_word(
         }
 
 
-# ============================================================
 # Nudge Preferences
-# ============================================================
 
 @router.get("/nudge/settings")
 async def get_nudge_settings(
@@ -108,9 +103,7 @@ async def update_nudge_settings(
     }
 
 
-# ============================================================
 # Proactive Nudge WebSocket
-# ============================================================
 
 @router.websocket("/ws/proactive")
 async def websocket_proactive_nudge(

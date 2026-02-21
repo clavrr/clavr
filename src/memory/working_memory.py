@@ -416,9 +416,12 @@ class WorkingMemoryManager:
         """Set the database session for persistence."""
         self._db = db
         
-    def get_or_create(self, user_id: int, session_id: str) -> WorkingMemory:
+    async def get_or_create(
+        self, user_id: int, session_id: str
+    ) -> WorkingMemory:
         """
         Get existing working memory or create a new one.
+        Attempts to load from DB on cache miss.
         
         Args:
             user_id: User ID
@@ -434,13 +437,24 @@ class WorkingMemoryManager:
         # Check cache first
         if session_id in self._cache[user_id]:
             return self._cache[user_id][session_id]
+        
+        # Try loading from database
+        if self.persistence_enabled:
+            wm = await self._load_from_db(user_id, session_id)
+            if wm:
+                self._cache[user_id][session_id] = wm
+                logger.info(
+                    f"[WorkingMemoryManager] Restored working memory from DB for "
+                    f"user {user_id}, session {session_id[:20]}... ({wm.total_turns} turns)"
+                )
+                return wm
             
         # Create new working memory
         wm = WorkingMemory(user_id=user_id, session_id=session_id)
         self._cache[user_id][session_id] = wm
         
         # Cleanup stale sessions for this user
-        self._cleanup_stale_sessions(user_id)
+        await self._cleanup_stale_sessions(user_id)
         
         logger.info(
             f"[WorkingMemoryManager] Created new working memory for "
@@ -453,8 +467,8 @@ class WorkingMemoryManager:
         """Get working memory if it exists."""
         return self._cache.get(user_id, {}).get(session_id)
     
-    def _cleanup_stale_sessions(self, user_id: int):
-        """Remove stale sessions for a user."""
+    async def _cleanup_stale_sessions(self, user_id: int):
+        """Remove stale sessions for a user, persisting before eviction."""
         if user_id not in self._cache:
             return
             
@@ -465,6 +479,9 @@ class WorkingMemoryManager:
         ]
         
         for sid in stale_sessions:
+            # Persist before evicting so pending facts survive
+            if self.persistence_enabled:
+                await self.persist_to_db(sessions[sid])
             del sessions[sid]
             logger.debug(f"[WorkingMemoryManager] Cleaned up stale session {sid[:20]}...")
             
@@ -476,7 +493,9 @@ class WorkingMemoryManager:
                 key=lambda x: x[1].last_activity,
                 reverse=True
             )
-            for sid, _ in sorted_sessions[self.max_sessions_per_user:]:
+            for sid, wm in sorted_sessions[self.max_sessions_per_user:]:
+                if self.persistence_enabled:
+                    await self.persist_to_db(wm)
                 del sessions[sid]
                 logger.debug(
                     f"[WorkingMemoryManager] Evicted old session {sid[:20]}... "
@@ -509,6 +528,90 @@ class WorkingMemoryManager:
             "total_turns": total_turns,
             "average_turns_per_session": total_turns / total_sessions if total_sessions > 0 else 0
         }
+    
+    async def persist_to_db(self, wm: WorkingMemory):
+        """
+        Persist a WorkingMemory snapshot to the database.
+        Uses upsert logic (update if exists, insert if not).
+        """
+        try:
+            from src.database import get_async_db_context
+            from src.database.models import WorkingMemorySnapshot
+            from sqlalchemy import select
+            
+            async with get_async_db_context() as db:
+                result = await db.execute(
+                    select(WorkingMemorySnapshot).where(
+                        WorkingMemorySnapshot.user_id == wm.user_id,
+                        WorkingMemorySnapshot.session_id == wm.session_id
+                    )
+                )
+                snapshot = result.scalar_one_or_none()
+                
+                snapshot_data = wm.to_dict()
+                
+                if snapshot:
+                    snapshot.snapshot_data = snapshot_data
+                    snapshot.turn_count = wm.total_turns
+                    snapshot.active_entities = wm.active_entities[:20]
+                    snapshot.active_topics = wm.active_topics[:10]
+                    snapshot.current_goal = wm.current_goal
+                else:
+                    snapshot = WorkingMemorySnapshot(
+                        user_id=wm.user_id,
+                        session_id=wm.session_id,
+                        snapshot_data=snapshot_data,
+                        turn_count=wm.total_turns,
+                        active_entities=wm.active_entities[:20],
+                        active_topics=wm.active_topics[:10],
+                        current_goal=wm.current_goal,
+                    )
+                    db.add(snapshot)
+                
+                await db.commit()
+                logger.debug(
+                    f"[WorkingMemoryManager] Persisted snapshot for user {wm.user_id}, "
+                    f"session {wm.session_id[:20]}... ({wm.total_turns} turns)"
+                )
+                
+        except Exception as e:
+            logger.debug(f"[WorkingMemoryManager] Could not persist snapshot: {e}")
+    
+    async def _load_from_db(self, user_id: int, session_id: str) -> Optional[WorkingMemory]:
+        """
+        Load a WorkingMemory from the database snapshot.
+        Returns None if no snapshot exists or it's stale.
+        """
+        try:
+            from src.database import get_async_db_context
+            from src.database.models import WorkingMemorySnapshot
+            from sqlalchemy import select
+            
+            async with get_async_db_context() as db:
+                result = await db.execute(
+                    select(WorkingMemorySnapshot).where(
+                        WorkingMemorySnapshot.user_id == user_id,
+                        WorkingMemorySnapshot.session_id == session_id
+                    )
+                )
+                snapshot = result.scalar_one_or_none()
+                
+                if not snapshot or not snapshot.snapshot_data:
+                    return None
+                
+                # Check if snapshot is too old (stale)
+                if snapshot.updated_at:
+                    idle_time = datetime.utcnow() - snapshot.updated_at
+                    if idle_time > timedelta(minutes=self.max_idle_minutes * 2):
+                        return None
+                
+                # Reconstruct WorkingMemory from snapshot
+                wm = WorkingMemory.from_dict(snapshot.snapshot_data)
+                return wm
+                
+        except Exception as e:
+            logger.debug(f"[WorkingMemoryManager] Could not load snapshot: {e}")
+            return None
 
 
 # Global instance (can be replaced with dependency injection)

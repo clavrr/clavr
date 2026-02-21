@@ -893,9 +893,10 @@ class MemoryOrchestrator:
         Learn from a complete conversation turn.
         
         This is called after each agent response to:
-        1. Update working memory with the turn
-        2. Extract and store any learnable facts
-        3. Update entity/topic tracking
+        1. Evaluate the PREVIOUS turn (did the user like it?)
+        2. Update working memory with the current turn
+        3. Extract and store any learnable facts
+        4. Update entity/topic tracking
         
         Args:
             user_id: User ID
@@ -911,6 +912,113 @@ class MemoryOrchestrator:
         try:
             # Get/create working memory
             wm = self.working_memory_manager.get_or_create(user_id, session_id)
+            
+            # --- OUTCOME DETECTION: Evaluate previous turn ---
+            # Before adding the new turn, check if the user's new message 
+            # tells us whether the previous response was good or bad.
+            try:
+                from src.ai.capabilities.outcome_detector import get_outcome_detector, OutcomeSignal
+                detector = get_outcome_detector()
+                
+                # Get the previous turn context from working memory
+                turns = wm.get_context_window(3)
+                prev_response = ""
+                prev_query = ""
+                for turn in reversed(turns):
+                    if hasattr(turn, 'role'):
+                        if turn.role == "assistant" and not prev_response:
+                            prev_response = turn.content
+                        elif turn.role == "user" and not prev_query:
+                            prev_query = turn.content
+                    elif isinstance(turn, dict):
+                        if turn.get("role") == "assistant" and not prev_response:
+                            prev_response = turn.get("content", "")
+                        elif turn.get("role") == "user" and not prev_query:
+                            prev_query = turn.get("content", "")
+                
+                if prev_response:
+                    # Calculate time gap (approximate)
+                    time_gap = 0.0
+                    if hasattr(wm, '_last_activity') and wm._last_activity:
+                        from datetime import datetime
+                        time_gap = (datetime.utcnow() - wm._last_activity).total_seconds()
+                    
+                    outcome = detector.detect(
+                        user_message=user_message,
+                        previous_response=prev_response,
+                        previous_query=prev_query,
+                        time_gap_seconds=time_gap
+                    )
+                    
+                    if outcome.signal in (OutcomeSignal.NEGATIVE, OutcomeSignal.CORRECTION, OutcomeSignal.RETRY):
+                        # Mark the current interaction as not successful
+                        success = False
+                        
+                        logger.info(
+                            f"[MemoryOrchestrator] Outcome detected: {outcome.signal.value} "
+                            f"(confidence: {outcome.confidence:.2f}) — {outcome.reasoning}"
+                        )
+                        
+                        # Store correction as a fact for future learning
+                        if outcome.signal == OutcomeSignal.CORRECTION and outcome.correction:
+                            correction = outcome.correction
+                            if correction.correct_element and self.semantic_memory:
+                                correction_fact = (
+                                    f"User corrected: wanted '{correction.correct_element}' "
+                                    f"not '{correction.wrong_element or 'previous response'}'"
+                                )
+                                try:
+                                    await self.semantic_memory.learn_fact(
+                                        user_id=user_id,
+                                        content=correction_fact,
+                                        category="correction",
+                                        source="outcome_detector",
+                                        confidence=outcome.confidence
+                                    )
+                                except Exception:
+                                    pass  # Non-critical
+                            
+                            # Forward domain corrections to routing system
+                            if correction.wrong_domain and correction.correct_domain:
+                                try:
+                                    from src.ai.intent.user_skill_prefs import get_skill_tracker
+                                    skill_tracker = get_skill_tracker()
+                                    skill_tracker.get_profile(user_id).record_correction(
+                                        wrong_skill=correction.wrong_domain,
+                                        correct_skill=correction.correct_domain
+                                    )
+                                    logger.info(
+                                        f"[MemoryOrchestrator] Routing correction: "
+                                        f"{correction.wrong_domain} → {correction.correct_domain}"
+                                    )
+                                except Exception:
+                                    pass  # Non-critical
+                        
+                        if outcome.signal == OutcomeSignal.RETRY:
+                            # Store that the previous response format/content didn't work
+                            if self.semantic_memory:
+                                try:
+                                    await self.semantic_memory.learn_fact(
+                                        user_id=user_id,
+                                        content=f"User rephrased query (possible dissatisfaction with previous answer by {agent_name})",
+                                        category="feedback",
+                                        source="outcome_detector",
+                                        confidence=outcome.confidence * 0.7  # Lower confidence for inferred retries
+                                    )
+                                except Exception:
+                                    pass
+                    
+                    elif outcome.signal == OutcomeSignal.POSITIVE and outcome.confidence > 0.7:
+                        logger.debug(
+                            f"[MemoryOrchestrator] Positive outcome: {outcome.reasoning}"
+                        )
+            
+            except ImportError:
+                pass  # OutcomeDetector not available
+            except Exception as e:
+                logger.debug(f"[MemoryOrchestrator] Outcome detection failed (non-critical): {e}")
+            
+            # --- Add current turn to working memory ---
             
             # Add user turn
             wm.add_turn(
@@ -928,21 +1036,10 @@ class MemoryOrchestrator:
                 metadata={"tools_used": tools_used, "success": success}
             )
             
-            # Store in conversation memory if available
-            if self.conversation_memory:
-                if hasattr(self.conversation_memory, "add_message"):
-                    await self.conversation_memory.add_message(
-                        user_id=user_id,
-                        session_id=session_id,
-                        role="user",
-                        content=user_message
-                    )
-                    await self.conversation_memory.add_message(
-                        user_id=user_id,
-                        session_id=session_id,
-                        role="assistant",
-                        content=assistant_response
-                    )
+            # NOTE: Conversation message persistence is handled by ChatService.
+            # Do NOT call conversation_memory.add_message() here — it would create
+            # duplicate messages since ChatService already saves both the user query
+            # and assistant response to the database.
             
             # Detect and track goals from user message
             if self.goal_tracker:

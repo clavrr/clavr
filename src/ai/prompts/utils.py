@@ -6,7 +6,8 @@ from .constants import (
     CORE_PERSONA, 
     TONE_STYLE_GUIDELINES, 
     OPERATIONAL_PRINCIPLES, 
-    MEMORY_INSTRUCTIONS
+    MEMORY_INSTRUCTIONS,
+    ADVOCACY_PRINCIPLES,
 )
 
 def format_prompt(template: str, **kwargs: Any) -> str:
@@ -40,7 +41,8 @@ class BasePromptBuilder:
             f"\nAGENT ROLE:\n{agent_role}",
             "\nCAPABILITIES:\n- " + "\n- ".join(capabilities),
             TONE_STYLE_GUIDELINES,
-            OPERATIONAL_PRINCIPLES
+            OPERATIONAL_PRINCIPLES,
+            ADVOCACY_PRINCIPLES
         ]
         
         if include_memory:

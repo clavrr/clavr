@@ -12,7 +12,6 @@ from langchain_core.messages import SystemMessage, HumanMessage
 from ...utils.logger import setup_logger
 from .semantic_memory import SemanticMemory
 from ..llm_factory import LLMFactory
-from api.dependencies import AppState
 
 logger = setup_logger(__name__)
 
@@ -59,6 +58,7 @@ class FactExtractor:
     def _get_llm(self):
         if not self.llm:
             try:
+                from api.dependencies import AppState
                 config = AppState.get_config()
                 # Use a cheaper/faster model if available, or standard one
                 self.llm = LLMFactory.get_llm_for_provider(config, temperature=0.0)

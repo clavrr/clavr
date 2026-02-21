@@ -4,10 +4,10 @@ LLM Extraction Schemas for Calendar Agent
 """
 
 SCHEDULE_SCHEMA = {
-    "summary": "Title or summary of the event",
+    "summary": "Title or summary of the event. Do NOT include attendee names here — extract them into attendees instead. E.g. 'Schedule meeting with John' → summary='Meeting', attendees=['John']",
     "start_time": "Start time in ISO format or relative (e.g. 'tomorrow at 3pm')",
     "end_time": "End time or duration (e.g. '1 hour'), else null",
-    "attendees": "List of email addresses for attendees, else null",
+    "attendees": "List of attendee names or email addresses. Extract ANY person mentioned with 'with [name]' here. Names will be resolved to emails automatically. E.g. 'meeting with Emmanuel and Sarah' → ['Emmanuel', 'Sarah']",
     "location": "Location of the event, else null",
     "description": "Description of the event, else null",
     "timezone_reference": "If user mentions a specific timezone or city for time (e.g. '9am London time', '3pm Tokyo'), extract it here. null otherwise.",
