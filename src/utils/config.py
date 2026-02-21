@@ -65,8 +65,8 @@ class ConfigDefaults:
     
     # RAG defaults
     RAG_EMBEDDING_PROVIDER_GEMINI = "gemini"
-    RAG_EMBEDDING_MODEL_DEFAULT = "models/text-embedding-004"
-    RAG_EMBEDDING_DIMENSION_DEFAULT = 768
+    RAG_EMBEDDING_MODEL_DEFAULT = "models/gemini-embedding-001"
+    RAG_EMBEDDING_DIMENSION_DEFAULT = 3072
     RAG_VECTOR_STORE_BACKEND_AUTO = "auto"
     RAG_COLLECTION_NAME_DEFAULT = "email-knowledge"
     RAG_CHUNK_SIZE_DEFAULT = 500
@@ -300,7 +300,7 @@ class RAGConfig(BaseModel):
     # Embedding configuration
     embedding_provider: str = ConfigDefaults.RAG_EMBEDDING_PROVIDER_GEMINI  # "gemini" or "sentence-transformers"
     embedding_model: str = ConfigDefaults.RAG_EMBEDDING_MODEL_DEFAULT  # Gemini model or sentence-transformer model name
-    embedding_dimension: int = ConfigDefaults.RAG_EMBEDDING_DIMENSION_DEFAULT  # 768 for Gemini/all-mpnet-base-v2, 384 for all-MiniLM-L6-v2
+    embedding_dimension: int = ConfigDefaults.RAG_EMBEDDING_DIMENSION_DEFAULT  # 3072 for gemini-embedding-001, 768 for text-embedding-005, 384 for all-MiniLM-L6-v2
     
     # Vector store configuration
     vector_store_backend: str = ConfigDefaults.RAG_VECTOR_STORE_BACKEND_AUTO  # "auto", "qdrant", or "postgres"

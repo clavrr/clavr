@@ -255,7 +255,7 @@ def run_cycle_planning(self) -> Dict[str, Any]:
                         notification_service = NotificationService(db)
                         request = NotificationRequest(
                             user_id=user.id,
-                            title=f"📊 Sprint Analysis: {result.cycle_name}",
+                            title=f"Sprint Analysis: {result.cycle_name}",
                             message=message,
                             notification_type=NotificationType.SYSTEM,
                             priority=NotificationPriority.NORMAL,
@@ -298,13 +298,21 @@ def _build_cycle_report(result) -> str:
     return "\n".join(lines)
 
 
+# Module-level instance cache for ghost tasks (Celery workers are
+# process-scoped, so this avoids per-task Redis reconnection overhead).
+_ghost_cache: Dict[str, Any] = {}
+
+
 @celery_app.task(base=IdempotentTask, bind=True)
 def sweep_follow_ups(self) -> Dict[str, Any]:
     """
-    Periodic task to advance overdue follow-ups.
+    Periodic task to advance overdue follow-ups through the escalation chain.
 
-    For each user, loads overdue threads and calls `tracker.advance()`
-    so they progress through the escalation chain (e.g. WAITING → NUDGE → ESCALATED).
+    Calls FollowUpTracker.run_sweep() for each user, which handles:
+    - State advancement (FLAGGED → REMINDED_ONCE → REMINDED_TWICE → ESCALATED)
+    - Auto-drafting context-aware follow-up replies via EmailAutoResponder
+    - Slack DM escalation for overdue threads
+    - Revenue-signal-proportional timing (high-value deals escalate faster)
     """
     logger.info("Starting Follow-Up sweep cycle")
 
@@ -317,20 +325,21 @@ def sweep_follow_ups(self) -> Dict[str, Any]:
 
     try:
         config = load_config()
-        from api.dependencies import AppState
+        from src.services.follow_up_tracker import FollowUpTracker
 
-        tracker = AppState.get_follow_up_tracker()
+        cache_key = f"tracker_{id(config)}"
+        if cache_key not in _ghost_cache:
+            _ghost_cache[cache_key] = FollowUpTracker(config)
+        tracker = _ghost_cache[cache_key]
 
         with get_db_context() as db:
             users = db.query(User).all()
 
             for user in users:
                 try:
-                    overdue = tracker.get_overdue(user.id)
-                    for thread in overdue:
-                        key = f"{user.id}:{thread.thread_id}"
-                        tracker.advance(key)
-                        results["advanced"] += 1
+                    import asyncio
+                    summary = asyncio.run(tracker.run_sweep(user.id))
+                    results["advanced"] += summary.get("threads_advanced", 0)
                     results["processed"] += 1
                 except Exception as e:
                     logger.error(f"Follow-up sweep failed for user {user.id}: {e}")
@@ -488,7 +497,7 @@ def check_pr_bottlenecks(self) -> Dict[str, Any]:
                         notification_service = NotificationService(db)
                         request = NotificationRequest(
                             user_id=user.id,
-                            title="🔍 PR Bottleneck Alert",
+                            title="PR Bottleneck Alert",
                             message=message,
                             notification_type=NotificationType.SYSTEM,
                             priority=NotificationPriority.NORMAL,
@@ -565,7 +574,7 @@ def run_sprint_retro(self) -> Dict[str, Any]:
                         notification_service = NotificationService(db)
                         request = NotificationRequest(
                             user_id=user.id,
-                            title=f"📊 Sprint Retro: {report.cycle_name}",
+                            title=f"Sprint Retro: {report.cycle_name}",
                             message=message,
                             notification_type=NotificationType.SYSTEM,
                             priority=NotificationPriority.NORMAL,
@@ -633,7 +642,7 @@ def send_morning_digest(self) -> Dict[str, Any]:
                         notification_service = NotificationService(db)
                         request = NotificationRequest(
                             user_id=user.id,
-                            title="☀️ Morning Digest",
+                            title="Morning Digest",
                             message=message,
                             notification_type=NotificationType.SYSTEM,
                             priority=NotificationPriority.NORMAL,

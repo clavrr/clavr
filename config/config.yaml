@@ -57,8 +57,8 @@ database:
 rag:
   # Embedding configuration
   embedding_provider: "gemini"  # "gemini" or "sentence-transformers"
-  embedding_model: "${RAG_EMBEDDING_MODEL:-models/text-embedding-004}"  # Gemini embedding model
-  embedding_dimension: 768  # 768 for Gemini/all-mpnet-base-v2
+  embedding_model: "${RAG_EMBEDDING_MODEL:-models/gemini-embedding-001}"  # Gemini embedding model (recommended by Google)
+  embedding_dimension: 3072  # 3072 default for gemini-embedding-001 (also supports 768, 1536)
   
   # Vector store configuration
   # Supported: "auto" (Qdrant primary, PostgreSQL fallback), "qdrant", "postgres"

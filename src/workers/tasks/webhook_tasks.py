@@ -128,6 +128,110 @@ def deliver_webhook_task(
         elif event_type in ["slack.thread.updated", "slack.message.created"]:
             await thread_analyzer.handle_event(event_type, payload, user_id)
 
+        # Revenue signal classification for incoming emails
+        if event_type == "email.received":
+            await _classify_and_track_revenue_signal(config, payload, user_id)
+
+
+# ---------------------------------------------------------------------------
+# Module-level instance cache
+# ---------------------------------------------------------------------------
+# Avoids re-creating RevenueSignalClassifier (lightweight but wasteful),
+# FollowUpTracker (creates RedisBackedStore → Redis connect + ping), and
+# LeadResponder on every webhook call.  Celery workers are process-scoped,
+# so this is safe without locking.
+_instance_cache: Dict[str, Any] = {}
+
+
+def _get_classifier(config):
+    """Return a cached RevenueSignalClassifier for the given config."""
+    key = f"clf_{id(config)}"
+    if key not in _instance_cache:
+        from src.services.revenue_signals import RevenueSignalClassifier
+        _instance_cache[key] = RevenueSignalClassifier(config)
+    return _instance_cache[key]
+
+
+def _get_tracker(config):
+    """Return a cached FollowUpTracker for the given config."""
+    key = f"tracker_{id(config)}"
+    if key not in _instance_cache:
+        from src.services.follow_up_tracker import FollowUpTracker
+        _instance_cache[key] = FollowUpTracker(config)
+    return _instance_cache[key]
+
+
+def _get_lead_responder(config):
+    """Return a cached LeadResponder for the given config."""
+    key = f"lead_{id(config)}"
+    if key not in _instance_cache:
+        from src.services.lead_responder import LeadResponder
+        _instance_cache[key] = LeadResponder(config=config)
+    return _instance_cache[key]
+
+
+async def _classify_and_track_revenue_signal(
+    config, payload: Dict[str, Any], user_id: int
+) -> None:
+    """
+    Classify incoming email for revenue signals; if positive, start tracking.
+
+    Bridges the email ingestion pipeline → RevenueSignalClassifier → FollowUpTracker.
+    Also triggers LeadResponder fast-path for high-confidence inbound leads.
+
+    Uses module-level cached instances to avoid per-call Redis connection
+    overhead and redundant object construction.
+    """
+    try:
+        subject = payload.get("subject", "")
+        body = payload.get("body", payload.get("snippet", ""))
+        sender = payload.get("from") or payload.get("sender") or ""
+        sender_email = payload.get("sender_email", sender)
+        email_id = payload.get("id", "")
+        thread_id = payload.get("threadId", email_id)
+
+        if not subject and not body:
+            return
+
+        clf = _get_classifier(config)
+        signal = clf.classify(
+            email_subject=subject,
+            email_body=body,
+            sender=str(sender),
+        )
+
+        if signal is None:
+            return
+
+        tracker = _get_tracker(config)
+        tracker.track(
+            thread_id=thread_id,
+            email_id=email_id,
+            sender=str(sender),
+            sender_email=str(sender_email),
+            subject=subject,
+            signal_type=signal.signal_type.value,
+            signal_urgency=signal.urgency.value,
+            signal_confidence=signal.confidence,
+            estimated_value=signal.estimated_value,
+            user_id=user_id,
+        )
+
+        logger.info(
+            f"[RevenueWebhook] Tracked email '{subject}' "
+            f"(signal={signal.signal_type.value}, value={signal.estimated_value})"
+        )
+
+        # Also run LeadResponder for inbound leads
+        if signal.signal_type.value == "inbound_lead" and signal.confidence >= 0.80:
+            try:
+                responder = _get_lead_responder(config)
+                await responder.handle_inbound(payload, user_id)
+            except Exception as lead_err:
+                logger.warning(f"[RevenueWebhook] LeadResponder failed: {lead_err}")
+
+    except Exception as e:
+        logger.warning(f"[RevenueWebhook] Revenue signal classification failed: {e}")
 
 @celery_app.task(base=IdempotentTask, bind=True)
 def retry_failed_webhooks_task(self) -> Dict[str, Any]:
