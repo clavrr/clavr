@@ -21,6 +21,12 @@ email-validator>=2.1.0
 # Slack Integration
 slack-sdk>=3.27.0
 
+# Asana Integration
+asana>=5.0.10
+
+# Notion Integration
+notion-client>=2.2.1
+
 # AI/LLM
 openai>=1.12.0
 anthropic>=0.18.0
@@ -38,7 +44,6 @@ langgraph>=0.0.20
 qdrant-client>=1.7.0  # REQUIRED: Primary vector store
 psycopg2-binary>=2.9.0  # REQUIRED: PostgreSQL fallback for vector store
 # Fallback: PostgreSQL with pgvector
-sentence-transformers>=2.2.2  # Local embeddings
 tiktoken>=0.5.2  # Token counting
 pgvector>=0.2.4  # PostgreSQL vector extension
 langchain-postgres>=0.0.6  # LangChain PostgreSQL integration
@@ -59,9 +64,6 @@ asyncpg>=0.29.0  # PostgreSQL async driver for AsyncSession support
 
 # LangGraph Checkpointing
 langgraph-checkpoint-postgres>=1.0.0
-
-# Attachment content extraction (IBM Docling - Advanced document parsing)
-docling>=1.0.0
 
 # Google Calendar API & OAuth
 google-auth>=2.23.0
@@ -90,7 +92,7 @@ click>=8.1.7
 python-dateutil>=2.8.2
 pytz>=2024.1
 dateparser>=1.2.0
-numpy>=2.1.0,<2.3.0
+numpy>=1.22.4,<2.0.0
 urllib3>=2.0.0,<2.4.0
 psutil>=5.9.0  # System resource monitoring for health checks
 requests>=2.32.5  # Required by both locust and langchain-community

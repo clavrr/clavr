@@ -507,10 +507,10 @@ class ChatService:
             is_connected_db = False
             try:
                 if uid:
-                    # Check if active tasks integration exists
+                    # Check if active tasks integration exists (Google Tasks OR Asana)
                     stmt = select(UserIntegration).where(
                         UserIntegration.user_id == uid,
-                        UserIntegration.provider == 'google_tasks',
+                        UserIntegration.provider.in_(['google_tasks', 'asana']),
                         UserIntegration.is_active == True
                     )
                     result = await self.db.execute(stmt)

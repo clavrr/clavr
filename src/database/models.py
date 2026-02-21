@@ -479,7 +479,7 @@ class MeetingTemplate(Base):
     id = Column(Integer, primary_key=True, index=True)
     user_id = Column(Integer, ForeignKey('users.id'), nullable=False, index=True)
     name = Column(String(255), nullable=False)
-    title = Column(EncryptedString(500))
+    title = Column(EncryptedString)
     duration_minutes = Column(Integer, default=60)
     description = Column(EncryptedString)
     location = Column(String(500))
@@ -531,7 +531,7 @@ class TaskTemplate(Base):
     id = Column(Integer, primary_key=True, index=True)
     user_id = Column(Integer, ForeignKey('users.id'), nullable=False, index=True)
     name = Column(String(255), nullable=False)
-    description = Column(EncryptedString(500))  # Template display name
+    description = Column(EncryptedString)  # Template display name
     task_description = Column(EncryptedString, nullable=False)  # Task description (supports {variables})
     priority = Column(String(20), default='medium')  # 'low', 'medium', 'high'
     category = Column(String(100))  # e.g., 'work', 'personal', 'project'
@@ -585,7 +585,7 @@ class EmailTemplate(Base):
     id = Column(Integer, primary_key=True, index=True)
     user_id = Column(Integer, ForeignKey('users.id'), nullable=False, index=True)
     name = Column(String(255), nullable=False)
-    subject = Column(EncryptedString(500))  # Email subject (supports {variables})
+    subject = Column(EncryptedString)  # Email subject (supports {variables})
     body = Column(EncryptedString, nullable=False)  # Email body (supports {variables})
     to_recipients = Column(JSON)  # Default recipients (list of email addresses)
     cc_recipients = Column(JSON)  # Default CC recipients

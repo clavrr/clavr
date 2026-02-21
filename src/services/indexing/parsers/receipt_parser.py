@@ -29,6 +29,9 @@ try:
     from docling.datamodel.document import ConversionResult
     DOCLING_AVAILABLE = True
 except ImportError:
+    DocumentConverter = None
+    InputFormat = None
+    ConversionResult = None
     DOCLING_AVAILABLE = False
 
 

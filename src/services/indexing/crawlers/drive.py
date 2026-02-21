@@ -26,6 +26,8 @@ try:
     from docling.datamodel.base_models import InputFormat
     DOCLING_AVAILABLE = True
 except ImportError:
+    DocumentConverter = None
+    InputFormat = None
     DOCLING_AVAILABLE = False
     logger.warning("Docling not available. Pdf/Office parsing will be skipped.")
 

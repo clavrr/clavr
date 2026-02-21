@@ -88,7 +88,7 @@ TIME_SENSITIVE_KEYWORDS = ["today", "tonight", "morning", "afternoon", "evening"
 HIGH_PRIORITY_KEYWORDS = ["high", "important", "top", "priority"]
 
 # Schema Validation Constants (moved from schemas.py)
-VALID_DOMAINS = ["email", "calendar", "task", "tasks", "notion", "notes", "research", "drive", "general"]
+VALID_DOMAINS = ["email", "calendar", "task", "tasks", "asana", "notion", "notes", "research", "drive", "general"]
 VALID_ACTIONS = ["search", "list", "create", "update", "delete", "send", "schedule", "complete", "summarize", "manage"]
 
 # Formatting Limits
@@ -222,7 +222,7 @@ DOMAIN_EMOJIS = {
 DOMAIN_DISPLAY_NAMES = {
     'email': 'Gmail',
     'calendar': 'Google Calendar',
-    'tasks': 'Google Tasks',
+    'tasks': 'Tasks',
     'drive': 'Google Drive',
     'keep': 'Google Keep',
     'notes': 'Google Keep',
@@ -265,6 +265,8 @@ DOMAIN_ALIASES = {
     'gcal': 'calendar',
     'google_tasks': 'tasks', 
     'todo': 'tasks',
+    'asana': 'tasks',
+    'asana_tool': 'tasks',
     'keep': 'notes',
     'google_keep': 'notes',
     'google_drive': 'drive',

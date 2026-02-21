@@ -49,86 +49,65 @@ async def auth_google_callback(
     
     This callback handles both:
     1. Login flows (state is random or missing)
-    2. Integration flows (state is 'user_{id}_{provider}')
+    2. Integration flows (state is secure `int_...` or legacy `user_{id}_{provider}`)
     """
     try:
         # Check if this is an integration callback
-        # Integration states look like: user_3_gmail, user_5_google_calendar, etc.
-        if state and state.startswith("user_"):
-            # This is an integration flow, forward to integration handler
-            from api.dependencies import get_integration_service
-            from sqlalchemy.ext.asyncio import AsyncSession
-            from api.dependencies import get_async_db
-            
-            # Parse state to get provider and potential redirect_to
-            # format: user_{id}_{provider}|{b64_redirect}
-            redirect_to = None
-            if "|" in state:
-                import base64
-                parts_with_redirect = state.split("|")
-                state_core = parts_with_redirect[0]
-                try:
-                    b64_redirect = parts_with_redirect[1]
-                    redirect_to = base64.urlsafe_b64decode(b64_redirect).decode()
-                except Exception as e:
-                    logger.warning(f"Failed to parse redirect_to from integration state: {e}")
-            else:
-                state_core = state
-
-            parts = state_core.split("_")
-            if len(parts) >= 3:
-                provider = "_".join(parts[2:])  # e.g., "gmail" or "google_calendar"
+        if state and (state.startswith("user_") or state.startswith("int_")):
+            # Get a fresh db session
+            from src.database import get_async_db_context
+            async with get_async_db_context() as db:
+                from api.dependencies import get_integration_service
+                integration_service = get_integration_service(db)
+                provider = integration_service.get_provider_hint_from_state(state)
+                callback_result = await integration_service.handle_callback(provider, code, state)
+                real_provider = callback_result.provider
+                token_data = callback_result.token_data
+                redirect_to = callback_result.redirect_to
                 
-                # Get a fresh db session
-                from src.database import get_async_db_context
-                async with get_async_db_context() as db:
-                    from api.dependencies import get_integration_service
-                    integration_service = get_integration_service(db)
-                    real_provider, token_data = await integration_service.handle_callback(provider, code, state)
+                # Update active session with new scopes if available
+                # This ensures the user doesn't have to log out/in to use the new integration
+                current_session = getattr(request.state, 'session', None)
+                if current_session and token_data.get('scope'):
+                    from sqlalchemy import select
+                    from src.database.models import Session as DBSession
                     
-                    # Update active session with new scopes if available
-                    # This ensures the user doesn't have to log out/in to use the new integration
-                    current_session = getattr(request.state, 'session', None)
-                    if current_session and token_data.get('scope'):
-                        from sqlalchemy import select
-                        from src.database.models import Session as DBSession
+                    # Fetch the current session from the database
+                    stmt = select(DBSession).where(DBSession.id == current_session.id)
+                    result = await db.execute(stmt)
+                    db_session = result.scalar_one_or_none()
+                    
+                    if db_session:
+                        # Merge new scopes with existing ones
+                        new_scopes = token_data.get('scope').split(' ')
+                        existing_scopes = db_session.granted_scopes.split(',') if db_session.granted_scopes else []
                         
-                        # Fetch the current session from the database
-                        stmt = select(DBSession).where(DBSession.id == current_session.id)
-                        result = await db.execute(stmt)
-                        db_session = result.scalar_one_or_none()
+                        # Filter out empty strings and merge
+                        merged_scopes = list(set(filter(None, existing_scopes + new_scopes)))
+                        db_session.granted_scopes = ",".join(merged_scopes)
                         
-                        if db_session:
-                            # Merge new scopes with existing ones
-                            new_scopes = token_data.get('scope').split(' ')
-                            existing_scopes = db_session.granted_scopes.split(',') if db_session.granted_scopes else []
-                            
-                            # Filter out empty strings and merge
-                            merged_scopes = list(set(filter(None, existing_scopes + new_scopes)))
-                            db_session.granted_scopes = ",".join(merged_scopes)
-                            
-                            await db.commit()
-                            logger.info(f"Updated session {db_session.id} with new integration scopes for {real_provider}")
-                    
-                    f_url = get_frontend_url(config)
-                    
-                    if redirect_to:
-                        # Ensure absolute URL for frontend
-                        if not redirect_to.startswith("http"):
-                            path = redirect_to if redirect_to.startswith("/") else f"/{redirect_to}"
-                            final_redirect = f"{f_url}{path}"
-                        else:
-                            final_redirect = redirect_to
-                            
-                        # Add success params if not already there
-                        if "?" in final_redirect:
-                            final_redirect += f"&success=true&provider={real_provider}"
-                        else:
-                            final_redirect += f"?success=true&provider={real_provider}"
+                        await db.commit()
+                        logger.info(f"Updated session {db_session.id} with new integration scopes for {real_provider}")
+                
+                f_url = get_frontend_url(config)
+                
+                if redirect_to:
+                    # Ensure absolute URL for frontend
+                    if not redirect_to.startswith("http"):
+                        path = redirect_to if redirect_to.startswith("/") else f"/{redirect_to}"
+                        final_redirect = f"{f_url}{path}"
                     else:
-                        final_redirect = f"{f_url}/integrations?success=true&provider={real_provider}"
+                        final_redirect = redirect_to
                         
-                    return RedirectResponse(url=final_redirect)
+                    # Add success params if not already there
+                    if "?" in final_redirect:
+                        final_redirect += f"&status=success&provider={real_provider}"
+                    else:
+                        final_redirect += f"?status=success&provider={real_provider}"
+                else:
+                    final_redirect = f"{f_url}/settings/integrations?status=success&provider={real_provider}"
+                    
+                return RedirectResponse(url=final_redirect)
         
         # Normal login flow
         user, session, is_new_user, redirect_url = await auth_service.handle_google_callback(code, request, state=state)
@@ -169,10 +148,12 @@ async def logout(
 @router.get("/status")
 async def get_auth_status(
     request: Request,
-    auth_service = Depends(get_auth_service)
+    auth_service = Depends(get_auth_service),
+    config: Config = Depends(get_config)
 ):
     """Get current authentication status."""
-    status = await auth_service.get_session_status(request)
+    ttl = getattr(getattr(config, 'security', None), 'session_ttl_minutes', 60)
+    status = await auth_service.get_session_status(request, timeout_minutes=ttl)
     return status
 
 @router.get("/me")
@@ -194,10 +175,12 @@ async def get_current_user_info(request: Request):
 @router.get("/session/status")
 async def get_session_status_alias(
     request: Request,
-    auth_service = Depends(get_auth_service)
+    auth_service = Depends(get_auth_service),
+    config: Config = Depends(get_config)
 ):
     """Alias for /auth/status - Get current session status."""
-    status = await auth_service.get_session_status(request)
+    ttl = getattr(getattr(config, 'security', None), 'session_ttl_minutes', 60)
+    status = await auth_service.get_session_status(request, timeout_minutes=ttl)
     return status
 
 @router.get("/integrations")

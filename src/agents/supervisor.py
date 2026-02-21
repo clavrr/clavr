@@ -238,6 +238,9 @@ class SupervisorAgent:
         active_providers = await self._get_active_providers(user_id)
         
         from .constants import DOMAIN_DISPLAY_NAMES, PROVIDER_MAPPINGS
+
+        # Task workflows can run through either Google Tasks or Asana.
+        tasks_connected = "google_tasks" in active_providers or "asana" in active_providers
         
         connected_services = []
         disconnected_services = []
@@ -245,6 +248,13 @@ class SupervisorAgent:
         
         # Dynamically check all mapped providers
         for domain, display_name in DOMAIN_DISPLAY_NAMES.items():
+            if domain == "tasks":
+                if tasks_connected:
+                    connected_services.append(display_name)
+                else:
+                    disconnected_services.append(display_name)
+                continue
+
             provider_key = PROVIDER_MAPPINGS.get(domain)
             if not provider_key or provider_key in processed_providers:
                 continue
@@ -515,6 +525,9 @@ CRITICAL ROUTING RULES:
         """Check if a domain's provider is enabled for the user."""
         if domain == 'research' or domain == 'general':
             return True
+
+        if domain == 'tasks':
+            return 'google_tasks' in active_providers or 'asana' in active_providers
             
         provider = PROVIDER_MAPPINGS.get(domain)
         # If no mapping, assume enabled (e.g. weather, maps)
@@ -606,7 +619,8 @@ CRITICAL ROUTING RULES:
                 "user_id": user_id, 
                 "user_name": user_name, 
                 "session_id": session_id,
-                "previous_context": context_str
+                "previous_context": context_str,
+                "active_providers": sorted(active_providers),
             }
             
             with LatencyMonitor(f"Agent Execution: {domain}", threshold_ms=30000):
@@ -774,9 +788,10 @@ CRITICAL ROUTING RULES:
                 if match:
                     data = json.loads(match.group(0))
                     category = data.get("category", "general").lower()
-                    
-                    if category in self.agents:
-                        return category
+
+                    normalized = DOMAIN_ALIASES.get(category, category)
+                    if normalized in self.agents or normalized == "general":
+                        return normalized
                         
             except Exception as e:
                 logger.warning(f"Interactions API routing failed, falling back to LLM: {e}")
@@ -803,9 +818,10 @@ CRITICAL ROUTING RULES:
                 json_str = match.group(0)
                 data = json.loads(json_str)
                 category = data.get("category", "general").lower()
-                
-                if category in self.agents:
-                    return category
+
+                normalized = DOMAIN_ALIASES.get(category, category)
+                if normalized in self.agents or normalized == "general":
+                    return normalized
                 
             return "general"
             
@@ -951,7 +967,12 @@ CRITICAL ROUTING RULES:
             start_msg = DOMAIN_START_MESSAGES.get(target_agent, f"Checking {target_agent}...")
             await self._emit_event('tool_call_start', start_msg, data={'tool': target_agent})
             
-            ctx = {"user_id": user_id, "user_name": user_name, "session_id": session_id}
+            ctx = {
+                "user_id": user_id,
+                "user_name": user_name,
+                "session_id": session_id,
+                "active_providers": sorted(active_providers),
+            }
             with LatencyMonitor(f"Agent Execution: {target_agent}"):
                 final_result = await agent.run(query, context=ctx)
             
