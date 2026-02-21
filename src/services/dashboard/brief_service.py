@@ -197,20 +197,17 @@ class BriefService:
             return []
             
         try:
-            # Use Gmail's native category filtering to get ONLY primary-tab emails.
-            # This excludes Promotions, Social, Updates, and Forums tabs at the API level.
-            gmail_query = "category:primary newer_than:7d"
+            # Fetch recent inbox emails. We filter out promos via sender/subject patterns below.
+            # NOTE: category:primary doesn't work on all Gmail/Workspace accounts.
+            gmail_query = "newer_than:7d"
             
-            logger.info(f"[BriefService] Searching primary-tab emails: {gmail_query}")
-            
-            # Explicitly disable RAG in fast_mode to avoid hitting timeouts (>1s)
-            allow_rag = not fast_mode
+            logger.info(f"[BriefService] Fetching inbox emails: {gmail_query}")
             
             messages = await asyncio.to_thread(
                 self.email_service.search_emails,
                 query=gmail_query,
                 folder="inbox",
-                limit=30,  # Fetch extra to survive additional filtering
+                limit=30,
             ) 
             
             logger.info(f"[BriefService] Found {len(messages)} primary-tab emails")

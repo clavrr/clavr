@@ -300,7 +300,7 @@ async def get_briefs(
     
     # Bump this version number whenever the summarization prompt or payload shape changes.
     # This auto-invalidates stale cached payloads so users always get the latest format.
-    BRIEFS_CACHE_VERSION = "v15"
+    BRIEFS_CACHE_VERSION = "v16"
     
     cache_store = RedisBackedStore(prefix="dashboard_briefs", ttl_seconds=3600)
     cache_key = f"{BRIEFS_CACHE_VERSION}:user:{current_user.id}"
