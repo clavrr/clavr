@@ -1141,7 +1141,19 @@ class BriefService:
         
         # Sort by urgency (high first) then by due_date
         urgency_order = {"high": 0, "medium": 1, "low": 2}
-        items.sort(key=lambda x: (urgency_order.get(x.get('urgency', 'medium'), 1), x.get('due_date') or '9999'))
+        
+        def _get_sort_key(item):
+            rank = urgency_order.get(item.get('urgency', 'medium'), 1)
+            due = item.get('due_date')
+            if isinstance(due, datetime):
+                due_str = due.isoformat()
+            elif due:
+                due_str = str(due)
+            else:
+                due_str = '9999'
+            return (rank, due_str)
+            
+        items.sort(key=_get_sort_key)
         
         # Limit to 15 items
         items = items[:15]
