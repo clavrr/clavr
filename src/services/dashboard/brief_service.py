@@ -175,6 +175,9 @@ class BriefService:
                 if isinstance(r, Exception):
                     logger.error(f"[BriefService] Email enhance error: {r}")
 
+        # Sort emails by received_at (newest first) for stable order between loads
+        emails.sort(key=lambda e: e.get('received_at', ''), reverse=True)
+
         # Strip raw fields before sending to frontend — only `summary` should be rendered
         for e in emails:
             e.pop('body', None)     # Full HTML body — huge, only needed during LLM enhancement
@@ -1241,8 +1244,9 @@ class BriefService:
         sender = email.get('from', '')
         
         if not body or len(body.strip()) < 10:
-            logger.warning(f"[BriefService] No body for '{subject}' from '{sender}'")
-            return ''
+            # No body — use subject as the content for summarization
+            logger.info(f"[BriefService] No body for '{subject}', using subject as content")
+            body = f"{subject}"  # LLM will summarize from subject + sender
             
         try:
             from src.ai.llm_factory import LLMFactory
