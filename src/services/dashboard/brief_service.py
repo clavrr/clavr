@@ -153,19 +153,32 @@ class BriefService:
             async def enhance_email(e):
                 _clean_from(e)
                 
-                try:
-                    raw_summary = await self._extract_actionable_summary(e, user_name)
-                    # Only accept summaries that are truly specific (≥30 chars)
-                    if raw_summary and len(raw_summary) >= 30:
-                        e['summary'] = raw_summary
-                        logger.info(f"[BriefService] ✓ Summary for '{e.get('subject', '')[:40]}': {raw_summary}")
-                        return
-                    elif raw_summary:
-                        logger.warning(f"[BriefService] ✗ Too short ({len(raw_summary)}): {raw_summary}")
-                except Exception as exc:
-                    logger.error(f"[BriefService] LLM failed for '{e.get('subject')}': {exc}")
+                # Try LLM summarization with one retry
+                for attempt in range(2):
+                    try:
+                        raw_summary = await self._extract_actionable_summary(e, user_name)
+                        if raw_summary and len(raw_summary) >= 30:
+                            e['summary'] = raw_summary
+                            logger.info(f"[BriefService] ✓ Summary for '{e.get('subject', '')[:40]}': {raw_summary}")
+                            return
+                        elif raw_summary:
+                            logger.warning(f"[BriefService] ✗ Too short ({len(raw_summary)}): {raw_summary}")
+                    except Exception as exc:
+                        logger.error(f"[BriefService] LLM attempt {attempt+1} failed for '{e.get('subject')}': {exc}")
+                    
+                    # Brief pause before retry
+                    if attempt == 0:
+                        await asyncio.sleep(1)
                 
-                # Fallback: clean, non-raw message
+                # Fallback: use snippet (Gmail preview text) if available — much better than generic message
+                snippet = e.get('snippet', '') or e.get('summary', '')
+                if snippet and len(snippet) >= 20:
+                    sender = e.get('from', 'Someone').split()[0]
+                    e['summary'] = f"{sender} says: {snippet[:150]}"
+                    logger.info(f"[BriefService] ⚡ Snippet fallback for '{e.get('subject', '')[:40]}': {e['summary']}")
+                    return
+                
+                # Last resort
                 sender = e.get('from', 'Someone').split()[0]
                 e['summary'] = f"New email from {sender}"
             
