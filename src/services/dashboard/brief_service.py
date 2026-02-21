@@ -77,14 +77,6 @@ class BriefService:
             
         results = await asyncio.gather(*tasks, return_exceptions=True)
         
-        # We must fetch recent important emails SEQUENTIALLY after _get_emails 
-        # because google-api-python-client's httplib2 is NOT thread-safe for parallel calls on the same client.
-        urgent_read_emails = []
-        try:
-            urgent_read_emails = await self._get_recent_important_emails(user_id)
-        except Exception as e:
-            logger.error(f"[BriefService] Sequential fetch of urgent emails failed: {e}")
-        
         emails = results[0] if isinstance(results[0], list) else []
         todos = results[1] if isinstance(results[1], list) else []
         meetings = results[2] if isinstance(results[2], list) else []
@@ -99,6 +91,14 @@ class BriefService:
         idx += 1
         
         people = results[idx] if isinstance(results[idx], dict) else {}
+
+        # We must fetch recent important emails SEQUENTIALLY after _get_emails 
+        # because google-api-python-client's httplib2 is NOT thread-safe for parallel calls on the same client.
+        urgent_read_emails = []
+        try:
+            urgent_read_emails = await self._get_recent_important_emails(user_id, people)
+        except Exception as e:
+            logger.error(f"[BriefService] Sequential fetch of urgent emails failed: {e}")
 
         # 2. Skip slow LLM-based summarization in fast_mode (voice optimization)
         # _generate_smart_reminders takes ~6-8s, which is too slow for voice (~1s limit)
@@ -133,7 +133,8 @@ class BriefService:
                 todos=todos,
                 meetings=meetings,
                 documents=documents,
-                ghost_drafts=ghost_drafts
+                ghost_drafts=ghost_drafts,
+                people=people
             )
 
         return {
@@ -203,6 +204,7 @@ class BriefService:
                     "subject": msg.get('subject', 'No Subject'),
                     "from": msg.get('sender', 'Unknown'),
                     "summary": summary,
+                    "body": msg.get('body', ''),
                     "received_at": msg.get('date'),
                     "thread_id": msg.get('threadId')
                 })
@@ -222,9 +224,9 @@ class BriefService:
             logger.error(f"[BriefService] Error fetching emails: {e}", exc_info=True)
             return []
 
-    async def _get_recent_important_emails(self, user_id: int) -> List[Dict]:
+    async def _get_recent_important_emails(self, user_id: int, people: Dict[str, Any] = {}) -> List[Dict]:
         """
-        Fetch recent emails (read or unread) that match high-impact keywords.
+        Fetch recent emails (read or unread) that match high-impact keywords OR are from VIPs.
         Used specifically for Reminders to capture things like 'Investment offer' even if opened.
         """
         if not self.email_service:
@@ -232,13 +234,27 @@ class BriefService:
             
         try:
             # Construct OR query with keywords
-            # "newer_than:2d (urgent OR asap OR ...)"
+            # "newer_than:2d (urgent OR asap OR ... OR from:vip1 OR from:vip2)"
             keywords_or = " OR ".join(f'"{kw}"' for kw in self.IMPACT_KEYWORDS)
-            query = f"newer_than:2d ({keywords_or})"
             
-            logger.info(f"[BriefService] Searching recent important emails: {query[:50]}...")
+            # Incorporate Inner Circle VIPs
+            vip_emails = []
+            inner_circle = people.get('inner_circle', [])
+            for person in inner_circle:
+                email_addr = person.get('email')
+                if email_addr:
+                    vip_emails.append(f"from:{email_addr}")
+                    
+            if vip_emails:
+                vips_or = " OR ".join(vip_emails)
+                query = f"newer_than:2d (({keywords_or}) OR ({vips_or}))"
+            else:
+                query = f"newer_than:2d ({keywords_or})"
+            
+            logger.info(f"[BriefService] Searching recent important/VIP emails: {query[:50]}...")
             
             # Fetch with strict limit since this is expensive/specific
+            # Increase limit slightly since we are combining two sets of things
             messages = await asyncio.to_thread(
                 self.email_service.search_emails, 
                 query=query, 
@@ -263,6 +279,7 @@ class BriefService:
                     "subject": msg.get('subject', 'No Subject'),
                     "from": msg.get('sender', 'Unknown'),
                     "summary": msg.get('snippet', ''),
+                    "body": msg.get('body', ''),
                     "received_at": msg.get('date'),
                     "thread_id": msg.get('threadId')
                 })
@@ -713,7 +730,8 @@ class BriefService:
         meetings: List[Dict],
         urgent_emails: List[Dict] = [], # New
         documents: List[Dict] = [],
-        ghost_drafts: List[Dict] = []
+        ghost_drafts: List[Dict] = [],
+        people: Dict[str, Any] = {} # New
     ) -> Dict[str, Any]:
         """
         Generate intelligent reminders.
@@ -757,8 +775,24 @@ class BriefService:
         # Filter: Last 48h AND High Impact
         impact_keywords = self.IMPACT_KEYWORDS
         
+        # Build set of VIP emails from CRM data
+        vip_emails = set()
+        inner_circle = people.get('inner_circle', [])
+        for person in inner_circle:
+            email_addr = person.get('email')
+            if email_addr:
+                vip_emails.add(email_addr.lower().strip())
+        
         now = datetime.now()
-        email_reminders_added = 0
+        
+        # Build active goals list from todos to use for alignment scoring
+        active_goals = []
+        for t in todos[:10]:
+            title = t.get('title', '')
+            if title and len(title) > 3:
+                active_goals.append(title.lower())
+                
+        email_candidates_scored = []
         
         for email in candidate_list:
             # 1. Check Date (Last 48 hours)
@@ -802,6 +836,12 @@ class BriefService:
                 logger.warning(f"[BriefService] Date parse failed for reminder check: {e}")
                 continue
 
+            # Extract clean email address for VIP matching
+            from_address_match = re.search(r'<(.+?)>', email.get('from', ''))
+            from_email = from_address_match.group(1).lower().strip() if from_address_match else email.get('from', '').lower().strip()
+            
+            is_vip = from_email in vip_emails
+
             # 2. Check Keywords (Title or Summary)
             subject = email.get('subject', '').lower()
             summary = email.get('summary', '').lower()
@@ -810,34 +850,69 @@ class BriefService:
             content_to_check = f"{subject} {summary} {snippet}"
             
             # Use regex for word boundary matching
-            is_high_impact = any(
+            has_keywords = any(
                 re.search(r'\b' + re.escape(kw) + r'\b', content_to_check) 
                 for kw in impact_keywords
             )
             
-            if is_high_impact:
-                # Clean up subject for natural display (remove "Re:", "Fwd:", etc.)
-                raw_subject = email.get('subject', 'Email')
-                clean_subject = raw_subject
-                for prefix in ['Re: ', 'RE: ', 'Fwd: ', 'FWD: ', 'Fw: ']:
-                    if clean_subject.startswith(prefix):
-                        clean_subject = clean_subject[len(prefix):]
+            # 3. Check Task/Goal Alignment
+            # If the email content contains words from active tasks
+            is_aligned = False
+            for goal in active_goals:
+                # Basic token collision
+                goal_words = set(w for w in goal.split() if w not in {'task', 'todo', 'the', 'and', 'for', 'with', 'review', 'update'})
+                if len(goal_words) > 0:
+                    matched_words = sum(1 for w in goal_words if re.search(r'\b' + re.escape(w) + r'\b', content_to_check))
+                    # If it matches at least half of the significant words in the goal (min 1)
+                    if matched_words >= max(1, len(goal_words) / 2):
+                        is_aligned = True
+                        break
+            
+            # Calculate Intelligence Score
+            score = 0
+            if is_vip: score += 50
+            if is_aligned: score += 30
+            if has_keywords: score += 20
+            
+            # Recency Decay (-1 point per hour older than 2 hours)
+            hours_old = diff.total_seconds() / 3600
+            if hours_old > 2:
+                score -= int(hours_old - 2)
                 
-                logger.info(f"[BriefService][Reminders] ✓ Adding email reminder: {clean_subject[:50]}")
-                items.append({
-                    "title": clean_subject,  # Just the subject, natural
-                    "subtitle": f"from {email.get('from', 'Unknown').split('<')[0].strip()}",  # "from John Doe"
-                    "type": "email",
-                    "urgency": "high",
-                    "due_date": received_at,
-                    "id": email.get('id')
-                })
-                email_reminders_added += 1
-                # Limit to 5 max email reminders
-                if email_reminders_added >= 5:
-                    break
+            if score > 0:
+                email_candidates_scored.append((score, email, is_vip, is_aligned, received_at))
             else:
-                logger.info(f"[BriefService][Reminders] ✗ Skipping (no keyword match): {email.get('subject', 'N/A')[:50]}")
+                logger.info(f"[BriefService][Reminders] ✗ Skipping (score={score}): {email.get('subject', 'N/A')[:50]}")
+                
+        # Sort emails by score descending and take top 5
+        email_candidates_scored.sort(key=lambda x: x[0], reverse=True)
+        top_email_candidates = email_candidates_scored[:5]
+        
+        for score, email, is_vip, is_aligned, received_at in top_email_candidates:
+            # Clean up subject for natural display (remove "Re:", "Fwd:", etc.)
+            raw_subject = email.get('subject', 'Email')
+            clean_subject = raw_subject
+            for prefix in ['Re: ', 'RE: ', 'Fwd: ', 'FWD: ', 'Fw: ']:
+                if clean_subject.startswith(prefix):
+                    clean_subject = clean_subject[len(prefix):]
+            
+            if is_vip:
+                subtitle = f"Priority: Inner Circle ({email.get('from', 'Unknown').split('<')[0].strip()})"
+            elif is_aligned:
+                subtitle = f"Related to active task ({email.get('from', 'Unknown').split('<')[0].strip()})"
+            else:
+                subtitle = f"from {email.get('from', 'Unknown').split('<')[0].strip()}"
+            
+            logger.info(f"[BriefService][Reminders] ✓ Adding email reminder (score={score}, VIP={is_vip}, aligned={is_aligned}): {clean_subject[:50]}")
+            items.append({
+                "title": clean_subject,  # Just the subject, natural
+                "subtitle": subtitle,
+                "type": "email",
+                "urgency": "high" if score > 30 else "medium",
+                "due_date": received_at,
+                "id": email.get('id'),
+                "_email_context": email  # Temp ref for generation later
+            })
         
         # 2. Add pending todos (recent only - last 48h, max 5)
         # Filter out:
@@ -1071,6 +1146,24 @@ class BriefService:
         # Limit to 15 items
         items = items[:15]
         
+        # --- ACTION ORIENTED SUMMARIZATION ---
+        # Process high-priority emails in parallel to extract actionable summaries
+        email_items = [item for item in items if item.get('type') == 'email' and '_email_context' in item]
+        if email_items:
+            async def enhance_email(item):
+                email_ctx = item.pop('_email_context')
+                action_summary = await self._extract_actionable_summary(email_ctx)
+                if action_summary and action_summary != email_ctx.get('summary'):
+                    # Keep original subject as context, but make title the action
+                    item['title'] = action_summary
+                    
+            logger.info(f"[BriefService] Enhancing {len(email_items)} emails with LLM action summaries")
+            await asyncio.gather(*(enhance_email(item) for item in email_items), return_exceptions=True)
+            
+        # Clean up any leftover _email_context
+        for item in items:
+            item.pop('_email_context', None)
+        
         # 5. Generate personalized summary using LLM
         summary = await self._generate_greeting(user_name, items)
         
@@ -1081,6 +1174,44 @@ class BriefService:
             "items": items
         }
     
+    async def _extract_actionable_summary(self, email: Dict) -> str:
+        """Extract a 1-sentence actionable summary from an email body using a fast LLM."""
+        body = email.get('body', '')
+        if not body or len(body.strip()) < 10:
+            return email.get('summary', 'No content available')
+            
+        try:
+            from src.ai.llm_factory import LLMFactory
+            # Use a fast subset of the body to keep latency and token count low
+            clean_body = body[:2000] # Content usually within first 2000 chars
+            
+            prompt = f"""Extract the core ask or action needed from this email in a single, short sentence.
+If there is no specific action, summarize what the email is about in one sentence.
+Make it actionable and direct (e.g., "Review the presentation" or "John is asking for an update on Q3").
+Do not include introductory words like "The email is asking to...". Just the action.
+
+SUBJECT: {email.get('subject', '')}
+FROM: {email.get('from', '')}
+
+BODY:
+{clean_body}
+
+Single-sentence summary:"""
+
+            # We use the default model to avoid cold starts with alternative models
+            llm = LLMFactory.get_llm_for_provider(self.config, temperature=0.2, max_tokens=60)
+            response = await asyncio.to_thread(llm.invoke, prompt)
+            content = response.content if hasattr(response, 'content') else str(response)
+            
+            summary = content.strip().strip('"').strip("'")
+            if len(summary) > 200:
+                return email.get('summary', '')  # Fallback
+            return summary
+            
+        except Exception as e:
+            logger.error(f"[BriefService] Action extraction failed: {e}")
+            return email.get('summary', '')
+
     def _is_soon(self, start_time: Optional[str]) -> bool:
         """Check if a meeting is within the next 2 hours."""
         if not start_time:
